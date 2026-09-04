@@ -237,9 +237,12 @@ class RemoteClaudeLogin:
             screen = self.screen
         for start in [m.start() for m in re.finditer(r'https://', screen)]:
             candidate = re.split(r'\n\s*\n', screen[start:], maxsplit=1)[0]
+            # Claude's PTY sometimes prints its "Paste code here" prompt directly
+            # after a wrapped URL, without a blank line in between.
+            candidate = re.split(r'Paste\s*code\s*here', candidate, maxsplit=1, flags=re.I)[0]
             candidate = re.sub(r'\s+', '', candidate)
             parsed = urlparse(candidate)
-            if parsed.scheme == 'https' and parsed.hostname in {'claude.ai', 'platform.claude.com', 'auth.anthropic.com'}:
+            if parsed.scheme == 'https' and parsed.hostname in {'claude.com', 'claude.ai', 'platform.claude.com', 'auth.anthropic.com'}:
                 return candidate
         return None
 
@@ -1122,6 +1125,23 @@ def advance_remote_claude_onboarding(flow) -> None:
             with MODEL_AUTH_LOCK:
                 if flow['status'] == 'pending':
                     flow['message'] = 'Preparing Claude Code sign-in.'
+            threading.Thread(target=advance_remote_claude_login_method, args=(flow,), daemon=True).start()
+            return
+        time.sleep(.25)
+
+
+def advance_remote_claude_login_method(flow) -> None:
+    """Accept Claude's default subscription login method after first-run setup."""
+    bridge: RemoteClaudeLogin = flow['bridge']
+    for _ in range(40):
+        if bridge.process.poll() is not None:
+            return
+        compact = re.sub(r'\s+', '', bridge.snapshot()).lower()
+        if 'selectloginmethod' in compact and 'claudecodecanbeused' in compact:
+            bridge.accept_default()
+            with MODEL_AUTH_LOCK:
+                if flow['status'] == 'pending':
+                    flow['message'] = 'Opening Claude browser sign-in.'
             return
         time.sleep(.25)
 

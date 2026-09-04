@@ -150,11 +150,26 @@ class CoderRunnerTests(unittest.TestCase):
         bridge.accept_default.assert_called_once_with()
         self.assertEqual(flow['message'], 'Preparing Claude Code sign-in.')
 
+    def test_claude_onboarding_selects_default_subscription_login(self):
+        bridge = MagicMock()
+        bridge.process.poll.return_value = None
+        bridge.snapshot.return_value = 'ClaudeCodecanbeusedwithyourClaudesubscription.Selectloginmethod:'
+        flow = {'status':'pending', 'bridge':bridge}
+        app.advance_remote_claude_login_method(flow)
+        bridge.accept_default.assert_called_once_with()
+        self.assertEqual(flow['message'], 'Opening Claude browser sign-in.')
+
     def test_claude_login_extracts_a_wrapped_claude_url(self):
         bridge = object.__new__(app.RemoteClaudeLogin)
         bridge.lock = threading.RLock()
         bridge.screen = 'Browserdidntopen\n\nhttps://claude.ai/oauth/authorize?state=abc&code_\nchallenge=def\n\nPastecodehere'
         self.assertEqual(bridge.verification_url(), 'https://claude.ai/oauth/authorize?state=abc&code_challenge=def')
+
+    def test_claude_login_stops_wrapped_url_before_return_code_prompt(self):
+        bridge = object.__new__(app.RemoteClaudeLogin)
+        bridge.lock = threading.RLock()
+        bridge.screen = 'https://platform.claude.com/oauth/authorize?state=abc\n&code_challenge=def\nPastecodehereifprompted'
+        self.assertEqual(bridge.verification_url(), 'https://platform.claude.com/oauth/authorize?state=abc&code_challenge=def')
 
 
 def subprocess_result(stdout='', returncode=0, stderr=''):
