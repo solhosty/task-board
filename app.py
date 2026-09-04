@@ -87,6 +87,14 @@ CODER_SETUP_PROFILES = ("auto", "python", "node")
 KEYCHAIN_SERVICE = "Harness Rotation Coder"
 
 
+class CoderExternalAuthRequired(RuntimeError):
+    """A Coder user must finish a provider login before provisioning can continue."""
+
+    def __init__(self, login_url: str):
+        self.login_url = login_url
+        super().__init__(f'GitHub authorization is required. Open {login_url}')
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -349,6 +357,20 @@ def coder_json(base_url: str, path: str, token: Optional[str] = None) -> Dict[st
     return payload if isinstance(payload, dict) else {'value': payload}
 
 
+def coder_external_auth_status(server: Dict[str, Any], provider: str = 'github') -> Dict[str, Any]:
+    if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', provider):
+        raise ValueError('Invalid Coder external-auth provider.')
+    token = read_coder_token(server)
+    if not token:
+        raise ValueError('The Coder token is unavailable from Keychain.')
+    payload = coder_json(server['base_url'], f'/api/v2/external-auth/{provider}', token)
+    return {
+        'provider': provider,
+        'authenticated': bool(payload.get('authenticated')),
+        'login_url': f"{server['base_url'].rstrip('/')}/external-auth/{provider}",
+    }
+
+
 def probe_coder(base_url: str, token: Optional[str] = None) -> Dict[str, Any]:
     info: Dict[str, Any] = {'reachable': False, 'authorized': False, 'version': None, 'detail': None, 'capabilities': {}}
     try:
@@ -561,6 +583,10 @@ def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[s
     token = read_coder_token(server)
     if not token:
         raise ValueError('The Coder token is unavailable from Keychain.')
+    external_auth = coder_external_auth_status(server)
+    if not external_auth['authenticated']:
+        execute("UPDATE execution_leases SET state='awaiting_external_auth',updated_at=? WHERE run_id=?", (now(), run_id))
+        raise CoderExternalAuthRequired(external_auth['login_url'])
     workspace = f'harness-task-{task["id"]}-{run_id[:8]}'
     environment = dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=token,
                        CODER_ORGANIZATION=server['organization'])
@@ -935,6 +961,8 @@ def mark_task_complete(repo: Path, task: Dict[str, Any]) -> None:
 def run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: Optional[int] = None, permission_retry: bool = False) -> None:
     try:
         _run_attempt(run_id, project_id, task_id, resume_attempt_id, permission_retry)
+    except CoderExternalAuthRequired as exc:
+        update_run(run_id, 'awaiting_external_auth', f'Connect GitHub to this Coder account, then continue. {exc.login_url}')
     except Exception as exc:
         execute("UPDATE attempts SET status='failed',ended_at=?,error=? WHERE run_id=? AND status IN ('running','verified')", (now(), str(exc), run_id))
         update_run(run_id, 'stopped', 'Execution stopped: ' + str(exc))
@@ -1147,6 +1175,11 @@ class API(SimpleHTTPRequestHandler):
                     harness['availability'] = harness_availability(harness)
                 self.send_json({"api_version": 9, "projects": [serialize_project(item) for item in rows("SELECT * FROM projects ORDER BY id DESC")], "harnesses": harnesses,
                                 "coder_servers": [public_coder_server(item) for item in rows('SELECT * FROM coder_servers ORDER BY name')], "adapters": adapter_metadata()})
+                return
+            match = re.match(r'^/api/coder-servers/(\d+)/external-auth/github$', route)
+            if match:
+                server = coder_server_or_404(int(match.group(1)))
+                self.send_json(coder_external_auth_status(server))
                 return
             match = re.match(r"^/api/tasks/(\d+)$", route)
             if match:
@@ -1474,6 +1507,21 @@ class API(SimpleHTTPRequestHandler):
                 claim_run(run['id'], run['status'], 'queued', 'Resuming this task on the next available harness.')
                 threading.Thread(target=run_attempt, args=(run["id"], run["project_id"], run["task_id"], run["attempt_id"]), daemon=True).start()
                 self.send_json({"ok": True}); return
+            match = re.match(r"^/api/runs/([\w-]+)/resume-after-auth$", route)
+            if match:
+                run = one("SELECT * FROM runs WHERE id=?", (match.group(1),))
+                if not run or run['status'] != 'awaiting_external_auth':
+                    raise ValueError('Run is not awaiting Coder GitHub authorization')
+                profile = project_coder_profile(run['project_id'])
+                if not profile or not profile.get('coder_server_id'):
+                    raise ValueError('This project no longer has a Coder server configured')
+                status = coder_external_auth_status(coder_server_or_404(profile['coder_server_id']))
+                if not status['authenticated']:
+                    self.send_json({'ok': False, 'error': 'GitHub is not connected to this Coder account yet.', **status}, 409)
+                    return
+                claim_run(run['id'], run['status'], 'queued', 'GitHub connected; provisioning the Coder workspace.')
+                threading.Thread(target=run_attempt, args=(run['id'], run['project_id'], run['task_id']), daemon=True).start()
+                self.send_json({'ok': True}); return
             match = re.match(r"^/api/runs/([\w-]+)/discard$", route)
             if match:
                 run = one("SELECT * FROM runs WHERE id=?", (match.group(1),))

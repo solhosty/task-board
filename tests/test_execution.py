@@ -14,6 +14,7 @@ import time
 import unittest
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app
@@ -79,6 +80,30 @@ print('Implemented the requested feature.', flush=True)
         self.api(f"/api/runs/{state['run']['id']}/approve-dispatch", {})
         state = self.wait(task_id, 'awaiting_review')
         self.assertEqual(state['attempts'][0]['tool_permissions'], 'auto')
+
+    def test_coder_github_auth_status_never_exposes_the_token(self):
+        server = {'id': 7, 'base_url': 'http://127.0.0.1:3000', 'token_configured': 1}
+        with patch.object(app, 'read_coder_token', return_value='secret-token'), \
+             patch.object(app, 'coder_json', return_value={'authenticated': False}) as request:
+            status = app.coder_external_auth_status(server)
+        self.assertEqual(status, {
+            'provider': 'github',
+            'authenticated': False,
+            'login_url': 'http://127.0.0.1:3000/external-auth/github',
+        })
+        self.assertNotIn('token', status)
+        request.assert_called_once_with('http://127.0.0.1:3000', '/api/v2/external-auth/github', 'secret-token')
+
+    def test_coder_auth_requirement_becomes_a_resumable_run_state(self):
+        project = self.api('/api/projects', {'name':'Coder auth', 'repo_path':str(self.repo), 'default_mode':'supervised'})
+        task = self.api(f"/api/projects/{project['id']}/tasks", {'text':'Work remotely'})
+        submission = self.api(f"/api/projects/{project['id']}/run", {'task_id':task['id']})
+        login_url = 'http://127.0.0.1:3000/external-auth/github'
+        with patch.object(app, '_run_attempt', side_effect=app.CoderExternalAuthRequired(login_url)):
+            app.run_attempt(submission['run_id'], project['id'], task['id'])
+        state = self.api(f"/api/tasks/{task['id']}")
+        self.assertEqual(state['run']['status'], 'awaiting_external_auth')
+        self.assertIn(login_url, state['run']['message'])
 
     def test_permission_override_survives_quota_handoff(self):
         self.configure_worker('codex', 'quota')

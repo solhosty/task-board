@@ -22,6 +22,9 @@ provider "docker" {
 data "coder_provisioner" "me" {}
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
+data "coder_external_auth" "github" {
+  id = "github"
+}
 
 data "coder_parameter" "repo_url" {
   name         = "repo_url"
@@ -44,10 +47,10 @@ data "coder_parameter" "base_ref" {
 resource "coder_agent" "main" {
   arch = data.coder_provisioner.me.arch
   os   = "linux"
-  dir  = "/home/coder"
 
   startup_script = <<-EOT
     set -eu
+    export GIT_TERMINAL_PROMPT=0
     if [ ! -f ~/.harness-base-ready ]; then
       sudo apt-get update
       sudo apt-get install -y --no-install-recommends git curl ca-certificates jq python3 python3-venv nodejs npm
