@@ -147,7 +147,7 @@ class CoderRunnerTests(unittest.TestCase):
         bridge.snapshot.return_value = 'Choosethetextstylethatlooksbest'
         flow = {'status':'pending', 'bridge':bridge}
         app.advance_remote_claude_onboarding(flow)
-        bridge.send.assert_called_once_with('1')
+        bridge.accept_default.assert_called_once_with()
         self.assertEqual(flow['message'], 'Preparing Claude Code sign-in.')
 
 

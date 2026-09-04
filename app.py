@@ -219,6 +219,11 @@ class RemoteClaudeLogin:
             raise ValueError('Enter a valid Claude login response.')
         self._write(value + '\n')
 
+    def accept_default(self) -> None:
+        """Confirm a native terminal menu's currently selected option."""
+        if self.process.poll() is None:
+            self._write('\r')
+
     def snapshot(self) -> str:
         with self.lock:
             # CSI/OSC sequences are terminal rendering controls, not login text.
@@ -1101,7 +1106,7 @@ def advance_remote_claude_onboarding(flow) -> None:
             return
         compact = re.sub(r'\s+', '', bridge.snapshot()).lower()
         if 'choosethetextstyle' in compact:
-            bridge.send('1')
+            bridge.accept_default()
             with MODEL_AUTH_LOCK:
                 if flow['status'] == 'pending':
                     flow['message'] = 'Preparing Claude Code sign-in.'
