@@ -113,7 +113,7 @@ class RemoteCodexAppServer:
     """
     def __init__(self, workspace_name: str, environment: Dict[str, str]):
         self.process = subprocess.Popen(
-            ['coder', 'ssh', '--wait', 'yes', workspace_name, '--', 'codex', 'app-server'],
+            ['coder', 'ssh', '--wait', 'yes', workspace_name, '--', '/home/coder/.local/bin/codex', 'app-server'],
             env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1)
         self.responses: Dict[int, Queue] = {}
@@ -813,7 +813,7 @@ def validate_runner_workspace(server, owner, workspace):
         raise ValueError('Coder returned incomplete workspace metadata.')
 
 
-def save_coder_runner(server, owner, workspace, max_tasks=1):
+def save_coder_runner(server, owner, workspace, max_tasks=1, allow_migration=False):
     if type(max_tasks) is not int or not 1 <= max_tasks <= 8:
         raise ValueError('Runner concurrency must be an integer from 1 to 8.')
     validate_runner_workspace(server, owner, workspace)
@@ -822,7 +822,12 @@ def save_coder_runner(server, owner, workspace, max_tasks=1):
             AND organization=? AND owner_id=?''',
             (server['id'], server['base_url'], server['organization'], owner['id']))
         if existing and existing['workspace_id'] != workspace['id']:
-            raise ValueError('This account already has a runner. Moving its tasks and logins requires an explicit migration.')
+            if not allow_migration:
+                raise ValueError('This account already has a runner. Moving its tasks and logins requires an explicit migration.')
+            workspace_url = server['base_url'].rstrip('/') + '/@' + quote(owner['username'], safe='') + '/' + quote(workspace['name'], safe='')
+            execute('''UPDATE coder_runners SET workspace_id=?,workspace_name=?,workspace_url=?,template_name=?,max_tasks=?,updated_at=? WHERE id=?''',
+                    (workspace['id'], workspace['name'], workspace_url, workspace.get('template_name') or '', max_tasks, now(), existing['id']))
+            return one('SELECT * FROM coder_runners WHERE id=?', (existing['id'],))
         workspace_url = server['base_url'].rstrip('/') + '/@' + quote(owner['username'], safe='') + '/' + quote(workspace['name'], safe='')
         execute('''INSERT INTO coder_runners(coder_server_id,deployment_url,organization,owner_id,
             workspace_id,workspace_name,workspace_url,template_name,max_tasks,created_at,updated_at)
@@ -845,6 +850,8 @@ def ensure_coder_runner(server, profile):
             validate_runner_workspace(server, owner, workspace)
             if workspace['id'] != runner['workspace_id']:
                 raise ValueError('The saved runner no longer matches Coder. Recovery is required.')
+            if profile.get('template_name') and workspace.get('template_name') and workspace['template_name'] != profile['template_name']:
+                raise ValueError('The saved runner uses a different template. Use runner migration; the old workspace will be preserved.')
             # Keep the same workspace ID through renames; never replace a missing runner.
             runner = save_coder_runner(server, owner, workspace, runner['max_tasks'])
         else:
@@ -857,10 +864,7 @@ def ensure_coder_runner(server, profile):
                 if exc.code != 404:
                     raise
                 # Bootstrap once from the approved blueprint, without a project checkout.
-                command = ['coder', 'create', name, '--template', profile['template_name'],
-                           '--parameter', 'repo_url=', '--parameter', 'base_ref=main',
-                           '--parameter', 'auth_provider_id=' + (profile.get('auth_provider_id') or 'github'),
-                           '--stop-after', '8h', '--yes']
+                command = ['coder', 'create', name, '--template', profile['template_name'], '--stop-after', '8h', '--yes']
                 created = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=300)
                 if created.returncode:
                     raise RuntimeError('Coder runner creation failed. Inspect its build in Coder; no existing runner was deleted.')
@@ -869,12 +873,33 @@ def ensure_coder_runner(server, profile):
         return runner, environment
 
 
+def migrate_coder_runner(server: Dict[str, Any], profile: Dict[str, Any], max_tasks: int = 1) -> Dict[str, Any]:
+    """Create a fresh private runner from the selected template; never delete the old one."""
+    with CODER_RUNNER_LOCK:
+        token, owner, previous = coder_runner_context(server)
+        template = str(profile.get('template_name') or '')
+        if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,127}', template):
+            raise ValueError('Choose a valid Coder template name before migrating.')
+        marker = json.dumps([server['base_url'], server['organization'], owner['id'], template, uuid.uuid4().hex])
+        name = 'harness-runner-' + hashlib.sha256(marker.encode()).hexdigest()[:12]
+        environment = dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=token,
+                           CODER_ORGANIZATION=server['organization'])
+        created = subprocess.run(['coder', 'create', name, '--template', template, '--stop-after', '8h', '--yes'],
+                                 env=environment, capture_output=True, text=True, timeout=600)
+        if created.returncode:
+            raise RuntimeError('Coder could not create the new runner. The old runner remains unchanged; inspect the template build in Coder.')
+        workspace = coder_json(server['base_url'], '/api/v2/users/me/workspace/' + quote(name, safe=''), token)
+        runner = save_coder_runner(server, owner, workspace, max_tasks, allow_migration=True)
+        return {'runner': runner, 'previous_workspace_id': previous['workspace_id'] if previous else None,
+                'previous_workspace_name': previous['workspace_name'] if previous else None}
+
+
 def remote_codex_account(runner: Dict[str, Any], environment: Dict[str, str], refresh: bool = False) -> Dict[str, Any]:
     """Read only the public account shape; never return an access token."""
     installed = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--',
-                               'sh', '-lc', 'if command -v codex >/dev/null; then printf HARNESS_FOUND; else printf HARNESS_MISSING; fi'], env=environment,
+                               'ls', '-l', '/home/coder/.local/bin/codex'], env=environment,
                               capture_output=True, text=True, timeout=45)
-    if installed.returncode or 'HARNESS_FOUND' not in installed.stdout:
+    if installed.returncode or 'codex' not in installed.stdout:
         return {'installed': False, 'authenticated': False,
                 'detail': 'Codex is not installed in this runner. Publish a template revision with Codex before connecting it.'}
     bridge = RemoteCodexAppServer(runner['workspace_name'], environment)
@@ -893,12 +918,12 @@ def remote_codex_account(runner: Dict[str, Any], environment: Dict[str, str], re
 def remote_claude_account(runner: Dict[str, Any], environment: Dict[str, str]) -> Dict[str, Any]:
     """Ask Claude Code for its native status without reading its credentials."""
     present = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--',
-                              'sh', '-lc', 'if command -v claude >/dev/null; then printf HARNESS_FOUND; else printf HARNESS_MISSING; fi'], env=environment,
-                             capture_output=True, text=True, timeout=45)
-    if present.returncode or 'HARNESS_FOUND' not in present.stdout:
+                              'ls', '-l', '/home/coder/.local/bin/claude'], env=environment,
+                              capture_output=True, text=True, timeout=45)
+    if present.returncode or 'claude' not in present.stdout:
         return {'installed': False, 'authenticated': False, 'detail': 'Claude Code is not installed in this runner.'}
     checked = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--',
-                              'claude', 'auth', 'status', '--json'], env=environment,
+                              '/home/coder/.local/bin/claude', 'auth', 'status', '--json'], env=environment,
                              capture_output=True, text=True, timeout=45)
     try:
         payload = json.loads(checked.stdout)
@@ -1736,6 +1761,15 @@ class API(SimpleHTTPRequestHandler):
                 runner = save_coder_runner(server, owner, workspace, payload.get('max_tasks', 1))
                 self.send_json({'runner': runner})
                 return
+            match = re.match(r'^/api/coder-servers/(\d+)/runner/migrate$', route)
+            if match:
+                server = coder_server_or_404(int(match.group(1)))
+                project_id = int(payload.get('project_id') or 0)
+                profile = project_coder_profile(project_id)
+                if not profile or profile.get('coder_server_id') != server['id']:
+                    raise ValueError('Choose this Coder server for the project before migrating its runner.')
+                self.send_json(migrate_coder_runner(server, profile, payload.get('max_tasks', 1)))
+                return
             match = re.match(r'^/api/coder-servers/(\d+)/model-auth/codex/connect$', route)
             if match:
                 server = coder_server_or_404(int(match.group(1)))
@@ -1877,7 +1911,9 @@ class API(SimpleHTTPRequestHandler):
                 auth_provider_id = str(payload.get('auth_provider_id') or 'github').strip().lower()
                 if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', auth_provider_id):
                     raise ValueError('Enter a valid Coder connection ID, such as github or primary-gitlab.')
-                template_name = coder_template_name(server['name'], project['name'])
+                template_name = str(payload.get('template_name') or '').strip().lower() or coder_template_name(server['name'], project['name'])
+                if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,127}', template_name):
+                    raise ValueError('Enter a valid Coder template name.')
                 execute("""INSERT INTO project_coder_profiles(project_id,coder_server_id,setup_profile,repo_url,base_ref,auth_provider_id,template_name,enabled,default_target,created_at,updated_at)
                     VALUES(?,?,?,?,?,?,?,1,?,?,?) ON CONFLICT(project_id) DO UPDATE SET coder_server_id=excluded.coder_server_id,
                     setup_profile=excluded.setup_profile,repo_url=excluded.repo_url,base_ref=excluded.base_ref,auth_provider_id=excluded.auth_provider_id,template_name=excluded.template_name,

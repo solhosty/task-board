@@ -40,6 +40,9 @@ class CoderRunnerTests(unittest.TestCase):
         self.assertEqual(again['workspace_url'], 'http://localhost:3000/@owner/private-runner')
         with self.assertRaisesRegex(ValueError, 'migration'):
             app.save_coder_runner(self.server, self.owner, dict(self.workspace, id='different'))
+        migrated = app.save_coder_runner(self.server, self.owner, dict(self.workspace, id='different', name='fresh-runner'), allow_migration=True)
+        self.assertEqual(migrated['workspace_id'], 'different')
+        self.assertEqual(migrated['workspace_name'], 'fresh-runner')
 
     def test_rejects_other_owner_organization_and_shared_workspace(self):
         for fields in [{'owner_id':'other'}, {'organization_name':'other','organization_id':'other'}, {'shared_with':[{'name':'someone'}]}]:
