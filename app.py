@@ -217,7 +217,9 @@ class RemoteClaudeLogin:
             raise RuntimeError('The Claude login session closed. Start it again.')
         if not isinstance(value, str) or not value or len(value) > 8192 or '\x00' in value:
             raise ValueError('Enter a valid Claude login response.')
-        self._write(value + '\n')
+        # Claude's full-screen terminal handles text input, but confirms it only
+        # on the terminal Enter key (CR), not a transport line feed.
+        self._write(value + '\r')
 
     def accept_default(self) -> None:
         """Confirm a native terminal menu's currently selected option."""

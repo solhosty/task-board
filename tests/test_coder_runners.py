@@ -132,6 +132,15 @@ class CoderRunnerTests(unittest.TestCase):
         self.assertEqual(result['screen'], 'waiting for code')
         app.MODEL_AUTH_FLOWS.pop(key, None)
 
+    def test_claude_login_input_uses_terminal_enter(self):
+        bridge = object.__new__(app.RemoteClaudeLogin)
+        bridge.process = MagicMock()
+        bridge.process.poll.return_value = None
+        bridge.process.stdin = MagicMock()
+        bridge.send('one-time-code')
+        bridge.process.stdin.write.assert_called_once_with(b'one-time-code\r')
+        bridge.process.stdin.flush.assert_called_once_with()
+
     def test_claude_login_screen_removes_terminal_control_sequences(self):
         bridge = object.__new__(app.RemoteClaudeLogin)
         bridge.lock = threading.RLock()
