@@ -81,9 +81,9 @@ function renderPullRequests(pullRequests){const host=$('#pull-requests');if(!hos
 function renderRunBanner(data,attempt,isActive){
  const run=data.run;let html='';
  if(run&&run.status!=='complete'){
-  const authUrl=run.status==='awaiting_external_auth'?(run.message||'').match(/https?:\/\/[^\s]+\/external-auth\/[a-z0-9_-]+/)?.[0]:null;
+  const connection=data.connection_action;
   html='<section class="run-notice"><div><strong>'+esc(attempt?.display_status||phaseLabel(run.status))+'</strong><p>'+esc(conciseRunMessage(attempt?.display_reason||run.message||''))+'</p></div><div class="actions">'+
-   (authUrl?'<a class="button-link" href="'+esc(authUrl)+'" target="_blank" rel="noopener noreferrer">Connect account</a><button data-action="resume-after-auth">I’ve connected</button>':'')+
+   (connection?'<button id="connect-run-account">Connect account</button><button data-action="resume-after-auth">Check connection and continue</button>':'')+
    (run.status==='awaiting_dispatch'?'<button data-action="approve-dispatch">Start harness</button>':'')+
    (run.status==='awaiting_review'?'<button data-action="complete">Finish</button>':run.status==='awaiting_commit'?'<button data-action="approve-commit">Finish</button>':'')+
    (['awaiting_resume','paused_cooldown'].includes(run.status)?'<button data-action="resume">Continue</button>':'')+
@@ -93,6 +93,7 @@ function renderRunBanner(data,attempt,isActive){
  if(!html&&!run)html='<section class="run-notice quiet"><span>Ready when you are. Send a message to run with new context, or choose Run to start as-is.</span></section>';
  $('#run-banner').innerHTML=html;
  document.querySelectorAll('[data-action]').forEach(button=>button.onclick=()=>runAction(run.id,button.dataset.action));
+ const connect=$('#connect-run-account');if(connect)connect.onclick=async()=>{await openCoderConnections(data.connection_action.server_id);await connectProvider(data.connection_action.server_id,data.connection_action.provider)};
  const setup=$('#configure-harnesses');if(setup)setup.onclick=openProjectSettings;
 }
 function conciseRunMessage(message){
@@ -170,6 +171,7 @@ function openCoderServers(){
  if(!$('#detail').open)$('#detail').showModal();
 }
 async function openCoderConnections(serverId){
+ if(!$('#detail').open)$('#detail').showModal();
  const server=(state.data.coder_servers||[]).find(item=>item.id===serverId);if(!server)return;$('#detail-kicker').textContent='CONNECTED ACCOUNTS';$('#detail-title').textContent=server.name;$('#detail-body').style.display='none';$('#detail-form').innerHTML='<p class="muted">Checking connections configured on this Coder server…</p>';
 try{const data=await api('/api/coder-servers/'+serverId+'/external-auth');const providers=data.providers||[];$('#detail-form').innerHTML='<div class="settings-title"><div><p class="eyebrow">CODER CONNECTIONS</p><h3>Available providers</h3><p class="muted">Connections belong to your user on this Coder server. Projects select a provider by its ID.</p></div><button id="back-to-coder" class="secondary">Back</button></div>'+(providers.length?providers.map(connectionCard).join(''):'<p class="muted">This Coder deployment does not advertise any external-auth providers.</p>');$('#back-to-coder').onclick=openCoderServers;document.querySelectorAll('[data-connect-provider]').forEach(button=>button.onclick=()=>connectProvider(serverId,button.dataset.connectProvider));document.querySelectorAll('[data-refresh-connection]').forEach(button=>button.onclick=async()=>{button.disabled=true;try{const status=await api('/api/coder-servers/'+serverId+'/external-auth/'+button.dataset.refreshConnection);toast(status.authenticated?status.display_name+' is connected':status.display_name+' still needs to be connected');await openCoderConnections(serverId)}catch(error){toast(error.message)}finally{button.disabled=false}})}catch(error){$('#detail-form').innerHTML='<p class="muted">'+esc(error.message)+'</p><button id="back-to-coder" class="secondary">Back</button>';$('#back-to-coder').onclick=openCoderServers}
 }

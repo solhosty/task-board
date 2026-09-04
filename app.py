@@ -613,6 +613,17 @@ def execution_lease(run_id: str) -> Optional[Dict[str, Any]]:
     return one("SELECT * FROM execution_leases WHERE run_id=?", (run_id,))
 
 
+def run_connection_action(run: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Structured UI routing; never infer an account from a human-readable URL."""
+    if not run or run['status'] != 'awaiting_external_auth':
+        return None
+    profile = project_coder_profile(run['project_id'])
+    if not profile or not profile.get('coder_server_id'):
+        return None
+    return {'server_id': profile['coder_server_id'],
+            'provider': profile.get('auth_provider_id') or 'github'}
+
+
 def task_pull_requests(task_id: int) -> List[Dict[str, Any]]:
     return rows("SELECT * FROM task_pull_requests WHERE task_id=? ORDER BY id DESC", (task_id,))
 
@@ -1308,6 +1319,7 @@ class API(SimpleHTTPRequestHandler):
                 task_run = one('SELECT * FROM runs WHERE task_id=? ORDER BY rowid DESC LIMIT 1', (task_id,))
                 self.send_json({"task": task, "next_harness": {'key': selected['key'], 'label': selected['label'], 'model': selected['model'], 'selection': selection} if selected else None,
                     "run": task_run,
+                    "connection_action": run_connection_action(task_run),
                     "lease": execution_lease(task_run['id']) if task_run else None,
                     "pull_requests": task_pull_requests(task_id),
                     "blockers": blockers,
@@ -1630,7 +1642,7 @@ class API(SimpleHTTPRequestHandler):
             if match:
                 run = one("SELECT * FROM runs WHERE id=?", (match.group(1),))
                 if not run or run['status'] != 'awaiting_external_auth':
-                    raise ValueError('Run is not awaiting Coder GitHub authorization')
+                    raise ValueError('Run is not awaiting Coder account authorization')
                 profile = project_coder_profile(run['project_id'])
                 if not profile or not profile.get('coder_server_id'):
                     raise ValueError('This project no longer has a Coder server configured')
@@ -1639,7 +1651,7 @@ class API(SimpleHTTPRequestHandler):
                 if not status['authenticated']:
                     self.send_json({'ok': False, 'error': f"{status['display_name']} is not connected to this Coder account yet.", **status}, 409)
                     return
-                claim_run(run['id'], run['status'], 'queued', 'GitHub connected; provisioning the Coder workspace.')
+                claim_run(run['id'], run['status'], 'queued', f"{status['display_name']} connected; provisioning the Coder workspace.")
                 threading.Thread(target=run_attempt, args=(run['id'], run['project_id'], run['task_id']), daemon=True).start()
                 self.send_json({'ok': True}); return
             match = re.match(r"^/api/runs/([\w-]+)/discard$", route)

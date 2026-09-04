@@ -213,6 +213,21 @@ From `harness-auth-smoke-0904`, a read-only `git ls-remote` and a private clone 
 contains Node and Python but no Codex, Claude, Droid, or OpenCode CLI. This validates
 repository read access, not push permissions or remote agent execution.
 
+A second, fresh workspace (`harness-clean-checkout-0904`) completed the entire
+startup script and private checkout without a manual clone. Its checkout was
+`dc3950c8d7e414946c437f06512dd6634064163f`. Codex CLI 0.149.0 was then installed
+in that disposable workspace under `/home/coder/.local`; `codex login status`
+reported not logged in. Device authorization requires the user's consent. No local
+model credentials were copied and no API billing credentials were configured.
+This installation is a smoke-test preparation, not yet part of every template.
+
+Blocked task connection buttons now use a structured server/provider action from
+the project profile and the same Harness-owned connection flow as settings. They
+no longer extract a Coder browser login URL from a run message. The template also
+passes repository parameters as environment values rather than interpolating
+them into shell source. This template hardening still needs a new published
+template version before it applies to newly provisioned workspaces.
+
 Harness now owns the device-code exchange using the registered Coder token, instead
 of relying on a separate Coder browser session. Tests cover pending, slow-down,
 denial, expiry, and duplicate connection requests. The UI distinguishes authorization
