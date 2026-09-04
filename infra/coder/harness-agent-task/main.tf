@@ -22,9 +22,6 @@ provider "docker" {
 data "coder_provisioner" "me" {}
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
-data "coder_external_auth" "github" {
-  id = "github"
-}
 
 data "coder_parameter" "repo_url" {
   name         = "repo_url"
@@ -42,6 +39,19 @@ data "coder_parameter" "base_ref" {
   type         = "string"
   default      = "main"
   mutable      = false
+}
+
+data "coder_parameter" "auth_provider_id" {
+  name         = "auth_provider_id"
+  display_name = "Repository connection"
+  description  = "Coder external-auth provider ID used for this repository."
+  type         = "string"
+  default      = "github"
+  mutable      = false
+}
+
+data "coder_external_auth" "repository" {
+  id = data.coder_parameter.auth_provider_id.value
 }
 
 resource "coder_agent" "main" {

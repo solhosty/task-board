@@ -142,15 +142,17 @@ These values must be intentionally supplied; none are stored in source control.
   long-lived provider keys into source or task records.
 - Workspace retention/autostop and recovery period.
 
-GitHub access is per Coder user. Before provisioning a private-repository workspace,
-Harness checks Coder's GitHub external-auth state. If authorization is missing, the
-task stays active as `awaiting_external_auth`; the dashboard presents **Connect
-GitHub** and **I've connected** actions, then resumes that same run after Coder
-confirms the connection. Provider tokens are never returned to the browser or stored
-by Harness.
+External-service access is global to a user on one Coder server, rather than belonging
+to an individual project. Harness discovers the provider IDs advertised by that
+server and presents them under **Connected accounts**. Each project records the
+provider ID required for its repository. Before provisioning, Harness checks that
+connection; if authorization is missing, the task stays active as
+`awaiting_external_auth` and resumes the same run after Coder confirms it. Provider
+tokens are never returned to the browser or stored by Harness.
 
 This removes terminal setup from the normal flow, but it does not silently grant
-repository access. Each new Coder user approves GitHub once under their own account.
+repository access. Each new Coder user approves the required provider once under
+their own account.
 A future multi-user Harness deployment must scope Coder API tokens and task ownership
 per Harness user instead of sharing one dispatcher account.
 

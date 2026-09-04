@@ -90,9 +90,11 @@ KEYCHAIN_SERVICE = "Harness Rotation Coder"
 class CoderExternalAuthRequired(RuntimeError):
     """A Coder user must finish a provider login before provisioning can continue."""
 
-    def __init__(self, login_url: str):
+    def __init__(self, provider_id: str, display_name: str, login_url: str):
+        self.provider_id = provider_id
+        self.display_name = display_name
         self.login_url = login_url
-        super().__init__(f'GitHub authorization is required. Open {login_url}')
+        super().__init__(f'{display_name} authorization is required. Open {login_url}')
 
 
 def now() -> str:
@@ -181,7 +183,7 @@ def init_db() -> None:
           project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
           coder_server_id INTEGER REFERENCES coder_servers(id) ON DELETE SET NULL,
           setup_profile TEXT NOT NULL DEFAULT 'auto' CHECK(setup_profile IN ('auto','python','node')),
-          repo_url TEXT, base_ref TEXT NOT NULL DEFAULT 'main', template_name TEXT NOT NULL,
+          repo_url TEXT, base_ref TEXT NOT NULL DEFAULT 'main', auth_provider_id TEXT NOT NULL DEFAULT 'github', template_name TEXT NOT NULL,
           enabled INTEGER NOT NULL DEFAULT 0, default_target TEXT NOT NULL DEFAULT 'local'
           CHECK(default_target IN ('local','coder')),
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -223,6 +225,8 @@ def init_db() -> None:
         coder_profile_columns = {item[1] for item in conn.execute('PRAGMA table_info(project_coder_profiles)')}
         if 'default_target' not in coder_profile_columns:
             conn.execute("ALTER TABLE project_coder_profiles ADD COLUMN default_target TEXT NOT NULL DEFAULT 'local'")
+        if 'auth_provider_id' not in coder_profile_columns:
+            conn.execute("ALTER TABLE project_coder_profiles ADD COLUMN auth_provider_id TEXT NOT NULL DEFAULT 'github'")
         attempt_columns = {item[1] for item in conn.execute('PRAGMA table_info(attempts)')}
         if 'tool_permissions' not in attempt_columns:
             conn.execute('ALTER TABLE attempts ADD COLUMN tool_permissions TEXT')
@@ -366,9 +370,29 @@ def coder_external_auth_status(server: Dict[str, Any], provider: str = 'github')
     payload = coder_json(server['base_url'], f'/api/v2/external-auth/{provider}', token)
     return {
         'provider': provider,
+        'display_name': payload.get('display_name') or provider.replace('-', ' ').title(),
+        'type': payload.get('type') or 'external',
         'authenticated': bool(payload.get('authenticated')),
         'login_url': f"{server['base_url'].rstrip('/')}/external-auth/{provider}",
     }
+
+
+def coder_external_auth_providers(server: Dict[str, Any]) -> List[Dict[str, Any]]:
+    token = read_coder_token(server)
+    if not token:
+        raise ValueError('The Coder token is unavailable from Keychain.')
+    payload = coder_json(server['base_url'], '/api/v2/external-auth', token)
+    providers = payload.get('providers') or []
+    result = []
+    for provider in providers:
+        provider_id = str(provider.get('id') or '') if isinstance(provider, dict) else ''
+        if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', provider_id):
+            continue
+        status = coder_external_auth_status(server, provider_id)
+        status['display_name'] = provider.get('display_name') or status['display_name']
+        status['type'] = provider.get('type') or status['type']
+        result.append(status)
+    return result
 
 
 def probe_coder(base_url: str, token: Optional[str] = None) -> Dict[str, Any]:
@@ -583,10 +607,11 @@ def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[s
     token = read_coder_token(server)
     if not token:
         raise ValueError('The Coder token is unavailable from Keychain.')
-    external_auth = coder_external_auth_status(server)
+    provider_id = profile.get('auth_provider_id') or 'github'
+    external_auth = coder_external_auth_status(server, provider_id)
     if not external_auth['authenticated']:
-        execute("UPDATE execution_leases SET state='awaiting_external_auth',updated_at=? WHERE run_id=?", (now(), run_id))
-        raise CoderExternalAuthRequired(external_auth['login_url'])
+        execute("UPDATE execution_leases SET state='failed',updated_at=? WHERE run_id=?", (now(), run_id))
+        raise CoderExternalAuthRequired(provider_id, external_auth['display_name'], external_auth['login_url'])
     workspace = f'harness-task-{task["id"]}-{run_id[:8]}'
     environment = dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=token,
                        CODER_ORGANIZATION=server['organization'])
@@ -595,6 +620,7 @@ def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[s
         (workspace, f"{server['base_url']}/@{workspace}", profile['template_name'], now(), run_id))
     command = ['coder', 'create', workspace, '--template', profile['template_name'], '--parameter',
                f"repo_url={profile.get('repo_url') or ''}", '--parameter', f"base_ref={profile.get('base_ref') or 'main'}",
+               '--parameter', f"auth_provider_id={provider_id}",
                '--stop-after', '8h', '--yes']
     created = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=300)
     if created.returncode:
@@ -962,7 +988,7 @@ def run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: O
     try:
         _run_attempt(run_id, project_id, task_id, resume_attempt_id, permission_retry)
     except CoderExternalAuthRequired as exc:
-        update_run(run_id, 'awaiting_external_auth', f'Connect GitHub to this Coder account, then continue. {exc.login_url}')
+        update_run(run_id, 'awaiting_external_auth', f'Connect {exc.display_name} to this Coder account, then continue. {exc.login_url}')
     except Exception as exc:
         execute("UPDATE attempts SET status='failed',ended_at=?,error=? WHERE run_id=? AND status IN ('running','verified')", (now(), str(exc), run_id))
         update_run(run_id, 'stopped', 'Execution stopped: ' + str(exc))
@@ -1176,10 +1202,15 @@ class API(SimpleHTTPRequestHandler):
                 self.send_json({"api_version": 9, "projects": [serialize_project(item) for item in rows("SELECT * FROM projects ORDER BY id DESC")], "harnesses": harnesses,
                                 "coder_servers": [public_coder_server(item) for item in rows('SELECT * FROM coder_servers ORDER BY name')], "adapters": adapter_metadata()})
                 return
-            match = re.match(r'^/api/coder-servers/(\d+)/external-auth/github$', route)
+            match = re.match(r'^/api/coder-servers/(\d+)/external-auth$', route)
             if match:
                 server = coder_server_or_404(int(match.group(1)))
-                self.send_json(coder_external_auth_status(server))
+                self.send_json({'providers': coder_external_auth_providers(server)})
+                return
+            match = re.match(r'^/api/coder-servers/(\d+)/external-auth/([a-z0-9][a-z0-9_-]{0,63})$', route)
+            if match:
+                server = coder_server_or_404(int(match.group(1)))
+                self.send_json(coder_external_auth_status(server, match.group(2)))
                 return
             match = re.match(r"^/api/tasks/(\d+)$", route)
             if match:
@@ -1379,12 +1410,15 @@ class API(SimpleHTTPRequestHandler):
                     remote = git(['remote', 'get-url', 'origin'], Path(project['repo_path']), check=False)
                     repo_url = remote.stdout.strip() or None
                 base_ref = str(payload.get('base_ref') or 'main').strip()[:160] or 'main'
+                auth_provider_id = str(payload.get('auth_provider_id') or 'github').strip().lower()
+                if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', auth_provider_id):
+                    raise ValueError('Enter a valid Coder connection ID, such as github or primary-gitlab.')
                 template_name = coder_template_name(server['name'], project['name'])
-                execute("""INSERT INTO project_coder_profiles(project_id,coder_server_id,setup_profile,repo_url,base_ref,template_name,enabled,default_target,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,1,?,?,?) ON CONFLICT(project_id) DO UPDATE SET coder_server_id=excluded.coder_server_id,
-                    setup_profile=excluded.setup_profile,repo_url=excluded.repo_url,base_ref=excluded.base_ref,template_name=excluded.template_name,
+                execute("""INSERT INTO project_coder_profiles(project_id,coder_server_id,setup_profile,repo_url,base_ref,auth_provider_id,template_name,enabled,default_target,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,1,?,?,?) ON CONFLICT(project_id) DO UPDATE SET coder_server_id=excluded.coder_server_id,
+                    setup_profile=excluded.setup_profile,repo_url=excluded.repo_url,base_ref=excluded.base_ref,auth_provider_id=excluded.auth_provider_id,template_name=excluded.template_name,
                     enabled=1,default_target=excluded.default_target,updated_at=excluded.updated_at""",
-                    (project_id, server['id'], setup_profile, repo_url, base_ref, template_name, default_target, now(), now()))
+                    (project_id, server['id'], setup_profile, repo_url, base_ref, auth_provider_id, template_name, default_target, now(), now()))
                 self.send_json({'coder_profile': project_coder_profile(project_id)})
                 return
             match = re.match(r"^/api/projects/(\d+)/sync$", route)
@@ -1515,9 +1549,10 @@ class API(SimpleHTTPRequestHandler):
                 profile = project_coder_profile(run['project_id'])
                 if not profile or not profile.get('coder_server_id'):
                     raise ValueError('This project no longer has a Coder server configured')
-                status = coder_external_auth_status(coder_server_or_404(profile['coder_server_id']))
+                provider_id = profile.get('auth_provider_id') or 'github'
+                status = coder_external_auth_status(coder_server_or_404(profile['coder_server_id']), provider_id)
                 if not status['authenticated']:
-                    self.send_json({'ok': False, 'error': 'GitHub is not connected to this Coder account yet.', **status}, 409)
+                    self.send_json({'ok': False, 'error': f"{status['display_name']} is not connected to this Coder account yet.", **status}, 409)
                     return
                 claim_run(run['id'], run['status'], 'queued', 'GitHub connected; provisioning the Coder workspace.')
                 threading.Thread(target=run_attempt, args=(run['id'], run['project_id'], run['task_id']), daemon=True).start()

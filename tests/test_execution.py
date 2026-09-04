@@ -88,6 +88,8 @@ print('Implemented the requested feature.', flush=True)
             status = app.coder_external_auth_status(server)
         self.assertEqual(status, {
             'provider': 'github',
+            'display_name': 'Github',
+            'type': 'external',
             'authenticated': False,
             'login_url': 'http://127.0.0.1:3000/external-auth/github',
         })
@@ -99,11 +101,23 @@ print('Implemented the requested feature.', flush=True)
         task = self.api(f"/api/projects/{project['id']}/tasks", {'text':'Work remotely'})
         submission = self.api(f"/api/projects/{project['id']}/run", {'task_id':task['id']})
         login_url = 'http://127.0.0.1:3000/external-auth/github'
-        with patch.object(app, '_run_attempt', side_effect=app.CoderExternalAuthRequired(login_url)):
+        with patch.object(app, '_run_attempt', side_effect=app.CoderExternalAuthRequired('github', 'GitHub', login_url)):
             app.run_attempt(submission['run_id'], project['id'], task['id'])
         state = self.api(f"/api/tasks/{task['id']}")
         self.assertEqual(state['run']['status'], 'awaiting_external_auth')
         self.assertIn(login_url, state['run']['message'])
+
+    def test_coder_connection_catalog_is_provider_agnostic(self):
+        server = {'id': 7, 'base_url': 'http://127.0.0.1:3000', 'token_configured': 1}
+        catalog = {'providers': [{'id':'primary-gitlab', 'type':'gitlab', 'display_name':'Work GitLab'}]}
+        detail = {'authenticated': True, 'type':'gitlab', 'display_name':'Work GitLab'}
+        with patch.object(app, 'read_coder_token', return_value='secret-token'), \
+             patch.object(app, 'coder_json', side_effect=[catalog, detail]):
+            providers = app.coder_external_auth_providers(server)
+        self.assertEqual(providers[0]['provider'], 'primary-gitlab')
+        self.assertEqual(providers[0]['display_name'], 'Work GitLab')
+        self.assertTrue(providers[0]['authenticated'])
+        self.assertNotIn('token', providers[0])
 
     def test_permission_override_survives_quota_handoff(self):
         self.configure_worker('codex', 'quota')
