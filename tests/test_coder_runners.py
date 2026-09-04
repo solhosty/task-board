@@ -141,6 +141,15 @@ class CoderRunnerTests(unittest.TestCase):
     def test_claude_theme_matcher_handles_terminal_redraw_without_spaces(self):
         self.assertIsNotNone(app.re.search(r'choose\s*the\s*text\s*style|choosethetextstyle', 'Choosethetextstylethatlooksbest', app.re.I))
 
+    def test_claude_onboarding_bridge_selects_default_theme(self):
+        bridge = MagicMock()
+        bridge.process.poll.return_value = None
+        bridge.snapshot.return_value = 'Choosethetextstylethatlooksbest'
+        flow = {'status':'pending', 'bridge':bridge}
+        app.advance_remote_claude_onboarding(flow)
+        bridge.send.assert_called_once_with('1')
+        self.assertEqual(flow['message'], 'Preparing Claude Code sign-in.')
+
 
 def subprocess_result(stdout='', returncode=0, stderr=''):
     class Result:

@@ -186,7 +186,6 @@ class RemoteClaudeLogin:
                                         env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.STDOUT, bufsize=0)
         self.screen = ''
-        self.auto_style_selected = False
         self.login_url_requested = False
         self.lock = threading.RLock()
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -201,16 +200,10 @@ class RemoteClaudeLogin:
             text = chunk.decode('utf-8', errors='replace')
             with self.lock:
                 self.screen = (self.screen + text)[-24000:]
-                # Claude's first-run theme picker is cosmetic. Select its default
-                # so the dashboard proceeds directly to the actual account login.
-                if not self.auto_style_selected and re.search(r'choose\s*the\s*text\s*style|choosethetextstyle', self.screen, re.I):
-                    self.auto_style_selected = True
-                    self.screen = 'Preparing Claude Code sign-in…\n'
-                    self._write('1\n')
                 # In SSH/container sessions Claude can ask the user to press c to
                 # reveal/copy its browser URL. Do that non-sensitive step here.
-                elif (self.auto_style_selected and not self.login_url_requested
-                      and re.search(r'press\s*c\b|pressc\b', self.screen, re.I)):
+                if (not self.login_url_requested
+                    and re.search(r'press\s*c\b|pressc\b', self.screen, re.I)):
                     self.login_url_requested = True
                     self._write('c\n')
 
@@ -1095,8 +1088,25 @@ def start_remote_claude_login(server: Dict[str, Any], profile: Dict[str, Any]) -
         flow = {'status': 'pending', 'provider': 'claude', 'message': 'Claude Code is starting its native sign-in.',
                 'bridge': bridge, 'started_at': time.time()}
         MODEL_AUTH_FLOWS[key] = flow
+        threading.Thread(target=advance_remote_claude_onboarding, args=(flow,), daemon=True).start()
         threading.Thread(target=watch_remote_claude_login, args=(key, flow), daemon=True).start()
         return {k: v for k, v in flow.items() if k != 'bridge'}
+
+
+def advance_remote_claude_onboarding(flow) -> None:
+    """Skip Claude's cosmetic first-run theme picker only when it is visible."""
+    bridge: RemoteClaudeLogin = flow['bridge']
+    for _ in range(40):
+        if bridge.process.poll() is not None:
+            return
+        compact = re.sub(r'\s+', '', bridge.snapshot()).lower()
+        if 'choosethetextstyle' in compact:
+            bridge.send('1')
+            with MODEL_AUTH_LOCK:
+                if flow['status'] == 'pending':
+                    flow['message'] = 'Preparing Claude Code sign-in.'
+            return
+        time.sleep(.25)
 
 
 def watch_remote_claude_login(key, flow) -> None:
