@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+import base64
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -108,6 +110,16 @@ class CoderRunnerTests(unittest.TestCase):
         self.assertFalse(status['installed'])
         self.assertFalse(status['authenticated'])
         bridge.assert_not_called()
+
+    def test_remote_agent_request_keeps_prompt_out_of_the_shell_command(self):
+        task = {'text': 'work', 'id': 1, 'preferred_harness': None, 'preferred_model': None}
+        worktree = {'worktree_path': '/home/coder/.harness-runner/tasks/task-a', 'base_sha': 'a' * 40, 'branch_name': 'harness/task-a'}
+        with patch.object(app, 'task_prompt', return_value='quote; $(not-a-command)'):
+            command = app.remote_agent_request({'key':'codex', 'model':'default'}, worktree, task, {'verify_command':'true'}, 'standard')
+        encoded = command.split()[-1].strip("'")
+        request = json.loads(base64.urlsafe_b64decode(encoded.encode()).decode())
+        self.assertEqual(request['prompt'], 'quote; $(not-a-command)')
+        self.assertNotIn('quote;', command)
 
 
 def subprocess_result(stdout='', returncode=0, stderr=''):

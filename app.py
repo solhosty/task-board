@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import argparse
+import base64
 import errno
 import hashlib
 import os
@@ -49,6 +50,7 @@ DB_LOCK = threading.RLock()
 RUN_LOCK = threading.RLock()
 CODER_RUNNER_LOCK = threading.RLock()
 CHILDREN = set()
+REMOTE_RESULT_MARKER = '__HARNESS_REMOTE_RESULT__'
 
 QUOTA_PATTERNS = [
     re.compile(pattern, re.I)
@@ -1032,7 +1034,7 @@ def reserve_runner_worktree(run_id, task, runner, repo_url):
     return one('SELECT * FROM coder_task_worktrees WHERE task_id=?', (task['id'],))
 
 
-def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[str, Any]) -> str:
+def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[str, Any]) -> Dict[str, Any]:
     profile = project_coder_profile(project['id'])
     if not profile or not profile.get('coder_server_id'):
         raise ValueError('This project has no Coder environment configured.')
@@ -1066,7 +1068,64 @@ def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[s
             (result['worktree_path'], result['base_sha'], result['branch_name'], now(), task['id']))
     execute("UPDATE execution_leases SET state='ready',worktree_path=?,base_sha=?,updated_at=? WHERE run_id=?",
             (result['worktree_path'], result['base_sha'], now(), run_id))
-    return runner['workspace_name']
+    return {'runner': runner, 'environment': environment,
+            'worktree': one('SELECT * FROM coder_task_worktrees WHERE task_id=?', (task['id'],))}
+
+
+def choose_remote_harness(task: Dict[str, Any], runner: Dict[str, Any], environment: Dict[str, str]) -> Tuple[Dict[str, Any], str]:
+    """Choose only CLIs installed and signed in inside this runner, never locally."""
+    configured = {item['key']: item for item in rows("SELECT * FROM harnesses WHERE enabled=1 AND key IN ('codex','claude')")}
+    order = [task['preferred_harness']] if task.get('preferred_harness') else ['codex', 'claude']
+    statuses = {}
+    for key in order:
+        harness = configured.get(key)
+        if not harness:
+            continue
+        status = remote_codex_account(runner, environment) if key == 'codex' else remote_claude_account(runner, environment)
+        statuses[key] = status
+        if status.get('installed') and status.get('authenticated'):
+            selected = dict(harness)
+            if task.get('preferred_model'):
+                selected['model'] = task['preferred_model']
+            return selected, 'remote preferred' if task.get('preferred_harness') else 'remote fallback'
+    details = '; '.join(f"{key}: {value.get('detail') or ('not connected' if not value.get('authenticated') else 'unavailable')}" for key, value in statuses.items())
+    raise ValueError('No supported authenticated harness is available in this persistent runner. Connect Codex or Claude Code in Coder first.' + (f' ({details})' if details else ''))
+
+
+def remote_agent_request(harness: Dict[str, Any], worktree: Dict[str, Any], task: Dict[str, Any], project: Dict[str, Any], permission_mode: str) -> str:
+    request = {'harness': harness['key'], 'model': harness.get('model') or 'default', 'prompt': task_prompt(task, project),
+               'permission_mode': permission_mode, 'worktree_path': worktree['worktree_path'], 'base_sha': worktree['base_sha'],
+               'verify_command': project.get('verify_command') or '', 'reply_path': worktree['worktree_path'] + '/.harness-last-message'}
+    encoded = base64.urlsafe_b64encode(json.dumps(request, separators=(',', ':')).encode()).decode()
+    return shlex.join(['python3', '-', encoded])
+
+
+def run_remote_agent(runner: Dict[str, Any], environment: Dict[str, str], command: str, output_file: Path) -> Tuple[Dict[str, Any], str]:
+    """Run the bounded remote helper and retain the transcript locally for review."""
+    process = subprocess.Popen(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--', command],
+                               env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, bufsize=1)
+    assert process.stdin and process.stdout
+    process.stdin.write((APP_ROOT / 'remote_agent_runner.py').read_text())
+    process.stdin.close()
+    captured = []
+    with output_file.open('w', encoding='utf-8') as handle:
+        for line in process.stdout:
+            captured.append(line)
+            handle.write(line)
+    code = process.wait()
+    transcript = ''.join(captured)
+    marker_at = transcript.rfind(REMOTE_RESULT_MARKER)
+    if code or marker_at < 0:
+        raise RuntimeError('The Coder runner did not return a complete agent result. Its task worktree was preserved.')
+    raw = transcript[marker_at + len(REMOTE_RESULT_MARKER):].strip().splitlines()[0]
+    try:
+        result = json.loads(raw)
+    except ValueError as exc:
+        raise RuntimeError('The Coder runner returned an unreadable agent result.') from exc
+    if not isinstance(result, dict):
+        raise RuntimeError('The Coder runner returned an invalid agent result.')
+    return result, transcript[:marker_at]
 
 
 def harness_availability(harness: Dict[str, Any]) -> Dict[str, str]:
@@ -1435,8 +1494,44 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
         assert task
         backend, _ = effective_execution_backend(project, task)
         if backend == 'coder':
-            workspace = provision_coder_execution(run_id, project, task)
-            update_run(run_id, 'stopped', f'Persistent runner {workspace} and this task’s worktree are ready. In-app model connection and remote agent dispatch are not enabled yet. No terminal login is required for this preparation step.')
+            prepared = provision_coder_execution(run_id, project, task)
+            runner, environment, remote_worktree = prepared['runner'], prepared['environment'], prepared['worktree']
+            harness, selection = choose_remote_harness(task, runner, environment)
+            permissions = json.loads(one('SELECT * FROM runs WHERE id=?', (run_id,))['permissions_json'] or '{}')
+            permission_mode = permissions.get(harness['key'], 'standard')
+            problem = permission_blocker(harness['key'], permission_mode)
+            if problem:
+                update_run(run_id, 'stopped', problem)
+                return
+            attempt_id = execute("""INSERT INTO attempts(task_id,harness_key,model,selection,status,started_at,worktree_path,branch_name,base_sha,run_id,tool_permissions)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (task_id, harness['key'], harness['model'], selection, 'running', now(),
+                remote_worktree['worktree_path'], remote_worktree['branch_name'], remote_worktree['base_sha'], run_id, permission_mode))
+            execute('UPDATE tasks SET last_attempt_id=? WHERE id=?', (attempt_id, task_id))
+            file = log_file(attempt_id)
+            execute('UPDATE attempts SET log_path=? WHERE id=?', (str(file), attempt_id))
+            execute("INSERT INTO task_messages(task_id,role,content,created_at,attempt_id) VALUES(?,'system',?,?,?)",
+                    (task_id, f"{harness['label']} started in persistent Coder runner {runner['workspace_name']}.", now(), attempt_id))
+            update_run(run_id, 'running', f"{harness['label']} is working in persistent runner {runner['workspace_name']}.", attempt_id)
+            result, output = run_remote_agent(runner, environment, remote_agent_request(harness, remote_worktree, task, project, permission_mode), file)
+            output += result.get('output') or ''
+            reply, failure = result.get('reply') or decode_result(harness['key'], result.get('output') or '')[0], None
+            if result.get('error'):
+                failure = result['error']
+            if failure or result.get('code'):
+                error = failure or ('Harness exceeded the remote execution timeout.' if result.get('timed_out') else f"Harness exited with code {result.get('code')}.")
+                execute("UPDATE attempts SET status='failed',ended_at=?,error=?,diff_output=? WHERE id=?", (now(), error, result.get('diff') or '', attempt_id))
+                update_run(run_id, 'stopped', f'{harness["label"]} stopped. {error}\nFiles remain in persistent runner {runner["workspace_name"]}.', attempt_id)
+                return
+            verification = result.get('verification') or ''
+            if result.get('verify_code'):
+                execute("UPDATE attempts SET status='verify_failed',ended_at=?,verify_output=?,error=?,diff_output=? WHERE id=?",
+                        (now(), verification, f"Verify command exited with code {result.get('verify_code')}", result.get('diff') or '', attempt_id))
+                update_run(run_id, 'stopped', f'Verification failed. Files remain in persistent runner {runner["workspace_name"]}.', attempt_id)
+                return
+            execute("UPDATE attempts SET status='verified',verify_output=?,diff_output=? WHERE id=?", (verification, result.get('diff') or '', attempt_id))
+            if reply.strip():
+                execute("INSERT INTO task_messages(task_id,role,content,created_at,attempt_id) VALUES(?,'assistant',?,?,?)", (task_id, reply.strip(), now(), attempt_id))
+            update_run(run_id, 'awaiting_review', f'Verification passed in persistent runner {runner["workspace_name"]}. Review the remote diff before committing or creating a pull request.', attempt_id)
             return
         harness, selection = choose_harness(task)
         if permission_retry:

@@ -302,11 +302,9 @@ denial, expiry, and duplicate connection requests. The UI distinguishes authoriz
 from installation and labels an existing installation as Manage repository access.
 
 The registry and provisioning slices now record Coder servers, verify credentials,
-publish the Docker blueprint, pass repository parameters, provision a workspace,
-validate its remote Git HEAD, and bind it to the execution lease. The next slice
-installs and authenticates approved headless harness CLIs, streams their remote
-process output, and applies checkpoint/fallback behavior. Existing local and
-Git-worktree modes retain their current behavior.
+select a reviewed template per project, provision or migrate a private persistent
+runner, create a task-owned remote Git worktree, and bind it to the execution lease.
+Existing local and Git-worktree modes retain their current behavior.
 
 ### Model connection slice, 2026-09-04
 
@@ -324,8 +322,15 @@ from the runner's Coder workspace until a stable structured Claude Code UI proto
 is available. This still gives the user one durable login per runner rather than
 one per task.
 
-The live persistent runner currently reports that neither Codex nor Claude Code is
-installed. The connection screen refuses to start a login until a reviewed template
-revision installs the requested CLI; this prevents a misleading, non-completing
-login sequence. Remote model dispatch, output streaming, fallback, verification,
-and pull-request creation remain future work.
+The runner template now installs Codex and Claude Code. A remote run chooses an
+enabled, authenticated native CLI in that runner, invokes it only in the task's
+recorded worktree, retains the transcript locally, runs the configured verification
+command in the same worktree, and returns a remote Git diff to the board. The remote
+helper has a ten-minute bound for the agent and another ten-minute bound for
+verification. It accepts a base64-encoded request and builds the fixed native CLI
+argument list remotely, so task text never becomes shell syntax.
+
+This is intentionally review-first: every successful remote task enters **Needs
+review**. It does not automatically commit, merge, push, create a pull request, or
+fall back to another model. Those operations need their own explicit remote Git and
+PR contract before they can be enabled safely.
