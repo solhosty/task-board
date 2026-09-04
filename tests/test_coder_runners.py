@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import base64
 import json
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -130,6 +131,12 @@ class CoderRunnerTests(unittest.TestCase):
         bridge.send.assert_called_once_with('one-time-code')
         self.assertEqual(result['screen'], 'waiting for code')
         app.MODEL_AUTH_FLOWS.pop(key, None)
+
+    def test_claude_login_screen_removes_terminal_control_sequences(self):
+        bridge = object.__new__(app.RemoteClaudeLogin)
+        bridge.lock = threading.RLock()
+        bridge.screen = '\x1b[?25hWelcome\x1b[0m\r\nhttps://example.test/login\x1b]0;title\x07'
+        self.assertEqual(bridge.snapshot(), 'Welcome\nhttps://example.test/login')
 
 
 def subprocess_result(stdout='', returncode=0, stderr=''):

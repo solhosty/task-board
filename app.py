@@ -186,6 +186,8 @@ class RemoteClaudeLogin:
                                         env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.STDOUT, bufsize=0)
         self.screen = ''
+        self.auto_style_selected = False
+        self.login_url_requested = False
         self.lock = threading.RLock()
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
@@ -199,18 +201,37 @@ class RemoteClaudeLogin:
             text = chunk.decode('utf-8', errors='replace')
             with self.lock:
                 self.screen = (self.screen + text)[-24000:]
+                # Claude's first-run theme picker is cosmetic. Select its default
+                # so the dashboard proceeds directly to the actual account login.
+                if not self.auto_style_selected and 'Choose the text style' in self.screen:
+                    self.auto_style_selected = True
+                    self.screen = 'Preparing Claude Code sign-in…\n'
+                    self._write('1\n')
+                # In SSH/container sessions Claude can ask the user to press c to
+                # reveal/copy its browser URL. Do that non-sensitive step here.
+                elif (self.auto_style_selected and not self.login_url_requested
+                      and re.search(r'press\s+c\b', self.screen, re.I)):
+                    self.login_url_requested = True
+                    self._write('c\n')
+
+    def _write(self, value: str) -> None:
+        if self.process.poll() is None and self.process.stdin:
+            self.process.stdin.write(value.encode('utf-8'))
+            self.process.stdin.flush()
 
     def send(self, value: str) -> None:
         if self.process.poll() is not None or not self.process.stdin:
             raise RuntimeError('The Claude login session closed. Start it again.')
         if not isinstance(value, str) or not value or len(value) > 8192 or '\x00' in value:
             raise ValueError('Enter a valid Claude login response.')
-        self.process.stdin.write(value.encode('utf-8') + b'\n')
-        self.process.stdin.flush()
+        self._write(value + '\n')
 
     def snapshot(self) -> str:
         with self.lock:
-            return self.screen
+            # CSI/OSC sequences are terminal rendering controls, not login text.
+            cleaned = re.sub(r'\x1b\][^\x07]*(?:\x07|\x1b\\)', '', self.screen)
+            cleaned = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', cleaned)
+            return cleaned.replace('\r', '')[-16000:]
 
     def close(self) -> None:
         if self.process.poll() is None:
