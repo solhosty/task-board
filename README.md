@@ -12,6 +12,18 @@ Coder-targeted task dispatch now provisions a task-named workspace from the proj
 
 ## Run
 
+### Coder connection setup
+
+Connected Accounts separates **Connect to Coder** (device authorization for the
+registered Coder account) from **Install for repository access** (GitHub App
+installation and repository selection). Both may be required. Installation alone
+does not authorize Coder, and authorization alone does not prove repository access.
+Harness polls the device exchange server-side, honoring pending and slow-down
+responses, and displays expiry or failure. The private device code stays in memory;
+only the one-time user code and verification URL reach the browser. Restarting
+Harness interrupts pending exchanges; begin a new connection after a restart.
+
+
 ```sh
 python3 app.py
 ```

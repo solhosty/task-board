@@ -205,6 +205,19 @@ ran locally, in a Coder workspace, or across several fallback attempts.
 
 ## Next implementation slice
 
+### Live validation, 2026-09-04
+
+The registered Coder account now reports GitHub authorized with one app installation.
+From `harness-auth-smoke-0904`, a read-only `git ls-remote` and a private clone of
+`solhosty/alpha-01` both succeeded. The earlier 403 is resolved. The smoke workspace
+contains Node and Python but no Codex, Claude, Droid, or OpenCode CLI. This validates
+repository read access, not push permissions or remote agent execution.
+
+Harness now owns the device-code exchange using the registered Coder token, instead
+of relying on a separate Coder browser session. Tests cover pending, slow-down,
+denial, expiry, and duplicate connection requests. The UI distinguishes authorization
+from installation and labels an existing installation as Manage repository access.
+
 The registry and provisioning slices now record Coder servers, verify credentials,
 publish the Docker blueprint, pass repository parameters, provision a workspace,
 validate its remote Git HEAD, and bind it to the execution lease. The next slice

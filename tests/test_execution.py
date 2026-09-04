@@ -92,6 +92,9 @@ print('Implemented the requested feature.', flush=True)
             'type': 'external',
             'authenticated': False,
             'login_url': 'http://127.0.0.1:3000/external-auth/github',
+            'install_url': None,
+            'installation_count': 0,
+            'app_installable': False,
         })
         self.assertNotIn('token', status)
         request.assert_called_once_with('http://127.0.0.1:3000', '/api/v2/external-auth/github', 'secret-token')

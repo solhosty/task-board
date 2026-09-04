@@ -85,6 +85,8 @@ ADAPTERS: Dict[str, Dict[str, Any]] = {
 
 CODER_SETUP_PROFILES = ("auto", "python", "node")
 KEYCHAIN_SERVICE = "Harness Rotation Coder"
+AUTH_FLOWS = {}
+AUTH_FLOW_LOCK = threading.RLock()
 
 
 class CoderExternalAuthRequired(RuntimeError):
@@ -374,7 +376,81 @@ def coder_external_auth_status(server: Dict[str, Any], provider: str = 'github')
         'type': payload.get('type') or 'external',
         'authenticated': bool(payload.get('authenticated')),
         'login_url': f"{server['base_url'].rstrip('/')}/external-auth/{provider}",
+        'install_url': safe_install_url(payload.get('app_install_url')),
+        'installation_count': len(payload.get('installations') or []),
+        'app_installable': bool(payload.get('app_installable')),
     }
+
+
+def safe_install_url(value: Any) -> Optional[str]:
+    parsed = urlparse(str(value or ''))
+    return str(value) if parsed.scheme == 'https' and parsed.hostname and not parsed.username and not parsed.password else None
+
+
+def device_exchange(server, token, provider, device_code):
+    request = Request(server['base_url'].rstrip('/') + f'/api/v2/external-auth/{provider}/device',
+                      data=json.dumps({'device_code': device_code}).encode(),
+                      headers={'Coder-Session-Token': token, 'Content-Type': 'application/json'}, method='POST')
+    try:
+        with urlopen(request, timeout=10) as response:
+            response.read()
+        return 'complete'
+    except HTTPError as exc:
+        try:
+            detail = json.loads(exc.read()).get('detail')
+        except (ValueError, AttributeError):
+            detail = None
+        if detail in ('authorization_pending', 'slow_down', 'expired_token', 'access_denied'):
+            return detail
+        raise ValueError(f'Coder device exchange failed (HTTP {exc.code}). Check Coder server logs.') from None
+
+
+def start_device_flow(server, provider):
+    if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', provider):
+        raise ValueError('Invalid provider ID')
+    key = (server['id'], provider)
+    with AUTH_FLOW_LOCK:
+        previous = AUTH_FLOWS.get(key)
+        if previous and previous['status'] == 'pending' and previous['expires_at'] > time.time():
+            return dict(previous)
+        token = read_coder_token(server)
+        if not token:
+            raise ValueError('Saved Coder token is unavailable')
+        device = coder_json(server['base_url'], f'/api/v2/external-auth/{provider}/device', token)
+        url = safe_install_url(device.get('verification_uri'))
+        if not url or not device.get('device_code') or not device.get('user_code'):
+            raise ValueError('Coder did not return a supported device authorization challenge')
+        flow = {'status': 'pending', 'user_code': device['user_code'], 'verification_url': url,
+                'expires_at': time.time() + int(device.get('expires_in') or 900),
+                'message': 'Waiting for GitHub/provider approval. Harness will finish the connection automatically.'}
+        AUTH_FLOWS[key] = flow
+        threading.Thread(target=finish_device_flow,
+                         args=(server, token, provider, device['device_code'], flow, max(5, int(device.get('interval') or 5))),
+                         daemon=True).start()
+        return dict(flow)
+
+
+def finish_device_flow(server, token, provider, device_code, flow, interval):
+    try:
+        while time.time() < flow['expires_at']:
+            time.sleep(interval)
+            if time.time() >= flow['expires_at']:
+                break
+            result = device_exchange(server, token, provider, device_code)
+            if result == 'authorization_pending':
+                continue
+            if result == 'slow_down':
+                interval += 5
+                continue
+            with AUTH_FLOW_LOCK:
+                flow['status'] = 'complete' if result == 'complete' else 'failed'
+                flow['message'] = 'Authorization saved in Coder. Repository access is a separate check.' if result == 'complete' else result.replace('_', ' ')
+            return
+        with AUTH_FLOW_LOCK:
+            flow.update(status='expired', message='Code expired. Start a new connection.')
+    except Exception:
+        with AUTH_FLOW_LOCK:
+            flow.update(status='failed', message='Coder could not finish the device exchange. Check server connectivity and retry.')
 
 
 def coder_external_auth_providers(server: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1207,6 +1283,11 @@ class API(SimpleHTTPRequestHandler):
                 server = coder_server_or_404(int(match.group(1)))
                 self.send_json({'providers': coder_external_auth_providers(server)})
                 return
+            match = re.match(r'^/api/coder-servers/(\d+)/external-auth/([a-z0-9_-]+)/flow$', route)
+            if match:
+                with AUTH_FLOW_LOCK:
+                    self.send_json(dict(AUTH_FLOWS.get((int(match.group(1)), match.group(2))) or {'status': 'idle'}))
+                return
             match = re.match(r'^/api/coder-servers/(\d+)/external-auth/([a-z0-9][a-z0-9_-]{0,63})$', route)
             if match:
                 server = coder_server_or_404(int(match.group(1)))
@@ -1281,6 +1362,10 @@ class API(SimpleHTTPRequestHandler):
             if not self.headers.get("Content-Type", "").startswith("application/json"):
                 raise ValueError("Expected a JSON request")
             payload = self.body()
+            match = re.match(r'^/api/coder-servers/(\d+)/external-auth/([a-z0-9_-]+)/connect$', route)
+            if match:
+                self.send_json(start_device_flow(coder_server_or_404(int(match.group(1))), match.group(2)))
+                return
             if route == "/api/scan":
                 self.send_json({"harnesses": scan_harnesses()})
                 return
