@@ -17,6 +17,7 @@ import subprocess
 import threading
 import time
 import uuid
+from queue import Empty, Queue
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -90,6 +91,8 @@ CODER_SETUP_PROFILES = ("auto", "python", "node")
 KEYCHAIN_SERVICE = "Harness Rotation Coder"
 AUTH_FLOWS = {}
 AUTH_FLOW_LOCK = threading.RLock()
+MODEL_AUTH_FLOWS = {}
+MODEL_AUTH_LOCK = threading.RLock()
 
 
 class CoderExternalAuthRequired(RuntimeError):
@@ -100,6 +103,71 @@ class CoderExternalAuthRequired(RuntimeError):
         self.display_name = display_name
         self.login_url = login_url
         super().__init__(f'{display_name} authorization is required. Open {login_url}')
+
+
+class RemoteCodexAppServer:
+    """A short-lived, private stdio bridge to Codex in one Coder runner.
+
+    The bridge transports JSON-RPC only.  It never receives, persists, or logs
+    OpenAI credentials: Codex owns its managed login in the runner's home.
+    """
+    def __init__(self, workspace_name: str, environment: Dict[str, str]):
+        self.process = subprocess.Popen(
+            ['coder', 'ssh', '--wait', 'yes', workspace_name, '--', 'codex', 'app-server'],
+            env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1)
+        self.responses: Dict[int, Queue] = {}
+        self.notifications: Queue = Queue()
+        self.next_id = 1
+        self.lock = threading.RLock()
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+        self.request('initialize', {'clientInfo': {'name': 'harness_rotation', 'title': 'Harness Rotation', 'version': '1'}})
+        self.notify('initialized', {})
+
+    def _read(self) -> None:
+        assert self.process.stdout
+        for line in self.process.stdout:
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict) and isinstance(payload.get('id'), int):
+                queue = self.responses.get(payload['id'])
+                if queue:
+                    queue.put(payload)
+            elif isinstance(payload, dict):
+                self.notifications.put(payload)
+
+    def send(self, payload: Dict[str, Any]) -> None:
+        if self.process.poll() is not None or not self.process.stdin:
+            raise RuntimeError('The remote Codex connection closed. Start the connection again.')
+        self.process.stdin.write(json.dumps(payload, separators=(',', ':')) + '\n')
+        self.process.stdin.flush()
+
+    def request(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: int = 20) -> Dict[str, Any]:
+        with self.lock:
+            request_id = self.next_id
+            self.next_id += 1
+            reply: Queue = Queue(maxsize=1)
+            self.responses[request_id] = reply
+            self.send({'method': method, 'id': request_id, 'params': params or {}})
+        try:
+            result = reply.get(timeout=timeout)
+        except Empty:
+            raise RuntimeError('Codex did not answer in time. Check that the runner is online and retry.') from None
+        finally:
+            self.responses.pop(request_id, None)
+        if result.get('error'):
+            raise RuntimeError(str(result['error'].get('message') or 'Remote Codex request failed.'))
+        return result.get('result') or {}
+
+    def notify(self, method: str, params: Dict[str, Any]) -> None:
+        self.send({'method': method, 'params': params})
+
+    def close(self) -> None:
+        if self.process.poll() is None:
+            self.process.terminate()
 
 
 def now() -> str:
@@ -324,6 +392,13 @@ def project_coder_profile(project_id: int) -> Optional[Dict[str, Any]]:
     if profile:
         profile['enabled'] = bool(profile['enabled'])
         profile['token_configured'] = bool(profile['token_configured'])
+    return profile
+
+
+def coder_profile_for_server(server_id: int) -> Dict[str, Any]:
+    profile = one('SELECT * FROM project_coder_profiles WHERE coder_server_id=? AND enabled=1 ORDER BY project_id LIMIT 1', (server_id,))
+    if not profile:
+        raise ValueError('Enable this Coder server for a project before connecting a model.')
     return profile
 
 
@@ -792,6 +867,123 @@ def ensure_coder_runner(server, profile):
                 workspace = coder_json(server['base_url'], path, token)
             runner = save_coder_runner(server, owner, workspace)
         return runner, environment
+
+
+def remote_codex_account(runner: Dict[str, Any], environment: Dict[str, str], refresh: bool = False) -> Dict[str, Any]:
+    """Read only the public account shape; never return an access token."""
+    installed = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--',
+                               'sh', '-lc', 'if command -v codex >/dev/null; then printf HARNESS_FOUND; else printf HARNESS_MISSING; fi'], env=environment,
+                              capture_output=True, text=True, timeout=45)
+    if installed.returncode or 'HARNESS_FOUND' not in installed.stdout:
+        return {'installed': False, 'authenticated': False,
+                'detail': 'Codex is not installed in this runner. Publish a template revision with Codex before connecting it.'}
+    bridge = RemoteCodexAppServer(runner['workspace_name'], environment)
+    try:
+        result = bridge.request('account/read', {'refreshToken': refresh})
+        account = result.get('account') if isinstance(result.get('account'), dict) else None
+        return {'installed': True, 'authenticated': bool(account),
+                'auth_mode': account.get('type') if account else None,
+                'plan_type': account.get('planType') if account else None,
+                'email': account.get('email') if account else None,
+                'requires_openai_auth': bool(result.get('requiresOpenaiAuth'))}
+    finally:
+        bridge.close()
+
+
+def remote_claude_account(runner: Dict[str, Any], environment: Dict[str, str]) -> Dict[str, Any]:
+    """Ask Claude Code for its native status without reading its credentials."""
+    present = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--',
+                              'sh', '-lc', 'if command -v claude >/dev/null; then printf HARNESS_FOUND; else printf HARNESS_MISSING; fi'], env=environment,
+                             capture_output=True, text=True, timeout=45)
+    if present.returncode or 'HARNESS_FOUND' not in present.stdout:
+        return {'installed': False, 'authenticated': False, 'detail': 'Claude Code is not installed in this runner.'}
+    checked = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--',
+                              'claude', 'auth', 'status', '--json'], env=environment,
+                             capture_output=True, text=True, timeout=45)
+    try:
+        payload = json.loads(checked.stdout)
+    except (ValueError, TypeError):
+        return {'installed': checked.returncode == 0, 'authenticated': checked.returncode == 0,
+                'detail': 'Claude Code did not return a readable native status.'}
+    # Keep only non-sensitive display fields and tolerate CLI version differences.
+    return {'installed': True, 'authenticated': bool(payload.get('loggedIn') or payload.get('authenticated') or payload.get('account')),
+            'auth_mode': str(payload.get('authMethod') or payload.get('auth_method') or '') or None,
+            'email': payload.get('email') if isinstance(payload.get('email'), str) else None,
+            'detail': None}
+
+
+def model_auth_status(server: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
+    runner, environment = ensure_coder_runner(server, profile)
+    try:
+        codex = remote_codex_account(runner, environment)
+    except Exception as exc:
+        codex = {'installed': False, 'authenticated': False, 'detail': 'Codex status could not be read from this runner.'}
+    try:
+        claude = remote_claude_account(runner, environment)
+    except Exception:
+        claude = {'installed': False, 'authenticated': False, 'detail': 'Claude Code status could not be read from this runner.'}
+    return {'runner': {'id': runner['id'], 'workspace_id': runner['workspace_id'], 'workspace_name': runner['workspace_name'],
+                       'workspace_url': runner['workspace_url']}, 'providers': {'codex': codex, 'claude': claude}}
+
+
+def start_remote_codex_login(server: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
+    runner, environment = ensure_coder_runner(server, profile)
+    probe = remote_codex_account(runner, environment)
+    if not probe.get('installed'):
+        raise ValueError(probe.get('detail') or 'Codex is not installed in this runner.')
+    if probe.get('authenticated'):
+        return {'status': 'complete', 'provider': 'codex', 'message': 'Codex is already connected in this persistent runner.'}
+    key = (server['id'], runner['workspace_id'], 'codex')
+    with MODEL_AUTH_LOCK:
+        prior = MODEL_AUTH_FLOWS.get(key)
+        if prior and prior['status'] == 'pending':
+            return {k: v for k, v in prior.items() if k != 'bridge'}
+        bridge = RemoteCodexAppServer(runner['workspace_name'], environment)
+        try:
+            result = bridge.request('account/login/start', {'type': 'chatgptDeviceCode'})
+        except Exception:
+            bridge.close()
+            raise
+        url, code, login_id = result.get('verificationUrl'), result.get('userCode'), result.get('loginId')
+        parsed = urlparse(str(url or ''))
+        if not login_id or not code or parsed.scheme != 'https' or parsed.hostname != 'auth.openai.com':
+            bridge.close()
+            raise RuntimeError('Codex returned an unsupported login challenge.')
+        flow = {'status': 'pending', 'provider': 'codex', 'login_id': login_id,
+                'verification_url': url, 'user_code': code, 'message': 'Waiting for ChatGPT approval in the browser.',
+                'bridge': bridge, 'started_at': time.time()}
+        MODEL_AUTH_FLOWS[key] = flow
+        threading.Thread(target=watch_remote_codex_login, args=(key, flow), daemon=True).start()
+        return {k: v for k, v in flow.items() if k != 'bridge'}
+
+
+def watch_remote_codex_login(key, flow) -> None:
+    bridge: RemoteCodexAppServer = flow['bridge']
+    try:
+        while time.time() - flow['started_at'] < 15 * 60:
+            try:
+                notice = bridge.notifications.get(timeout=5)
+            except Empty:
+                continue
+            if notice.get('method') != 'account/login/completed':
+                continue
+            params = notice.get('params') or {}
+            if params.get('loginId') != flow['login_id']:
+                continue
+            with MODEL_AUTH_LOCK:
+                flow['status'] = 'complete' if params.get('success') else 'failed'
+                flow['message'] = 'Codex is connected in this persistent runner.' if params.get('success') else 'Codex login did not complete.'
+            return
+        with MODEL_AUTH_LOCK:
+            flow.update(status='expired', message='The Codex sign-in expired. Start it again.')
+    finally:
+        bridge.close()
+
+
+def remote_codex_login_flow(server_id: int, workspace_id: str) -> Optional[Dict[str, Any]]:
+    with MODEL_AUTH_LOCK:
+        flow = MODEL_AUTH_FLOWS.get((server_id, workspace_id, 'codex'))
+        return {k: v for k, v in flow.items() if k != 'bridge'} if flow else None
 
 
 def reserve_runner_worktree(run_id, task, runner, repo_url):
@@ -1435,6 +1627,16 @@ class API(SimpleHTTPRequestHandler):
                 self.send_json({'runner': runner, 'workspaces': workspaces,
                                 'execution_ready': False, 'scheduler_limit': 1})
                 return
+            match = re.match(r'^/api/coder-servers/(\d+)/model-auth$', route)
+            if match:
+                server = coder_server_or_404(int(match.group(1)))
+                profile = coder_profile_for_server(server['id'])
+                status = model_auth_status(server, profile)
+                active = remote_codex_login_flow(server['id'], status['runner']['workspace_id'])
+                if active:
+                    status['providers']['codex']['flow'] = active
+                self.send_json(status)
+                return
             match = re.match(r'^/api/coder-servers/(\d+)/external-auth$', route)
             if match:
                 server = coder_server_or_404(int(match.group(1)))
@@ -1533,6 +1735,11 @@ class API(SimpleHTTPRequestHandler):
                 workspace = coder_json(server['base_url'], '/api/v2/users/me/workspace/' + quote(name, safe=''), token)
                 runner = save_coder_runner(server, owner, workspace, payload.get('max_tasks', 1))
                 self.send_json({'runner': runner})
+                return
+            match = re.match(r'^/api/coder-servers/(\d+)/model-auth/codex/connect$', route)
+            if match:
+                server = coder_server_or_404(int(match.group(1)))
+                self.send_json(start_remote_codex_login(server, coder_profile_for_server(server['id'])))
                 return
             match = re.match(r'^/api/coder-servers/(\d+)/external-auth/([a-z0-9_-]+)/connect$', route)
             if match:

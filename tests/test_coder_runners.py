@@ -96,3 +96,20 @@ class CoderRunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'legacy'):
                 app.provision_coder_execution('new-run', {'id':self.project}, task)
         ensure.assert_not_called()
+
+    def test_missing_remote_codex_never_starts_an_auth_bridge(self):
+        result = subprocess_result(stdout='HARNESS_MISSING')
+        with patch.object(app.subprocess, 'run', return_value=result), \
+             patch.object(app, 'RemoteCodexAppServer') as bridge:
+            status = app.remote_codex_account(self.runner, {'CODER_URL':'http://localhost:3000'})
+        self.assertFalse(status['installed'])
+        self.assertFalse(status['authenticated'])
+        bridge.assert_not_called()
+
+
+def subprocess_result(stdout='', returncode=0, stderr=''):
+    class Result:
+        pass
+    result = Result()
+    result.stdout, result.returncode, result.stderr = stdout, returncode, stderr
+    return result

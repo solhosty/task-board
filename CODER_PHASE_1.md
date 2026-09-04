@@ -307,3 +307,25 @@ validate its remote Git HEAD, and bind it to the execution lease. The next slice
 installs and authenticates approved headless harness CLIs, streams their remote
 process output, and applies checkpoint/fallback behavior. Existing local and
 Git-worktree modes retain their current behavior.
+
+### Model connection slice, 2026-09-04
+
+Harness now exposes **Models** for a Coder server. It resolves the private
+persistent runner and reports only public installation/authentication state. For
+Codex, the dashboard uses a private Coder-SSH stdio bridge to the official
+`codex app-server` device-code protocol: the dashboard can display the OpenAI
+verification URL and code, while Codex itself persists and refreshes its managed
+login in the runner home. Harness does not receive, log, or persist a ChatGPT
+access token.
+
+Claude Code is surfaced in the same screen and is intentionally not represented as
+a custom OAuth provider. Its native CLI login stays in the runner and is launched
+from the runner's Coder workspace until a stable structured Claude Code UI protocol
+is available. This still gives the user one durable login per runner rather than
+one per task.
+
+The live persistent runner currently reports that neither Codex nor Claude Code is
+installed. The connection screen refuses to start a login until a reviewed template
+revision installs the requested CLI; this prevents a misleading, non-completing
+login sequence. Remote model dispatch, output streaming, fallback, verification,
+and pull-request creation remain future work.
