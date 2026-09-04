@@ -10,6 +10,7 @@ import hashlib
 import os
 import re
 import shutil
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -23,9 +24,10 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from urllib.request import Request, urlopen
 from events import read_events
+from remote_worktree import validate_source
 
 
 def browse_directory(location: Optional[str] = None) -> Dict[str, Any]:
@@ -44,6 +46,7 @@ WORKTREE_ROOT = Path("/private/tmp/harness-rotation-worktrees")
 HOST, PORT = "127.0.0.1", 4173
 DB_LOCK = threading.RLock()
 RUN_LOCK = threading.RLock()
+CODER_RUNNER_LOCK = threading.RLock()
 CHILDREN = set()
 
 QUOTA_PATTERNS = [
@@ -190,7 +193,25 @@ def init_db() -> None:
           CHECK(default_target IN ('local','coder')),
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS coder_runners (
+          id INTEGER PRIMARY KEY, coder_server_id INTEGER NOT NULL REFERENCES coder_servers(id),
+          deployment_url TEXT NOT NULL, organization TEXT NOT NULL, owner_id TEXT NOT NULL,
+          workspace_id TEXT NOT NULL, workspace_name TEXT NOT NULL, workspace_url TEXT NOT NULL,
+          template_name TEXT NOT NULL, max_tasks INTEGER NOT NULL DEFAULT 1 CHECK(max_tasks BETWEEN 1 AND 8),
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          UNIQUE(coder_server_id, deployment_url, organization, owner_id)
+        );
+        CREATE TABLE IF NOT EXISTS coder_task_worktrees (
+          task_id INTEGER PRIMARY KEY REFERENCES tasks(id),
+          runner_id INTEGER NOT NULL REFERENCES coder_runners(id),
+          task_key TEXT NOT NULL UNIQUE, repo_url TEXT NOT NULL,
+          worktree_path TEXT, base_sha TEXT, branch_name TEXT,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
         """)
+        lease_columns = {item[1] for item in conn.execute('PRAGMA table_info(execution_leases)')}
+        if 'runner_id' not in lease_columns:
+            conn.execute('ALTER TABLE execution_leases ADD COLUMN runner_id INTEGER REFERENCES coder_runners(id)')
         columns = {item[1] for item in conn.execute("PRAGMA table_info(attempts)")}
         if "diff_output" not in columns:
             conn.execute("ALTER TABLE attempts ADD COLUMN diff_output TEXT")
@@ -686,40 +707,149 @@ def bind_local_execution_lease(run_id: str, worktree: Path, base_sha: Optional[s
         WHERE run_id=?""", (str(worktree), base_sha, now(), run_id))
 
 
+def coder_runner_context(server: Dict[str, Any]):
+    token = read_coder_token(server)
+    if not token:
+        raise ValueError('The Coder token is unavailable from Keychain.')
+    owner = coder_json(server['base_url'], '/api/v2/users/me', token)
+    if not owner.get('id'):
+        raise ValueError('Coder did not identify the authenticated user.')
+    organizations = coder_json(server['base_url'], '/api/v2/organizations', token).get('value', [])
+    matches = [org for org in organizations if server['organization'] in (org.get('id'), org.get('name'))
+               or (server['organization'] == 'default' and org.get('is_default'))]
+    if len(matches) != 1:
+        raise ValueError('The registered Coder organization could not be resolved uniquely.')
+    owner['_runner_organization_id'] = matches[0]['id']
+    runner = one('''SELECT * FROM coder_runners WHERE coder_server_id=? AND deployment_url=?
+        AND organization=? AND owner_id=?''',
+        (server['id'], server['base_url'], server['organization'], owner['id']))
+    return token, owner, runner
+
+
+def validate_runner_workspace(server, owner, workspace):
+    if workspace.get('owner_id') != owner['id']:
+        raise ValueError('A runner must belong to the authenticated Coder user.')
+    expected_org = owner.get('_runner_organization_id') or server['organization']
+    if expected_org not in (workspace.get('organization_id'), workspace.get('organization_name')):
+        raise ValueError('The runner must belong to the registered Coder organization.')
+    if workspace.get('shared_with'):
+        raise ValueError('Use a private workspace for the runner, not a shared workspace.')
+    if not workspace.get('id') or not workspace.get('name'):
+        raise ValueError('Coder returned incomplete workspace metadata.')
+
+
+def save_coder_runner(server, owner, workspace, max_tasks=1):
+    if type(max_tasks) is not int or not 1 <= max_tasks <= 8:
+        raise ValueError('Runner concurrency must be an integer from 1 to 8.')
+    validate_runner_workspace(server, owner, workspace)
+    with CODER_RUNNER_LOCK:
+        existing = one('''SELECT * FROM coder_runners WHERE coder_server_id=? AND deployment_url=?
+            AND organization=? AND owner_id=?''',
+            (server['id'], server['base_url'], server['organization'], owner['id']))
+        if existing and existing['workspace_id'] != workspace['id']:
+            raise ValueError('This account already has a runner. Moving its tasks and logins requires an explicit migration.')
+        workspace_url = server['base_url'].rstrip('/') + '/@' + quote(owner['username'], safe='') + '/' + quote(workspace['name'], safe='')
+        execute('''INSERT INTO coder_runners(coder_server_id,deployment_url,organization,owner_id,
+            workspace_id,workspace_name,workspace_url,template_name,max_tasks,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(coder_server_id,deployment_url,organization,owner_id)
+            DO UPDATE SET workspace_name=excluded.workspace_name,workspace_url=excluded.workspace_url,
+            max_tasks=excluded.max_tasks,updated_at=excluded.updated_at''',
+            (server['id'], server['base_url'], server['organization'], owner['id'], workspace['id'],
+             workspace['name'], workspace_url, workspace.get('template_name') or '', max_tasks, now(), now()))
+        return one('SELECT * FROM coder_runners WHERE coder_server_id=? AND deployment_url=? AND organization=? AND owner_id=?',
+                   (server['id'], server['base_url'], server['organization'], owner['id']))
+
+
+def ensure_coder_runner(server, profile):
+    with CODER_RUNNER_LOCK:
+        token, owner, runner = coder_runner_context(server)
+        environment = dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=token,
+                           CODER_ORGANIZATION=server['organization'])
+        if runner:
+            workspace = coder_json(server['base_url'], '/api/v2/workspaces/' + quote(runner['workspace_id'], safe=''), token)
+            validate_runner_workspace(server, owner, workspace)
+            if workspace['id'] != runner['workspace_id']:
+                raise ValueError('The saved runner no longer matches Coder. Recovery is required.')
+            # Keep the same workspace ID through renames; never replace a missing runner.
+            runner = save_coder_runner(server, owner, workspace, runner['max_tasks'])
+        else:
+            identity = json.dumps([server['base_url'], server['organization'], owner['id']])
+            name = 'harness-runner-' + hashlib.sha256(identity.encode()).hexdigest()[:12]
+            path = '/api/v2/users/me/workspace/' + name
+            try:
+                workspace = coder_json(server['base_url'], path, token)
+            except HTTPError as exc:
+                if exc.code != 404:
+                    raise
+                # Bootstrap once from the approved blueprint, without a project checkout.
+                command = ['coder', 'create', name, '--template', profile['template_name'],
+                           '--parameter', 'repo_url=', '--parameter', 'base_ref=main',
+                           '--parameter', 'auth_provider_id=' + (profile.get('auth_provider_id') or 'github'),
+                           '--stop-after', '8h', '--yes']
+                created = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=300)
+                if created.returncode:
+                    raise RuntimeError('Coder runner creation failed. Inspect its build in Coder; no existing runner was deleted.')
+                workspace = coder_json(server['base_url'], path, token)
+            runner = save_coder_runner(server, owner, workspace)
+        return runner, environment
+
+
+def reserve_runner_worktree(run_id, task, runner, repo_url):
+    """Snapshot task ownership and enforce the configured process-slot upper bound."""
+    with DB_LOCK, db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        occupied = conn.execute('''SELECT COUNT(*) FROM execution_leases l JOIN runs r ON r.id=l.run_id
+            WHERE l.runner_id=? AND r.id!=? AND r.status IN ('queued','running','verifying','rotating','committing')''',
+            (runner['id'], run_id)).fetchone()[0]
+        if occupied >= runner['max_tasks']:
+            raise ValueError('Runner capacity is occupied. Existing tasks are preserved; retry after a slot is free.')
+        saved = conn.execute('SELECT * FROM coder_task_worktrees WHERE task_id=?', (task['id'],)).fetchone()
+        if saved and (saved['runner_id'] != runner['id'] or saved['repo_url'] != repo_url):
+            raise ValueError('This task belongs to another runner or repository. Its work was preserved; create a new task or migrate explicitly.')
+        if not saved:
+            conn.execute('''INSERT INTO coder_task_worktrees(task_id,runner_id,task_key,repo_url,created_at,updated_at)
+                VALUES(?,?,?,?,?,?)''', (task['id'], runner['id'], 'task-' + uuid.uuid4().hex, repo_url, now(), now()))
+        conn.execute('''UPDATE execution_leases SET state='provisioning',runner_id=?,workspace_id=?,
+            workspace_name=?,workspace_url=?,template_name=?,updated_at=? WHERE run_id=?''',
+            (runner['id'], runner['workspace_id'], runner['workspace_name'], runner['workspace_url'], runner['template_name'], now(), run_id))
+    return one('SELECT * FROM coder_task_worktrees WHERE task_id=?', (task['id'],))
+
+
 def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[str, Any]) -> str:
     profile = project_coder_profile(project['id'])
     if not profile or not profile.get('coder_server_id'):
         raise ValueError('This project has no Coder environment configured.')
     server = coder_server_or_404(profile['coder_server_id'])
-    token = read_coder_token(server)
-    if not token:
-        raise ValueError('The Coder token is unavailable from Keychain.')
+    repo_url = profile.get('repo_url') or ''
+    validate_source(repo_url)
+    legacy = one("""SELECT id FROM execution_leases WHERE task_id=? AND backend='coder'
+        AND workspace_name IS NOT NULL AND runner_id IS NULL LIMIT 1""", (task['id'],))
+    if legacy:
+        raise ValueError('This task has a legacy task workspace. It was preserved; create a new task or explicitly migrate its work to a persistent runner.')
     provider_id = profile.get('auth_provider_id') or 'github'
     external_auth = coder_external_auth_status(server, provider_id)
     if not external_auth['authenticated']:
         execute("UPDATE execution_leases SET state='failed',updated_at=? WHERE run_id=?", (now(), run_id))
         raise CoderExternalAuthRequired(provider_id, external_auth['display_name'], external_auth['login_url'])
-    workspace = f'harness-task-{task["id"]}-{run_id[:8]}'
-    environment = dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=token,
-                       CODER_ORGANIZATION=server['organization'])
-    execute("""UPDATE execution_leases SET state='provisioning',workspace_name=?,workspace_url=?,
-        template_name=?,updated_at=? WHERE run_id=?""",
-        (workspace, f"{server['base_url']}/@{workspace}", profile['template_name'], now(), run_id))
-    command = ['coder', 'create', workspace, '--template', profile['template_name'], '--parameter',
-               f"repo_url={profile.get('repo_url') or ''}", '--parameter', f"base_ref={profile.get('base_ref') or 'main'}",
-               '--parameter', f"auth_provider_id={provider_id}",
-               '--stop-after', '8h', '--yes']
-    created = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=300)
-    if created.returncode:
-        raise RuntimeError(created.stderr.strip() or created.stdout.strip() or 'Coder workspace creation failed.')
-    checked = subprocess.run(['coder', 'ssh', '--wait', 'yes', workspace, '--', 'git', '-C', '/home/coder/task',
-                              'rev-parse', 'HEAD'], env=environment, capture_output=True, text=True, timeout=180)
+    runner, environment = ensure_coder_runner(server, profile)
+    saved = reserve_runner_worktree(run_id, task, runner, repo_url)
+    request = {'repo_url': repo_url, 'base_ref': profile.get('base_ref') or 'main', 'task_key': saved['task_key']}
+    command = shlex.join(['python3', '-', json.dumps(request)])
+    checked = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--', command],
+                             input=(APP_ROOT / 'remote_worktree.py').read_text(), env=environment,
+                             capture_output=True, text=True, timeout=300)
     if checked.returncode:
-        raise RuntimeError(checked.stderr.strip() or 'Coder workspace checkout validation failed.')
-    base_sha = checked.stdout.strip()
-    execute("""UPDATE execution_leases SET state='ready',workspace_name=?,worktree_path='/home/coder/task',
-        base_sha=?,updated_at=? WHERE run_id=?""", (workspace, base_sha, now(), run_id))
-    return workspace
+        execute("UPDATE execution_leases SET state='failed',updated_at=? WHERE run_id=?", (now(), run_id))
+        raise RuntimeError('Runner task checkout failed. Check repository access and branch; existing work was preserved.')
+    result = json.loads(checked.stdout)
+    expected_path = '/home/coder/.harness-runner/tasks/' + saved['task_key']
+    if result.get('worktree_path') != expected_path or not re.fullmatch(r'[a-f0-9]{40,64}', result.get('base_sha', '')):
+        raise RuntimeError('Runner returned an unexpected worktree or Git revision.')
+    execute('''UPDATE coder_task_worktrees SET worktree_path=?,base_sha=?,branch_name=?,updated_at=? WHERE task_id=?''',
+            (result['worktree_path'], result['base_sha'], result['branch_name'], now(), task['id']))
+    execute("UPDATE execution_leases SET state='ready',worktree_path=?,base_sha=?,updated_at=? WHERE run_id=?",
+            (result['worktree_path'], result['base_sha'], now(), run_id))
+    return runner['workspace_name']
 
 
 def harness_availability(harness: Dict[str, Any]) -> Dict[str, str]:
@@ -1089,7 +1219,7 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
         backend, _ = effective_execution_backend(project, task)
         if backend == 'coder':
             workspace = provision_coder_execution(run_id, project, task)
-            update_run(run_id, 'stopped', f'Coder workspace {workspace} is ready with the project checked out. Install and authenticate a remote harness CLI before agent dispatch can be enabled.')
+            update_run(run_id, 'stopped', f'Persistent runner {workspace} and this task’s worktree are ready. In-app model connection and remote agent dispatch are not enabled yet. No terminal login is required for this preparation step.')
             return
         harness, selection = choose_harness(task)
         if permission_retry:
@@ -1289,6 +1419,22 @@ class API(SimpleHTTPRequestHandler):
                 self.send_json({"api_version": 9, "projects": [serialize_project(item) for item in rows("SELECT * FROM projects ORDER BY id DESC")], "harnesses": harnesses,
                                 "coder_servers": [public_coder_server(item) for item in rows('SELECT * FROM coder_servers ORDER BY name')], "adapters": adapter_metadata()})
                 return
+            match = re.match(r'^/api/coder-servers/(\d+)/runner$', route)
+            if match:
+                server = coder_server_or_404(int(match.group(1)))
+                token, owner, runner = coder_runner_context(server)
+                catalog = coder_json(server['base_url'], '/api/v2/workspaces?q=owner%3Ame', token)
+                workspaces = []
+                for workspace in catalog.get('workspaces', []):
+                    try:
+                        validate_runner_workspace(server, owner, workspace)
+                    except ValueError:
+                        continue
+                    workspaces.append({'name': workspace['name'], 'id': workspace['id'],
+                                       'status': workspace.get('latest_build', {}).get('status', 'unknown')})
+                self.send_json({'runner': runner, 'workspaces': workspaces,
+                                'execution_ready': False, 'scheduler_limit': 1})
+                return
             match = re.match(r'^/api/coder-servers/(\d+)/external-auth$', route)
             if match:
                 server = coder_server_or_404(int(match.group(1)))
@@ -1307,7 +1453,11 @@ class API(SimpleHTTPRequestHandler):
             match = re.match(r"^/api/tasks/(\d+)$", route)
             if match:
                 task_id = int(match.group(1))
-                task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
+                # Read task/run together before slow availability checks. Otherwise
+                # a concurrent completion can pair an old task with a finished run.
+                with DB_LOCK:
+                    task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
+                    task_run = one('SELECT * FROM runs WHERE task_id=? ORDER BY rowid DESC LIMIT 1', (task_id,))
                 if not task:
                     raise ValueError("Task not found")
                 selected, selection = choose_harness(task)
@@ -1316,7 +1466,6 @@ class API(SimpleHTTPRequestHandler):
                     problem = permission_blocker(selected['key'], permission_snapshot(task)[selected['key']])
                     if problem:
                         blockers.append(problem)
-                task_run = one('SELECT * FROM runs WHERE task_id=? ORDER BY rowid DESC LIMIT 1', (task_id,))
                 self.send_json({"task": task, "next_harness": {'key': selected['key'], 'label': selected['label'], 'model': selected['model'], 'selection': selection} if selected else None,
                     "run": task_run,
                     "connection_action": run_connection_action(task_run),
@@ -1374,6 +1523,17 @@ class API(SimpleHTTPRequestHandler):
             if not self.headers.get("Content-Type", "").startswith("application/json"):
                 raise ValueError("Expected a JSON request")
             payload = self.body()
+            match = re.match(r'^/api/coder-servers/(\d+)/runner$', route)
+            if match:
+                server = coder_server_or_404(int(match.group(1)))
+                token, owner, _ = coder_runner_context(server)
+                name = str(payload.get('workspace_name') or '')
+                if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9-]{0,63}', name):
+                    raise ValueError('Choose an existing private Coder workspace.')
+                workspace = coder_json(server['base_url'], '/api/v2/users/me/workspace/' + quote(name, safe=''), token)
+                runner = save_coder_runner(server, owner, workspace, payload.get('max_tasks', 1))
+                self.send_json({'runner': runner})
+                return
             match = re.match(r'^/api/coder-servers/(\d+)/external-auth/([a-z0-9_-]+)/connect$', route)
             if match:
                 self.send_json(start_device_flow(coder_server_or_404(int(match.group(1))), match.group(2)))

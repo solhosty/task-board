@@ -8,6 +8,8 @@ An **attempt** is one harness working toward that task's goal. Codex, Claude Cod
 
 A **Coder server** is a registered self-hosted execution environment. Its URL, organization, capability status, and a yes/no indication that a credential exists are recorded by Harness. The API token itself is kept in the operating-system keychain and is never stored in project state.
 
+A **runner** is a persistent private Coder workspace bound to a deployment, organization, and authenticated Coder user. A **task worktree** is a separate Git working copy inside that runner and survives retries and fallback attempts. Native CLI credentials remain in the runner's persistent home; worktrees do not isolate credentials, processes, ports, or the operating-system user. The runner's configured concurrency limit is an admission ceiling, not a guarantee of parallel scheduling. See [CONTEXT.md](CONTEXT.md) for canonical terminology and [the runner decision](docs/adr/0001-persistent-coder-runners.md).
+
 A **project Coder profile** selects one Coder server and describes the project's approved remote environment: repository source, base branch, setup profile, and preferred execution target. Harness derives a versioned template from this profile and a server-specific approved blueprint.
 
 An **execution target** is the place a task runs: the project default, local, or the project’s Coder environment. Each task displays its effective target on the board and may override the project default. Selecting Coder never moves the user's local folder automatically; remote work starts from a reachable repository source and recorded checkpoint.

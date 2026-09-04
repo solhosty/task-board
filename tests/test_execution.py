@@ -122,6 +122,22 @@ print('Implemented the requested feature.', flush=True)
         self.assertTrue(providers[0]['authenticated'])
         self.assertNotIn('token', providers[0])
 
+    def test_runner_settings_roundtrip_does_not_expose_coder_credentials(self):
+        app.execute("INSERT INTO coder_servers(id,name,base_url,organization,created_at,updated_at) VALUES(1,'test','http://localhost:3000','default',?,?)", (app.now(), app.now()))
+        workspace = {'id':'runner-id','name':'test-runner','owner_id':'owner-id',
+                     'organization_name':'default','template_name':'base','latest_build':{'status':'running'}}
+        owner = {'id':'owner-id','username':'owner'}
+        with patch.object(app, 'coder_runner_context', return_value=('secret', owner, None)), \
+             patch.object(app, 'coder_json', return_value=workspace):
+            result = self.api('/api/coder-servers/1/runner', {'workspace_name':'test-runner','max_tasks':2})
+        self.assertEqual(result['runner']['max_tasks'], 2)
+        with patch.object(app, 'coder_runner_context', return_value=('secret', owner, result['runner'])), \
+             patch.object(app, 'coder_json', return_value={'workspaces':[workspace, dict(workspace, owner_id='another')]}):
+            status = self.api('/api/coder-servers/1/runner')
+        self.assertEqual(len(status['workspaces']), 1)
+        self.assertFalse(status['execution_ready'])
+        self.assertNotIn('secret', json.dumps(status))
+
     def test_permission_override_survives_quota_handoff(self):
         self.configure_worker('codex', 'quota')
         project = self.api('/api/projects', {'name':'Permissions', 'repo_path':str(self.repo), 'default_mode':'unattended'})
@@ -197,6 +213,20 @@ print('Implemented the requested feature.', flush=True)
         self.assertEqual((self.repo / 'feature.txt').read_text(), 'implemented and verified\n')
         self.assertEqual(state['task']['status'], 'completed')
         self.assertFalse(Path(state['attempts'][0]['worktree_path']).exists())
+
+    def test_task_and_run_snapshot_do_not_mix_across_completion(self):
+        _, task_id, run_id = self.create()
+        def complete_during_checks(*args):
+            app.execute("UPDATE tasks SET status='completed' WHERE id=?", (task_id,))
+            app.update_run(run_id, 'complete', 'Finished')
+            return []
+        with patch.object(app, 'execution_blockers', side_effect=complete_during_checks):
+            state = self.api(f'/api/tasks/{task_id}')
+        self.assertEqual(state['task']['status'], 'pending')
+        self.assertEqual(state['run']['status'], 'awaiting_dispatch')
+        state = self.api(f'/api/tasks/{task_id}')
+        self.assertEqual(state['task']['status'], 'completed')
+        self.assertEqual(state['run']['status'], 'complete')
 
     def test_execution_lease_is_created_then_bound_to_the_task_worktree(self):
         _, task_id, run_id = self.create()

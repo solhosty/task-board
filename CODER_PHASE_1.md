@@ -13,7 +13,7 @@ harness inside that workspace.
 
 ## Product outcome
 
-A task can run in an isolated Coder workspace and survive a quota handoff without
+A task can run in its own worktree on a persistent private Coder runner and survive a quota handoff without
 losing its working files, task context, attempt history, or verification evidence.
 The result reaches **Needs review** only after the project verification command
 passes. No task merges, deploys, or publishes automatically.
@@ -31,7 +31,7 @@ uses that record to compile a versioned template for a project on that server:
 ```text
 server capability record + approved blueprint + project Coder profile
   → harness-<server>-<project> template version
-  → task workspace / execution lease
+  → persistent runner (created once) → task worktree / execution lease
 ```
 
 A project Coder profile supplies the repository source, base branch, setup profile
@@ -80,7 +80,8 @@ and checkpoint reference.
 
 ```text
 Queued
-  → Provisioning workspace
+  → Finding/starting persistent runner
+  → Preparing or reusing task worktree
   → Restoring checkpoint (if any)
   → Running attempt
        → quota: checkpoint → next eligible harness → Running attempt
@@ -101,9 +102,10 @@ not reported as an active agent run.
    task-owned commit on the task branch; if a commit is unavailable, it stores an
    explicit patch artifact and the base SHA.
 3. The next harness resumes in the same workspace and task worktree.
-4. If that workspace is unavailable, the dispatcher provisions a replacement from
-   the recorded template, checks out the base SHA, restores the checkpoint, and only
-   then starts the next attempt.
+4. If the runner is stopped, reconnect to that same workspace. If its storage is
+   missing, stop for explicit recovery: never silently replace it and lose model
+   logins or task state. Replacement plus checkpoint restoration remains a future
+   recovery capability and may require signing in again.
 5. A checkpoint never overwrites the user's base branch or merges task work.
 
 This is stronger than the current local-only behavior, where files are preserved but
@@ -114,12 +116,13 @@ a harness-server restart marks an active attempt interrupted.
 The dispatcher uses Coder Community's normal workspace management and remote-command
 transport. It does not require Coder's paid native background-agent API.
 
-1. Ensure a task workspace exists from an approved Coder template.
+1. Ensure the user's private persistent runner exists from an approved Coder template.
 2. Wait until its workspace agent is healthy.
 3. Start the configured headless harness with Coder's remote command mechanism.
 4. Stream normalized output to the existing attempt log and task conversation.
 5. Apply the existing quota/cooldown and verification rules.
-6. Stop or retain the workspace according to the task outcome and recovery window.
+6. Retain the runner's storage and task worktree after the task ends. Do not stop a
+   runner merely because one of its tasks finishes; other tasks may still use it.
 
 The working directory must be an actual persistent workspace volume for the task's
 whole run. A fresh disposable clone per harness attempt would break the present
@@ -166,8 +169,8 @@ disposable repository and Coder workspace:
    lifecycle state.
 3. A deterministic quota result causes a second harness to continue in the same
    task worktree with the prior file edits present.
-4. Killing the remote workspace after a checkpoint results in a replacement workspace
-   that restores the work and can continue the task.
+4. Restarting the same runner preserves worktrees and native CLI authentication.
+   Missing storage results in an explicit recovery state, not a silent replacement.
 5. The configured verification command runs remotely and must pass before the run
    enters review.
 6. The user can inspect the diff and explicitly finish or close the run; no automatic
@@ -205,7 +208,72 @@ ran locally, in a Coder workspace, or across several fallback attempts.
 
 ## Next implementation slice
 
+### In-app model authentication requirement
+
+Users must initiate model connections in Harness, not copy a code from an assistant
+message or run a terminal command. Repository authorization remains separate from
+model authorization. Do not restart the manual remote-login workflow.
+
+Verified on 2026-09-04:
+
+- Codex 0.149.0's generated protocol schema supports
+  `account/login/start` with `type: chatgptDeviceCode` and returns `loginId`,
+  `verificationUrl`, and `userCode`.
+- A live stdio connection through Coder SSH to the installed remote app-server
+  successfully completed `initialize` and `account/read`. It returned no account;
+  this probe did not start login, inspect credentials, or invoke a model.
+- The documented integration lets the frontend display the provider URL/code and
+  observe `account/login/completed`, with cancellation and logout operations.
+  Use that protocol instead of scraping CLI output or implementing private OAuth
+  endpoints. Successful login must be followed by an account read before the UI
+  reports connected. Keep credentials and raw protocol logs out of browser payloads.
+
+The implementation should expose Connect, Cancel, Reconnect, and Disconnect within
+Connected accounts, scoped to the user and Coder server. OpenAI still hosts consent;
+Harness must never collect the user's OpenAI password. Keep the protocol transport
+behind authenticated Coder SSH, not a publicly exposed app-server socket.
+
+The accepted MVP uses a persistent per-user runner with separate task worktrees,
+keeping provider-managed credentials in one home. The runner has a configurable
+admission ceiling (1–8), while the current scheduler remains serial until remote
+dispatch and parallel CLI sessions are tested. Worktrees do not isolate secrets,
+ports, processes, or the OS user. Do not copy auth caches into disposable task
+containers or share a credential volume across users.
+
+Claude Code support is a required part of this design. Its unmodified native binary
+must own sign-in and credentials; do not implement a custom Claude subscription
+OAuth exchange or token broker. Anthropic's hosting guidance permits users signing
+into hosted, unmodified Claude Code subject to its conditions, but does not establish
+a Codex-style structured frontend authentication protocol. In-app access to the
+native flow, status checks, expiry and reconnect still need implementation and
+end-to-end testing. Do not silently switch subscription users to API billing.
+
+Codex support does not establish equivalent subscription-login support for other
+harnesses. Each adapter needs a supported connection mechanism before it can appear
+as an available remote fallback. Neither in-app model login nor credential reuse
+across task workspaces is implemented by the current GitHub connection UI.
+
+Sources: [Codex app-server authentication](https://learn.chatgpt.com/docs/app-server#authentication),
+[Codex credential storage and headless login](https://learn.chatgpt.com/docs/auth),
+[Claude Code authentication](https://code.claude.com/docs/en/authentication),
+[Claude Code hosting and credential conditions](https://code.claude.com/docs/en/legal-and-compliance).
+
 ### Live validation, 2026-09-04
+
+Persistent-runner preparation was validated against the existing
+`harness-clean-checkout-0904` workspace using `tests/live_persistent_runner.py` and
+a temporary local database. Two tasks used the same workspace ID, had different
+worktrees, and retained an uncommitted diagnostic file after repeated preparation.
+No workspace was created and no model login or inference was invoked. The two
+diagnostic worktrees remain in that test workspace. The dashboard's Runner panel
+successfully lists the registered account's private workspaces; no production
+runner selection was made by this test.
+
+The suite includes runner account/organization boundaries, stable binding, capacity
+admission, database reinitialization, concurrent checkout setup, setup interruption,
+missing-worktree detection, and preservation of dirty files and base revisions.
+Concurrent checkout setup is not a test of concurrent model execution or token
+refresh. The scheduler and model connection/dispatch work remain incomplete.
 
 The registered Coder account now reports GitHub authorized with one app installation.
 From `harness-auth-smoke-0904`, a read-only `git ls-remote` and a private clone of
