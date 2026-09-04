@@ -66,6 +66,9 @@ resource "coder_agent" "main" {
       sudo apt-get install -y --no-install-recommends git curl ca-certificates jq python3 python3-venv nodejs npm
       touch ~/.harness-base-ready
     fi
+    if [ ! -x ~/.codex/packages/standalone/current/bin/codex ]; then
+      curl -fsSL https://chatgpt.com/codex/install.sh | sh
+    fi
     mkdir -p /home/coder/task
     if [ -n "$HARNESS_REPO_URL" ] && [ ! -d /home/coder/task/.git ]; then
       git clone --branch "$HARNESS_BASE_REF" --single-branch -- "$HARNESS_REPO_URL" /home/coder/task
@@ -75,10 +78,6 @@ resource "coder_agent" "main" {
   env = {
     HARNESS_REPO_URL   = data.coder_parameter.repo_url.value
     HARNESS_BASE_REF   = data.coder_parameter.base_ref.value
-    GIT_AUTHOR_NAME    = coalesce(data.coder_workspace_owner.me.full_name, data.coder_workspace_owner.me.name)
-    GIT_AUTHOR_EMAIL   = data.coder_workspace_owner.me.email
-    GIT_COMMITTER_NAME = coalesce(data.coder_workspace_owner.me.full_name, data.coder_workspace_owner.me.name)
-    GIT_COMMITTER_EMAIL = data.coder_workspace_owner.me.email
   }
 
   metadata {

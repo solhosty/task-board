@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 from queue import Empty, Queue
-from contextlib import closing
+from contextlib import closing, nullcontext
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -51,6 +51,8 @@ RUN_LOCK = threading.RLock()
 CODER_RUNNER_LOCK = threading.RLock()
 CHILDREN = set()
 REMOTE_RESULT_MARKER = '__HARNESS_REMOTE_RESULT__'
+REMOTE_DELIVERY_MARKER = '__HARNESS_REMOTE_DELIVERY_RESULT__'
+RUNNER_CAPACITY_REFRESH_SECONDS = 60
 
 QUOTA_PATTERNS = [
     re.compile(pattern, re.I)
@@ -91,6 +93,7 @@ ADAPTERS: Dict[str, Dict[str, Any]] = {
 
 CODER_SETUP_PROFILES = ("auto", "python", "node")
 KEYCHAIN_SERVICE = "Harness Rotation Coder"
+REMOTE_CODEX_BIN = '/home/coder/.codex/packages/standalone/current/bin/codex'
 AUTH_FLOWS = {}
 AUTH_FLOW_LOCK = threading.RLock()
 MODEL_AUTH_FLOWS = {}
@@ -115,7 +118,7 @@ class RemoteCodexAppServer:
     """
     def __init__(self, workspace_name: str, environment: Dict[str, str]):
         self.process = subprocess.Popen(
-            ['coder', 'ssh', '--wait', 'yes', workspace_name, '--', '/home/coder/.local/bin/codex', 'app-server'],
+            ['coder', 'ssh', '--wait', 'yes', workspace_name, '--', REMOTE_CODEX_BIN, 'app-server'],
             env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1)
         self.responses: Dict[int, Queue] = {}
@@ -349,6 +352,8 @@ def init_db() -> None:
           deployment_url TEXT NOT NULL, organization TEXT NOT NULL, owner_id TEXT NOT NULL,
           workspace_id TEXT NOT NULL, workspace_name TEXT NOT NULL, workspace_url TEXT NOT NULL,
           template_name TEXT NOT NULL, max_tasks INTEGER NOT NULL DEFAULT 1 CHECK(max_tasks BETWEEN 1 AND 8),
+          detected_cpu_count INTEGER, detected_memory_bytes INTEGER, detected_max_tasks INTEGER,
+          capacity_checked_at TEXT,
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
           UNIQUE(coder_server_id, deployment_url, organization, owner_id)
         );
@@ -363,6 +368,13 @@ def init_db() -> None:
         lease_columns = {item[1] for item in conn.execute('PRAGMA table_info(execution_leases)')}
         if 'runner_id' not in lease_columns:
             conn.execute('ALTER TABLE execution_leases ADD COLUMN runner_id INTEGER REFERENCES coder_runners(id)')
+        runner_columns = {item[1] for item in conn.execute('PRAGMA table_info(coder_runners)')}
+        for column, definition in (
+            ('detected_cpu_count', 'INTEGER'), ('detected_memory_bytes', 'INTEGER'),
+            ('detected_max_tasks', 'INTEGER'), ('capacity_checked_at', 'TEXT'),
+        ):
+            if column not in runner_columns:
+                conn.execute(f'ALTER TABLE coder_runners ADD COLUMN {column} {definition}')
         columns = {item[1] for item in conn.execute("PRAGMA table_info(attempts)")}
         if "diff_output" not in columns:
             conn.execute("ALTER TABLE attempts ADD COLUMN diff_output TEXT")
@@ -785,7 +797,25 @@ def adapter_metadata() -> Dict[str, Any]:
 
 
 def current_run(project_id: int) -> Optional[Dict[str, Any]]:
-    return one("SELECT * FROM runs WHERE project_id=? AND status NOT IN ('complete','stopped','discarded','blocked') ORDER BY rowid DESC LIMIT 1", (project_id,))
+    return (active_runs(project_id) or [None])[0]
+
+
+def active_runs(project_id: int) -> List[Dict[str, Any]]:
+    return rows("SELECT * FROM runs WHERE project_id=? AND status NOT IN ('complete','stopped','discarded','blocked') ORDER BY rowid DESC", (project_id,))
+
+
+def remote_parallel_capacity(profile: Optional[Dict[str, Any]]) -> int:
+    """Use the last capacity measured inside the persistent Coder runner."""
+    if not profile or not profile.get('coder_server_id'):
+        return 1
+    runner = one('SELECT detected_max_tasks FROM coder_runners WHERE coder_server_id=? ORDER BY rowid DESC LIMIT 1',
+                 (profile['coder_server_id'],))
+    return max(1, int(runner['detected_max_tasks'] or 1)) if runner else 1
+
+
+def run_backend(run_id: str) -> Optional[str]:
+    lease = execution_lease(run_id)
+    return lease.get('backend') if lease else None
 
 
 def execution_lease(run_id: str) -> Optional[Dict[str, Any]]:
@@ -810,6 +840,18 @@ def task_pull_requests(task_id: int) -> List[Dict[str, Any]]:
 def pull_request_status(project: Dict[str, Any], pull_request: Dict[str, Any]) -> Dict[str, Any]:
     if pull_request['provider'] != 'github':
         raise ValueError('Only GitHub pull-request sync is supported in this phase.')
+    remote_worktree = one('SELECT * FROM coder_task_worktrees WHERE task_id=?', (pull_request['task_id'],))
+    if remote_worktree:
+        profile = project_coder_profile(project['id'])
+        if not profile or not profile.get('coder_server_id'):
+            raise ValueError('This remote task no longer has a Coder profile for pull-request sync.')
+        runner, environment = ensure_coder_runner(coder_server_or_404(profile['coder_server_id']), profile)
+        payload = run_remote_pr_status(runner, environment, remote_pr_status_request(pull_request, profile))
+        raw_state = str(payload.get('state', '')).lower()
+        pr_state = 'merged' if payload.get('merged_at') or raw_state == 'merged' else 'closed' if raw_state == 'closed' else 'open'
+        return {'url': payload.get('url') or pull_request['url'], 'number': str(payload.get('number') or '') or None,
+                'branch_name': payload.get('branch_name'), 'head_sha': payload.get('head_sha'), 'state': pr_state,
+                'review_state': 'pending' if pr_state == 'open' else 'unknown', 'merged_at': payload.get('merged_at')}
     if not shutil.which('gh'):
         raise ValueError('GitHub CLI (gh) is not installed on the harness server.')
     fields = 'url,number,state,isDraft,reviewDecision,mergedAt,headRefName,headRefOid'
@@ -896,9 +938,7 @@ def validate_runner_workspace(server, owner, workspace):
         raise ValueError('Coder returned incomplete workspace metadata.')
 
 
-def save_coder_runner(server, owner, workspace, max_tasks=1, allow_migration=False):
-    if type(max_tasks) is not int or not 1 <= max_tasks <= 8:
-        raise ValueError('Runner concurrency must be an integer from 1 to 8.')
+def save_coder_runner(server, owner, workspace, allow_migration=False):
     validate_runner_workspace(server, owner, workspace)
     with CODER_RUNNER_LOCK:
         existing = one('''SELECT * FROM coder_runners WHERE coder_server_id=? AND deployment_url=?
@@ -908,19 +948,66 @@ def save_coder_runner(server, owner, workspace, max_tasks=1, allow_migration=Fal
             if not allow_migration:
                 raise ValueError('This account already has a runner. Moving its tasks and logins requires an explicit migration.')
             workspace_url = server['base_url'].rstrip('/') + '/@' + quote(owner['username'], safe='') + '/' + quote(workspace['name'], safe='')
-            execute('''UPDATE coder_runners SET workspace_id=?,workspace_name=?,workspace_url=?,template_name=?,max_tasks=?,updated_at=? WHERE id=?''',
-                    (workspace['id'], workspace['name'], workspace_url, workspace.get('template_name') or '', max_tasks, now(), existing['id']))
+            execute('''UPDATE coder_runners SET workspace_id=?,workspace_name=?,workspace_url=?,template_name=?,
+                detected_cpu_count=NULL,detected_memory_bytes=NULL,detected_max_tasks=NULL,capacity_checked_at=NULL,updated_at=? WHERE id=?''',
+                    (workspace['id'], workspace['name'], workspace_url, workspace.get('template_name') or '', now(), existing['id']))
             return one('SELECT * FROM coder_runners WHERE id=?', (existing['id'],))
         workspace_url = server['base_url'].rstrip('/') + '/@' + quote(owner['username'], safe='') + '/' + quote(workspace['name'], safe='')
         execute('''INSERT INTO coder_runners(coder_server_id,deployment_url,organization,owner_id,
-            workspace_id,workspace_name,workspace_url,template_name,max_tasks,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(coder_server_id,deployment_url,organization,owner_id)
+            workspace_id,workspace_name,workspace_url,template_name,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(coder_server_id,deployment_url,organization,owner_id)
             DO UPDATE SET workspace_name=excluded.workspace_name,workspace_url=excluded.workspace_url,
-            max_tasks=excluded.max_tasks,updated_at=excluded.updated_at''',
+            template_name=excluded.template_name,updated_at=excluded.updated_at''',
             (server['id'], server['base_url'], server['organization'], owner['id'], workspace['id'],
-             workspace['name'], workspace_url, workspace.get('template_name') or '', max_tasks, now(), now()))
+             workspace['name'], workspace_url, workspace.get('template_name') or '', now(), now()))
         return one('SELECT * FROM coder_runners WHERE coder_server_id=? AND deployment_url=? AND organization=? AND owner_id=?',
                    (server['id'], server['base_url'], server['organization'], owner['id']))
+
+
+def runner_capacity(runner: Dict[str, Any]) -> int:
+    return max(1, int(runner.get('detected_max_tasks') or 1))
+
+
+def refresh_runner_capacity(runner: Dict[str, Any], environment: Dict[str, str], force: bool = False) -> Dict[str, Any]:
+    """Measure limits from inside the runner; a failed probe preserves the last safe value."""
+    checked = runner.get('capacity_checked_at')
+    if not force and checked:
+        try:
+            if (datetime.now(timezone.utc) - datetime.fromisoformat(checked)).total_seconds() < RUNNER_CAPACITY_REFRESH_SECONDS:
+                return runner
+        except ValueError:
+            pass
+    command = shlex.join(['python3', '-'])
+    probed = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--', command],
+                            input=(APP_ROOT / 'remote_runner_capacity.py').read_text(), env=environment,
+                            capture_output=True, text=True, timeout=45)
+    if probed.returncode:
+        return runner
+    try:
+        details = json.loads(probed.stdout)
+        cpu = int(details['cpu_count'])
+        memory = int(details['memory_bytes']) if details.get('memory_bytes') else None
+        capacity = int(details['max_tasks'])
+        per_task = int(details['memory_per_task_bytes'])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return runner
+    if cpu < 1 or capacity < 1 or per_task != 2 * 1024 ** 3 or capacity > cpu:
+        return runner
+    if memory is not None and memory < 1:
+        return runner
+    execute('''UPDATE coder_runners SET detected_cpu_count=?,detected_memory_bytes=?,detected_max_tasks=?,capacity_checked_at=?,updated_at=? WHERE id=?''',
+            (cpu, memory, capacity, now(), now(), runner['id']))
+    return one('SELECT * FROM coder_runners WHERE id=?', (runner['id'],))
+
+
+def refresh_saved_runner_capacity(server: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Refresh an existing runner before scheduling; never create one just to inspect capacity."""
+    token, _, runner = coder_runner_context(server)
+    if not runner:
+        return None
+    environment = dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=token,
+                       CODER_ORGANIZATION=server['organization'])
+    return refresh_runner_capacity(runner, environment)
 
 
 def ensure_coder_runner(server, profile):
@@ -936,7 +1023,7 @@ def ensure_coder_runner(server, profile):
             if profile.get('template_name') and workspace.get('template_name') and workspace['template_name'] != profile['template_name']:
                 raise ValueError('The saved runner uses a different template. Use runner migration; the old workspace will be preserved.')
             # Keep the same workspace ID through renames; never replace a missing runner.
-            runner = save_coder_runner(server, owner, workspace, runner['max_tasks'])
+            runner = save_coder_runner(server, owner, workspace)
         else:
             identity = json.dumps([server['base_url'], server['organization'], owner['id']])
             name = 'harness-runner-' + hashlib.sha256(identity.encode()).hexdigest()[:12]
@@ -953,10 +1040,10 @@ def ensure_coder_runner(server, profile):
                     raise RuntimeError('Coder runner creation failed. Inspect its build in Coder; no existing runner was deleted.')
                 workspace = coder_json(server['base_url'], path, token)
             runner = save_coder_runner(server, owner, workspace)
-        return runner, environment
+        return refresh_runner_capacity(runner, environment), environment
 
 
-def migrate_coder_runner(server: Dict[str, Any], profile: Dict[str, Any], max_tasks: int = 1) -> Dict[str, Any]:
+def migrate_coder_runner(server: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
     """Create a fresh private runner from the selected template; never delete the old one."""
     with CODER_RUNNER_LOCK:
         token, owner, previous = coder_runner_context(server)
@@ -972,7 +1059,7 @@ def migrate_coder_runner(server: Dict[str, Any], profile: Dict[str, Any], max_ta
         if created.returncode:
             raise RuntimeError('Coder could not create the new runner. The old runner remains unchanged; inspect the template build in Coder.')
         workspace = coder_json(server['base_url'], '/api/v2/users/me/workspace/' + quote(name, safe=''), token)
-        runner = save_coder_runner(server, owner, workspace, max_tasks, allow_migration=True)
+        runner = refresh_runner_capacity(save_coder_runner(server, owner, workspace, allow_migration=True), environment, force=True)
         return {'runner': runner, 'previous_workspace_id': previous['workspace_id'] if previous else None,
                 'previous_workspace_name': previous['workspace_name'] if previous else None}
 
@@ -980,9 +1067,9 @@ def migrate_coder_runner(server: Dict[str, Any], profile: Dict[str, Any], max_ta
 def remote_codex_account(runner: Dict[str, Any], environment: Dict[str, str], refresh: bool = False) -> Dict[str, Any]:
     """Read only the public account shape; never return an access token."""
     installed = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--',
-                               'ls', '-l', '/home/coder/.local/bin/codex'], env=environment,
+                               'test', '-x', REMOTE_CODEX_BIN], env=environment,
                               capture_output=True, text=True, timeout=45)
-    if installed.returncode or 'codex' not in installed.stdout:
+    if installed.returncode:
         return {'installed': False, 'authenticated': False,
                 'detail': 'Codex is not installed in this runner. Publish a template revision with Codex before connecting it.'}
     bridge = RemoteCodexAppServer(runner['workspace_name'], environment)
@@ -1188,13 +1275,13 @@ def send_remote_claude_login_input(server_id: int, workspace_id: str, value: str
 
 
 def reserve_runner_worktree(run_id, task, runner, repo_url):
-    """Snapshot task ownership and enforce the configured process-slot upper bound."""
+    """Snapshot task ownership and enforce the measured process-slot upper bound."""
     with DB_LOCK, db() as conn:
         conn.execute('BEGIN IMMEDIATE')
         occupied = conn.execute('''SELECT COUNT(*) FROM execution_leases l JOIN runs r ON r.id=l.run_id
             WHERE l.runner_id=? AND r.id!=? AND r.status IN ('queued','running','verifying','rotating','committing')''',
             (runner['id'], run_id)).fetchone()[0]
-        if occupied >= runner['max_tasks']:
+        if occupied >= runner_capacity(runner):
             raise ValueError('Runner capacity is occupied. Existing tasks are preserved; retry after a slot is free.')
         saved = conn.execute('SELECT * FROM coder_task_worktrees WHERE task_id=?', (task['id'],)).fetchone()
         if saved and (saved['runner_id'] != runner['id'] or saved['repo_url'] != repo_url):
@@ -1246,12 +1333,16 @@ def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[s
             'worktree': one('SELECT * FROM coder_task_worktrees WHERE task_id=?', (task['id'],))}
 
 
-def choose_remote_harness(task: Dict[str, Any], runner: Dict[str, Any], environment: Dict[str, str]) -> Tuple[Dict[str, Any], str]:
+def choose_remote_harness(task: Dict[str, Any], runner: Dict[str, Any], environment: Dict[str, str],
+                          excluded_keys: Tuple[str, ...] = ()) -> Tuple[Dict[str, Any], str]:
     """Choose only CLIs installed and signed in inside this runner, never locally."""
     configured = {item['key']: item for item in rows("SELECT * FROM harnesses WHERE enabled=1 AND key IN ('codex','claude')")}
-    order = [task['preferred_harness']] if task.get('preferred_harness') else ['codex', 'claude']
+    order = ([task['preferred_harness']] if task.get('preferred_harness') else [])
+    order += [key for key in ('codex', 'claude') if key not in order]
     statuses = {}
     for key in order:
+        if key in excluded_keys:
+            continue
         harness = configured.get(key)
         if not harness:
             continue
@@ -1261,7 +1352,7 @@ def choose_remote_harness(task: Dict[str, Any], runner: Dict[str, Any], environm
             selected = dict(harness)
             if task.get('preferred_model'):
                 selected['model'] = task['preferred_model']
-            return selected, 'remote preferred' if task.get('preferred_harness') else 'remote fallback'
+            return selected, 'remote preferred' if task.get('preferred_harness') == key else 'remote fallback'
     details = '; '.join(f"{key}: {value.get('detail') or ('not connected' if not value.get('authenticated') else 'unavailable')}" for key, value in statuses.items())
     raise ValueError('No supported authenticated harness is available in this persistent runner. Connect Codex or Claude Code in Coder first.' + (f' ({details})' if details else ''))
 
@@ -1300,6 +1391,67 @@ def run_remote_agent(runner: Dict[str, Any], environment: Dict[str, str], comman
     if not isinstance(result, dict):
         raise RuntimeError('The Coder runner returned an invalid agent result.')
     return result, transcript[:marker_at]
+
+
+def remote_delivery_request(worktree: Dict[str, Any], task: Dict[str, Any], profile: Dict[str, Any]) -> str:
+    request = {'worktree_path': worktree['worktree_path'], 'branch_name': worktree['branch_name'],
+               'base_sha': worktree['base_sha'], 'repo_url': profile['repo_url'],
+               'base_ref': profile['base_ref'], 'auth_provider_id': profile.get('auth_provider_id') or 'github',
+               'title': task['text']}
+    encoded = base64.urlsafe_b64encode(json.dumps(request, separators=(',', ':')).encode()).decode()
+    return shlex.join(['python3', '-', encoded])
+
+
+def run_remote_delivery(runner: Dict[str, Any], environment: Dict[str, str], command: str) -> Dict[str, Any]:
+    """Run the fixed remote delivery helper without bringing credentials home."""
+    process = subprocess.Popen(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--', command],
+                               env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True)
+    assert process.stdin and process.stdout
+    process.stdin.write((APP_ROOT / 'remote_delivery_runner.py').read_text())
+    process.stdin.close()
+    transcript = process.stdout.read()
+    code = process.wait()
+    marker_at = transcript.rfind(REMOTE_DELIVERY_MARKER)
+    if code or marker_at < 0:
+        raise RuntimeError('The Coder runner did not return a complete delivery result. The remote worktree was preserved.')
+    try:
+        result = json.loads(transcript[marker_at + len(REMOTE_DELIVERY_MARKER):].strip().splitlines()[0])
+    except ValueError:
+        raise RuntimeError('The Coder runner returned an unreadable delivery result.') from None
+    if not isinstance(result, dict) or result.get('error'):
+        raise RuntimeError((result or {}).get('error') or 'The Coder runner could not deliver the remote task.')
+    if not result.get('commit_sha') or not result.get('pr_url'):
+        raise RuntimeError('The Coder runner returned an incomplete delivery result.')
+    return result
+
+
+def remote_pr_status_request(pull_request: Dict[str, Any], profile: Dict[str, Any]) -> str:
+    request = {'action': 'status', 'pr_url': pull_request['url'],
+               'auth_provider_id': profile.get('auth_provider_id') or 'github'}
+    encoded = base64.urlsafe_b64encode(json.dumps(request, separators=(',', ':')).encode()).decode()
+    return shlex.join(['python3', '-', encoded])
+
+
+def run_remote_pr_status(runner: Dict[str, Any], environment: Dict[str, str], command: str) -> Dict[str, Any]:
+    process = subprocess.Popen(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--', command],
+                               env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True)
+    assert process.stdin and process.stdout
+    process.stdin.write((APP_ROOT / 'remote_delivery_runner.py').read_text())
+    process.stdin.close()
+    transcript = process.stdout.read()
+    code = process.wait()
+    marker_at = transcript.rfind(REMOTE_DELIVERY_MARKER)
+    if code or marker_at < 0:
+        raise RuntimeError('The Coder runner did not return a pull-request status. The task branch was preserved.')
+    try:
+        result = json.loads(transcript[marker_at + len(REMOTE_DELIVERY_MARKER):].strip().splitlines()[0])
+    except ValueError:
+        raise RuntimeError('The Coder runner returned an unreadable pull-request status.') from None
+    if not isinstance(result, dict) or result.get('error') or not result.get('url'):
+        raise RuntimeError((result or {}).get('error') or 'The Coder runner could not read the pull-request status.')
+    return result
 
 
 def harness_availability(harness: Dict[str, Any]) -> Dict[str, str]:
@@ -1342,9 +1494,24 @@ def execution_blockers(project: Dict[str, Any], task: Optional[Dict[str, Any]] =
 
 
 def request_run(project_id: int, task_id: Optional[int] = None) -> Dict[str, Any]:
+    # Do this outside the scheduler lock: Coder SSH may take a moment, and an
+    # existing runner is enough to measure without provisioning anything.
+    preflight_project = project_or_404(project_id)
+    preflight_task = one("SELECT * FROM tasks WHERE project_id=? AND status='pending'" + (' AND id=?' if task_id else ' ORDER BY task_order LIMIT 1'),
+                         (project_id, int(task_id)) if task_id else (project_id,))
+    if preflight_task:
+        preflight_backend, preflight_profile = effective_execution_backend(preflight_project, preflight_task)
+        if preflight_backend == 'coder' and preflight_profile and preflight_profile.get('coder_server_id'):
+            try:
+                refresh_saved_runner_capacity(coder_server_or_404(preflight_profile['coder_server_id']))
+            except (ValueError, RuntimeError, HTTPError, URLError, OSError, subprocess.TimeoutExpired):
+                # Execution blockers and provisioning report Coder failures; a
+                # failed telemetry read must not discard a known safe capacity.
+                pass
     with DB_LOCK:
         project = project_or_404(project_id)
-        busy = current_run(project_id)
+        active = active_runs(project_id)
+        busy = active[0] if active else None
         if busy and task_id and busy['task_id'] == int(task_id):
             return {'run_id': busy['id'], 'status': busy['status'], 'message': busy['message']}
         task = one("SELECT * FROM tasks WHERE project_id=? AND status='pending'" + (' AND id=?' if task_id else ' ORDER BY task_order LIMIT 1'),
@@ -1353,8 +1520,13 @@ def request_run(project_id: int, task_id: Optional[int] = None) -> Dict[str, Any
             raise ValueError('No pending task to run')
         mode = effective_mode(project, task)
         blockers = execution_blockers(project, task)
-        if busy:
-            blockers.append('Another task in this project has an active or paused run. Finish that run first.')
+        backend, profile = effective_execution_backend(project, task)
+        occupied_remote = [run for run in active if run['status'] in ('awaiting_dispatch', 'queued', 'running', 'verifying', 'rotating', 'committing')]
+        if active:
+            if backend != 'coder' or any(run_backend(run['id']) != 'coder' for run in active):
+                blockers.append('Another task in this project has an active or paused run. Finish that run first.')
+            elif len(occupied_remote) >= remote_parallel_capacity(profile):
+                blockers.append(f'The persistent Coder runner has reached its environment capacity ({remote_parallel_capacity(profile)} task(s)).')
         harness, _ = choose_harness(task)
         permissions = permission_snapshot(task)
         if harness:
@@ -1367,7 +1539,7 @@ def request_run(project_id: int, task_id: Optional[int] = None) -> Dict[str, Any
         execute('INSERT INTO runs(id,project_id,task_id,mode,status,message,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)',
                 (run_id, project_id, task['id'], mode, status, message, now(), now()))
         execute('UPDATE runs SET permissions_json=? WHERE id=?', (json.dumps(permissions), run_id))
-        create_execution_lease(run_id, task['id'], effective_execution_backend(project, task)[0])
+        create_execution_lease(run_id, task['id'], backend)
     if status == 'queued':
         threading.Thread(target=run_attempt, args=(run_id, project_id, task['id']), daemon=True).start()
     return {'run_id': run_id, 'status': status, 'message': message}
@@ -1536,8 +1708,11 @@ def decode_result(key: str, output: str) -> Tuple[str, Optional[str]]:
             continue
         if not isinstance(event, dict):
             continue
-        if event.get('type') == 'item.completed' and event.get('item', {}).get('type') == 'agent_message':
-            messages.append(event['item'].get('text', ''))
+        item = event.get('item') if isinstance(event.get('item'), dict) else {}
+        if event.get('type') == 'item.completed' and item.get('type') == 'agent_message':
+            messages.append(item.get('text', ''))
+        if event.get('type') == 'item.completed' and item.get('type') == 'error':
+            failure = item.get('message') or item.get('error') or 'The harness reported an execution error.'
         if event.get('type') == 'assistant':
             content = event.get('message', {}).get('content', [])
             messages.extend(c.get('text', '') for c in content if isinstance(c, dict) and c.get('type') == 'text')
@@ -1663,14 +1838,20 @@ def run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: O
 
 def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: Optional[int] = None, permission_retry: bool = False) -> None:
     """Run a single attempt. Failures are persisted rather than raised into the HTTP thread."""
-    with RUN_LOCK:
+    preflight_project, preflight_task = project_or_404(project_id), one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    assert preflight_task
+    preflight_backend, _ = effective_execution_backend(preflight_project, preflight_task)
+    # Local tasks share the project folder; Coder tasks use recorded isolated worktrees.
+    with (RUN_LOCK if preflight_backend != 'coder' else nullcontext()):
         project, task = project_or_404(project_id), one("SELECT * FROM tasks WHERE id=?", (task_id,))
         assert task
         backend, _ = effective_execution_backend(project, task)
         if backend == 'coder':
             prepared = provision_coder_execution(run_id, project, task)
             runner, environment, remote_worktree = prepared['runner'], prepared['environment'], prepared['worktree']
-            harness, selection = choose_remote_harness(task, runner, environment)
+            prior = one('SELECT * FROM attempts WHERE id=? AND task_id=?', (resume_attempt_id, task_id)) if resume_attempt_id else None
+            excluded = (prior['harness_key'],) if prior and prior.get('harness_key') in ('codex', 'claude') else ()
+            harness, selection = choose_remote_harness(task, runner, environment, excluded)
             permissions = json.loads(one('SELECT * FROM runs WHERE id=?', (run_id,))['permissions_json'] or '{}')
             permission_mode = permissions.get(harness['key'], 'standard')
             problem = permission_blocker(harness['key'], permission_mode)
@@ -1688,13 +1869,26 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
             update_run(run_id, 'running', f"{harness['label']} is working in persistent runner {runner['workspace_name']}.", attempt_id)
             result, output = run_remote_agent(runner, environment, remote_agent_request(harness, remote_worktree, task, project, permission_mode), file)
             output += result.get('output') or ''
-            reply, failure = result.get('reply') or decode_result(harness['key'], result.get('output') or '')[0], None
-            if result.get('error'):
-                failure = result['error']
+            decoded_reply, decoded_failure = decode_result(harness['key'], result.get('output') or '')
+            reply = result.get('reply') or decoded_reply
+            failure = result.get('error') or decoded_failure
             if failure or result.get('code'):
                 error = failure or ('Harness exceeded the remote execution timeout.' if result.get('timed_out') else f"Harness exited with code {result.get('code')}.")
-                execute("UPDATE attempts SET status='failed',ended_at=?,error=?,diff_output=? WHERE id=?", (now(), error, result.get('diff') or '', attempt_id))
-                update_run(run_id, 'stopped', f'{harness["label"]} stopped. {error}\nFiles remain in persistent runner {runner["workspace_name"]}.', attempt_id)
+                is_quota = any(pattern.search(output) for pattern in QUOTA_PATTERNS)
+                outcome = 'quota' if is_quota else 'failed'
+                execute("UPDATE attempts SET status=?,ended_at=?,error=?,diff_output=? WHERE id=?", (outcome, now(), error, result.get('diff') or '', attempt_id))
+                if not is_quota:
+                    update_run(run_id, 'stopped', f'{harness["label"]} stopped. {error}\nFiles remain in persistent runner {runner["workspace_name"]}.', attempt_id)
+                    return
+                reset = re.search(r'resets? in (\d+)\s*(day|hour|minute)', output, re.I)
+                seconds = int(reset[1]) * {'day': 86400, 'hour': 3600, 'minute': 60}[reset[2].lower()] if reset else 4 * 3600
+                until = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(timespec='seconds')
+                execute("UPDATE harnesses SET cooldown_until=?,updated_at=? WHERE id=?", (until, now(), harness['id']))
+                if effective_mode(project, task) == 'supervised' or task['force_gate'] or not project.get('auto_failover', 1):
+                    update_run(run_id, 'awaiting_resume', f'{harness["label"]} reached its limit (retry after {until}). The remote worktree is preserved; resume on the next authenticated CLI.', attempt_id)
+                else:
+                    update_run(run_id, 'rotating', f'{harness["label"]} reached its limit (retry after {until}). Continuing in the same remote worktree on the next authenticated CLI.', attempt_id)
+                    threading.Thread(target=run_attempt, args=(run_id, project_id, task_id, attempt_id), daemon=True).start()
                 return
             verification = result.get('verification') or ''
             if result.get('verify_code'):
@@ -1822,6 +2016,24 @@ def finish_commit(run_id: str, project_id: int, task_id: int, attempt_id: int) -
         if not task or not attempt:
             return
         try:
+            lease = execution_lease(run_id)
+            if lease and lease['backend'] == 'coder':
+                profile = project_coder_profile(project_id)
+                if not profile:
+                    raise RuntimeError('This project no longer has a Coder profile. The remote worktree was preserved.')
+                prepared = provision_coder_execution(run_id, project, task)
+                result = run_remote_delivery(prepared['runner'], prepared['environment'],
+                                             remote_delivery_request(prepared['worktree'], task, profile))
+                execute("""INSERT INTO task_pull_requests(task_id,provider,url,number,branch_name,head_sha,state,review_state,created_at,updated_at)
+                    VALUES(?,'github',?,?,?,?,'open','pending',?,?) ON CONFLICT(task_id,url) DO UPDATE SET
+                    number=excluded.number,branch_name=excluded.branch_name,head_sha=excluded.head_sha,state='open',
+                    review_state='pending',sync_error=NULL,updated_at=excluded.updated_at""",
+                        (task_id, result['pr_url'], result.get('pr_number'), result.get('branch_name'), result.get('head_sha'), now(), now()))
+                execute("UPDATE attempts SET status='completed',ended_at=?,commit_sha=?,diff_stat=?,diff_output=?,error=NULL WHERE id=?",
+                        (now(), result['commit_sha'], result.get('diff_stat') or '', result.get('diff') or '', attempt_id))
+                execute("UPDATE tasks SET status='completed',last_attempt_id=? WHERE id=?", (attempt_id, task_id))
+                update_run(run_id, 'complete', 'Remote task committed, pushed, and opened for review: ' + result['pr_url'], attempt_id)
+                return
             local = Path(attempt['worktree_path']).resolve() == Path(project['repo_path']).resolve()
             if local:
                 commit_sha, stat, diff_output = None, 'Local changes (includes pre-existing edits)', worktree_diff(attempt)
@@ -1834,6 +2046,19 @@ def finish_commit(run_id: str, project_id: int, task_id: int, attempt_id: int) -
         except Exception as exc:
             execute("UPDATE attempts SET status='merge_failed', ended_at=?, error=? WHERE id=?", (now(), str(exc), attempt_id))
             update_run(run_id, "stopped", f"Commit/merge stopped safely: {exc}", attempt_id)
+
+
+def retry_remote_delivery(run_id: str) -> None:
+    """Retry only a failed remote delivery; never run the agent again."""
+    run = one('SELECT * FROM runs WHERE id=?', (run_id,))
+    if not run or run['status'] != 'stopped':
+        raise ValueError('This run is not awaiting delivery recovery.')
+    attempt = one('SELECT * FROM attempts WHERE id=? AND run_id=?', (run.get('attempt_id'), run_id))
+    lease = execution_lease(run_id)
+    if not attempt or attempt['status'] != 'merge_failed' or not lease or lease['backend'] != 'coder':
+        raise ValueError('Only a failed remote commit or pull-request delivery can be retried.')
+    claim_run(run_id, 'stopped', 'committing', 'Retrying remote delivery from the preserved task commit.')
+    threading.Thread(target=finish_commit, args=(run_id, run['project_id'], run['task_id'], attempt['id']), daemon=True).start()
 
 
 def serialize_project(project: Dict[str, Any]) -> Dict[str, Any]:
@@ -1909,6 +2134,9 @@ class API(SimpleHTTPRequestHandler):
             if match:
                 server = coder_server_or_404(int(match.group(1)))
                 token, owner, runner = coder_runner_context(server)
+                if runner:
+                    runner = refresh_runner_capacity(runner, dict(os.environ, CODER_URL=server['base_url'],
+                        CODER_SESSION_TOKEN=token, CODER_ORGANIZATION=server['organization']))
                 catalog = coder_json(server['base_url'], '/api/v2/workspaces?q=owner%3Ame', token)
                 workspaces = []
                 for workspace in catalog.get('workspaces', []):
@@ -1919,7 +2147,7 @@ class API(SimpleHTTPRequestHandler):
                     workspaces.append({'name': workspace['name'], 'id': workspace['id'],
                                        'status': workspace.get('latest_build', {}).get('status', 'unknown')})
                 self.send_json({'runner': runner, 'workspaces': workspaces,
-                                'execution_ready': False, 'scheduler_limit': 1})
+                                'execution_ready': False, 'scheduler_limit': runner_capacity(runner) if runner else 1})
                 return
             match = re.match(r'^/api/coder-servers/(\d+)/model-auth$', route)
             if match:
@@ -2037,7 +2265,9 @@ class API(SimpleHTTPRequestHandler):
                 if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9-]{0,63}', name):
                     raise ValueError('Choose an existing private Coder workspace.')
                 workspace = coder_json(server['base_url'], '/api/v2/users/me/workspace/' + quote(name, safe=''), token)
-                runner = save_coder_runner(server, owner, workspace, payload.get('max_tasks', 1))
+                runner = refresh_runner_capacity(save_coder_runner(server, owner, workspace),
+                                                 dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=token,
+                                                      CODER_ORGANIZATION=server['organization']), force=True)
                 self.send_json({'runner': runner})
                 return
             match = re.match(r'^/api/coder-servers/(\d+)/runner/migrate$', route)
@@ -2047,7 +2277,7 @@ class API(SimpleHTTPRequestHandler):
                 profile = project_coder_profile(project_id)
                 if not profile or profile.get('coder_server_id') != server['id']:
                     raise ValueError('Choose this Coder server for the project before migrating its runner.')
-                self.send_json(migrate_coder_runner(server, profile, payload.get('max_tasks', 1)))
+                self.send_json(migrate_coder_runner(server, profile))
                 return
             match = re.match(r'^/api/coder-servers/(\d+)/model-auth/codex/connect$', route)
             if match:
@@ -2325,6 +2555,10 @@ class API(SimpleHTTPRequestHandler):
                 claim_run(run['id'], run['status'], 'committing', 'Finishing reviewed run.')
                 threading.Thread(target=finish_commit, args=(run["id"], run["project_id"], run["task_id"], run["attempt_id"]), daemon=True).start()
                 self.send_json({"ok": True}); return
+            match = re.match(r"^/api/runs/([\w-]+)/retry-delivery$", route)
+            if match:
+                retry_remote_delivery(match.group(1))
+                self.send_json({'ok': True}); return
             match = re.match(r"^/api/runs/([\w-]+)/resume$", route)
             if match:
                 run = one("SELECT * FROM runs WHERE id=?", (match.group(1),))

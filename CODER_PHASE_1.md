@@ -234,9 +234,10 @@ Harness must never collect the user's OpenAI password. Keep the protocol transpo
 behind authenticated Coder SSH, not a publicly exposed app-server socket.
 
 The accepted MVP uses a persistent per-user runner with separate task worktrees,
-keeping provider-managed credentials in one home. The runner has a configurable
-admission ceiling (1–8), while the current scheduler remains serial until remote
-dispatch and parallel CLI sessions are tested. Worktrees do not isolate secrets,
+keeping provider-managed credentials in one home. The runner measures its own
+CPU quota/CPU set and cgroup memory, then admits the maximum safe number of Coder
+tasks (with 2 GiB reserved per agent); this is displayed read-only in Harness,
+not configured by the user. Local project-folder tasks remain serialized. Worktrees do not isolate secrets,
 ports, processes, or the OS user. Do not copy auth caches into disposable task
 containers or share a credential volume across users.
 
@@ -332,6 +333,10 @@ verification. It accepts a base64-encoded request and builds the fixed native CL
 argument list remotely, so task text never becomes shell syntax.
 
 This is intentionally review-first: every successful remote task enters **Needs
-review**. It does not automatically commit, merge, push, create a pull request, or
-fall back to another model. Those operations need their own explicit remote Git and
-PR contract before they can be enabled safely.
+review**. It does not automatically merge or publish a task. After the user
+explicitly selects **Commit, push & create PR**, the runner commits and pushes its
+isolated task branch and creates or reuses a GitHub PR through Coder external auth.
+The short-lived credential remains in Coder; Harness receives only the resulting
+PR metadata. On an unattended recognized quota failure, Harness preserves the same
+worktree and hands the task to the other authenticated runner CLI. Supervised runs
+wait for an explicit resume instead.

@@ -17,6 +17,15 @@ class ChatOutputTests(unittest.TestCase):
         self.assertEqual(reply, '## Done\nThe change is ready.')
         self.assertIsNone(error)
 
+    def test_codex_structured_item_error_is_a_failure(self):
+        events = [
+            {'type':'item.completed','item':{'type':'error','message':'Code mode host executable was not found.'}},
+            {'type':'item.completed','item':{'type':'agent_message','text':'No files were modified.'}},
+        ]
+        reply, error = app.decode_result('codex', '\n'.join(map(json.dumps, events)))
+        self.assertEqual(reply, 'No files were modified.')
+        self.assertEqual(error, 'Code mode host executable was not found.')
+
     def test_bounded_activity_and_saved_session(self):
         with tempfile.TemporaryDirectory(prefix='rotation-chat-test-') as directory:
             file = Path(directory)/'output.log'
