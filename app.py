@@ -172,6 +172,51 @@ class RemoteCodexAppServer:
             self.process.terminate()
 
 
+class RemoteClaudeLogin:
+    """A temporary PTY bridge for Claude Code's own interactive login flow.
+
+    Its screen and user input are held only in memory. The bridge never reads or
+    persists the credential Claude writes in the runner home.
+    """
+    def __init__(self, workspace_name: str, environment: Dict[str, str]):
+        source = base64.b64encode((APP_ROOT / 'remote_claude_login.py').read_bytes()).decode()
+        launcher = 'import base64;exec(compile(base64.b64decode(' + repr(source) + '),"<remote-claude-login>","exec"))'
+        command = shlex.join(['python3', '-c', launcher])
+        self.process = subprocess.Popen(['coder', 'ssh', '--wait', 'yes', workspace_name, '--', command],
+                                        env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, bufsize=0)
+        self.screen = ''
+        self.lock = threading.RLock()
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+
+    def _read(self) -> None:
+        assert self.process.stdout
+        while True:
+            chunk = self.process.stdout.read(1024)
+            if not chunk:
+                return
+            text = chunk.decode('utf-8', errors='replace')
+            with self.lock:
+                self.screen = (self.screen + text)[-24000:]
+
+    def send(self, value: str) -> None:
+        if self.process.poll() is not None or not self.process.stdin:
+            raise RuntimeError('The Claude login session closed. Start it again.')
+        if not isinstance(value, str) or not value or len(value) > 8192 or '\x00' in value:
+            raise ValueError('Enter a valid Claude login response.')
+        self.process.stdin.write(value.encode('utf-8') + b'\n')
+        self.process.stdin.flush()
+
+    def snapshot(self) -> str:
+        with self.lock:
+            return self.screen
+
+    def close(self) -> None:
+        if self.process.poll() is None:
+            self.process.terminate()
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -1013,6 +1058,64 @@ def remote_codex_login_flow(server_id: int, workspace_id: str) -> Optional[Dict[
         return {k: v for k, v in flow.items() if k != 'bridge'} if flow else None
 
 
+def start_remote_claude_login(server: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
+    runner, environment = ensure_coder_runner(server, profile)
+    probe = remote_claude_account(runner, environment)
+    if not probe.get('installed'):
+        raise ValueError(probe.get('detail') or 'Claude Code is not installed in this runner.')
+    if probe.get('authenticated'):
+        return {'status': 'complete', 'provider': 'claude', 'message': 'Claude Code is already connected in this persistent runner.'}
+    key = (server['id'], runner['workspace_id'], 'claude')
+    with MODEL_AUTH_LOCK:
+        prior = MODEL_AUTH_FLOWS.get(key)
+        if prior and prior['status'] == 'pending':
+            return {k: v for k, v in prior.items() if k != 'bridge'}
+        bridge = RemoteClaudeLogin(runner['workspace_name'], environment)
+        flow = {'status': 'pending', 'provider': 'claude', 'message': 'Claude Code is starting its native sign-in.',
+                'bridge': bridge, 'started_at': time.time()}
+        MODEL_AUTH_FLOWS[key] = flow
+        threading.Thread(target=watch_remote_claude_login, args=(key, flow), daemon=True).start()
+        return {k: v for k, v in flow.items() if k != 'bridge'}
+
+
+def watch_remote_claude_login(key, flow) -> None:
+    bridge: RemoteClaudeLogin = flow['bridge']
+    try:
+        while time.time() - flow['started_at'] < 15 * 60:
+            if bridge.process.poll() is not None:
+                with MODEL_AUTH_LOCK:
+                    if flow['status'] == 'pending':
+                        flow.update(status='finished', message='Claude Code closed before the dashboard confirmed authentication.')
+                return
+            time.sleep(1)
+        with MODEL_AUTH_LOCK:
+            flow.update(status='expired', message='The Claude sign-in session expired. Start it again.')
+    finally:
+        bridge.close()
+
+
+def remote_claude_login_flow(server_id: int, workspace_id: str) -> Optional[Dict[str, Any]]:
+    with MODEL_AUTH_LOCK:
+        flow = MODEL_AUTH_FLOWS.get((server_id, workspace_id, 'claude'))
+        if not flow:
+            return None
+        result = {k: v for k, v in flow.items() if k != 'bridge'}
+        bridge = flow.get('bridge')
+        if bridge and result['status'] == 'pending':
+            result['screen'] = bridge.snapshot()
+        return result
+
+
+def send_remote_claude_login_input(server_id: int, workspace_id: str, value: str) -> Dict[str, Any]:
+    with MODEL_AUTH_LOCK:
+        flow = MODEL_AUTH_FLOWS.get((server_id, workspace_id, 'claude'))
+        if not flow or flow['status'] != 'pending':
+            raise ValueError('No active Claude Code sign-in is waiting for input.')
+        bridge = flow['bridge']
+    bridge.send(value)
+    return remote_claude_login_flow(server_id, workspace_id) or {'status': 'pending'}
+
+
 def reserve_runner_worktree(run_id, task, runner, repo_url):
     """Snapshot task ownership and enforce the configured process-slot upper bound."""
     with DB_LOCK, db() as conn:
@@ -1755,6 +1858,16 @@ class API(SimpleHTTPRequestHandler):
                 active = remote_codex_login_flow(server['id'], status['runner']['workspace_id'])
                 if active:
                     status['providers']['codex']['flow'] = active
+                claude_active = remote_claude_login_flow(server['id'], status['runner']['workspace_id'])
+                if claude_active and status['providers']['claude'].get('authenticated') and claude_active['status'] == 'pending':
+                    with MODEL_AUTH_LOCK:
+                        flow = MODEL_AUTH_FLOWS.get((server['id'], status['runner']['workspace_id'], 'claude'))
+                        if flow:
+                            flow.update(status='complete', message='Claude Code is connected in this persistent runner.')
+                            flow['bridge'].close()
+                    claude_active = remote_claude_login_flow(server['id'], status['runner']['workspace_id'])
+                if claude_active:
+                    status['providers']['claude']['flow'] = claude_active
                 self.send_json(status)
                 return
             match = re.match(r'^/api/coder-servers/(\d+)/external-auth$', route)
@@ -1869,6 +1982,18 @@ class API(SimpleHTTPRequestHandler):
             if match:
                 server = coder_server_or_404(int(match.group(1)))
                 self.send_json(start_remote_codex_login(server, coder_profile_for_server(server['id'])))
+                return
+            match = re.match(r'^/api/coder-servers/(\d+)/model-auth/claude/connect$', route)
+            if match:
+                server = coder_server_or_404(int(match.group(1)))
+                self.send_json(start_remote_claude_login(server, coder_profile_for_server(server['id'])))
+                return
+            match = re.match(r'^/api/coder-servers/(\d+)/model-auth/claude/input$', route)
+            if match:
+                server = coder_server_or_404(int(match.group(1)))
+                profile = coder_profile_for_server(server['id'])
+                runner, _ = ensure_coder_runner(server, profile)
+                self.send_json(send_remote_claude_login_input(server['id'], runner['workspace_id'], str(payload.get('input') or '')))
                 return
             match = re.match(r'^/api/coder-servers/(\d+)/external-auth/([a-z0-9_-]+)/connect$', route)
             if match:

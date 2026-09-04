@@ -3,7 +3,7 @@ import unittest
 import base64
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import app
 
@@ -120,6 +120,16 @@ class CoderRunnerTests(unittest.TestCase):
         request = json.loads(base64.urlsafe_b64decode(encoded.encode()).decode())
         self.assertEqual(request['prompt'], 'quote; $(not-a-command)')
         self.assertNotIn('quote;', command)
+
+    def test_claude_login_input_is_forwarded_only_to_active_memory_bridge(self):
+        bridge = MagicMock()
+        bridge.snapshot.return_value = 'waiting for code'
+        key = (self.server['id'], self.runner['workspace_id'], 'claude')
+        app.MODEL_AUTH_FLOWS[key] = {'status':'pending', 'provider':'claude', 'message':'waiting', 'bridge':bridge, 'started_at':0}
+        result = app.send_remote_claude_login_input(self.server['id'], self.runner['workspace_id'], 'one-time-code')
+        bridge.send.assert_called_once_with('one-time-code')
+        self.assertEqual(result['screen'], 'waiting for code')
+        app.MODEL_AUTH_FLOWS.pop(key, None)
 
 
 def subprocess_result(stdout='', returncode=0, stderr=''):

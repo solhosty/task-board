@@ -41,7 +41,9 @@ Before starting a real remote task, connect at least one model in the runner:
 
 1. Open the dashboard and select the project.
 2. Open **Manage servers**, select the local Coder server, then **Models**.
-3. Connect Codex or open the runner in Coder and use Claude Code's native login.
+3. Connect Codex or select **Connect Claude Code**. The dashboard opens Claude's
+   native terminal sign-in in the persistent runner, displays its browser step,
+   and accepts a one-time return code if Claude requests one.
 4. Confirm the Models screen reports that CLI as authenticated.
 5. Create a small, reversible task, select **Coder**, approve dispatch, and
    confirm it reaches **Needs review** with a log, verification result, and diff.

@@ -317,10 +317,11 @@ login in the runner home. Harness does not receive, log, or persist a ChatGPT
 access token.
 
 Claude Code is surfaced in the same screen and is intentionally not represented as
-a custom OAuth provider. Its native CLI login stays in the runner and is launched
-from the runner's Coder workspace until a stable structured Claude Code UI protocol
-is available. This still gives the user one durable login per runner rather than
-one per task.
+a custom OAuth provider. The dashboard opens Claude's native interactive login in a
+short-lived PTY bridge to the runner, displays its browser step, and can forward a
+one-time return code. The bridge keeps terminal text only in memory and never reads,
+stores, or copies the credential Claude saves in the runner. This gives the user one
+durable login per runner rather than one per task.
 
 The runner template now installs Codex and Claude Code. A remote run chooses an
 enabled, authenticated native CLI in that runner, invokes it only in the task's
