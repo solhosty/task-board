@@ -191,10 +191,9 @@ ran locally, in a Coder workspace, or across several fallback attempts.
 
 ## Next implementation slice
 
-The initial registry slice records Coder servers, performs explicit localhost
-discovery and credential verification, and lets each project select its generated
-template profile. The next execution slice uploads a compiled template version,
-provisions a workspace, and binds its identifiers to the existing execution lease.
-It must remain feature-gated and reject dispatch until the required Coder
-configuration is verified. Existing local and Git-worktree modes must retain their
-current behavior.
+The registry and provisioning slices now record Coder servers, verify credentials,
+publish the Docker blueprint, pass repository parameters, provision a workspace,
+validate its remote Git HEAD, and bind it to the execution lease. The next slice
+installs and authenticates approved headless harness CLIs, streams their remote
+process output, and applies checkpoint/fallback behavior. Existing local and
+Git-worktree modes retain their current behavior.

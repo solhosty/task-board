@@ -23,6 +23,24 @@ data "coder_provisioner" "me" {}
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
 
+data "coder_parameter" "repo_url" {
+  name         = "repo_url"
+  display_name = "Repository URL"
+  description  = "Git repository checked out into /home/coder/task. Leave empty for an empty task workspace."
+  type         = "string"
+  default      = ""
+  mutable      = false
+}
+
+data "coder_parameter" "base_ref" {
+  name         = "base_ref"
+  display_name = "Base branch or ref"
+  description  = "Git ref to check out when creating the workspace."
+  type         = "string"
+  default      = "main"
+  mutable      = false
+}
+
 resource "coder_agent" "main" {
   arch = data.coder_provisioner.me.arch
   os   = "linux"
@@ -36,6 +54,9 @@ resource "coder_agent" "main" {
       touch ~/.harness-base-ready
     fi
     mkdir -p /home/coder/task
+    if [ -n "${data.coder_parameter.repo_url.value}" ] && [ ! -d /home/coder/task/.git ]; then
+      git clone --branch "${data.coder_parameter.base_ref.value}" --single-branch "${data.coder_parameter.repo_url.value}" /home/coder/task
+    fi
   EOT
 
   env = {

@@ -553,6 +553,36 @@ def bind_local_execution_lease(run_id: str, worktree: Path, base_sha: Optional[s
         WHERE run_id=?""", (str(worktree), base_sha, now(), run_id))
 
 
+def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[str, Any]) -> str:
+    profile = project_coder_profile(project['id'])
+    if not profile or not profile.get('coder_server_id'):
+        raise ValueError('This project has no Coder environment configured.')
+    server = coder_server_or_404(profile['coder_server_id'])
+    token = read_coder_token(server)
+    if not token:
+        raise ValueError('The Coder token is unavailable from Keychain.')
+    workspace = f'harness-task-{task["id"]}-{run_id[:8]}'
+    environment = dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=token,
+                       CODER_ORGANIZATION=server['organization'])
+    execute("""UPDATE execution_leases SET state='provisioning',workspace_name=?,workspace_url=?,
+        template_name=?,updated_at=? WHERE run_id=?""",
+        (workspace, f"{server['base_url']}/@{workspace}", profile['template_name'], now(), run_id))
+    command = ['coder', 'create', workspace, '--template', profile['template_name'], '--parameter',
+               f"repo_url={profile.get('repo_url') or ''}", '--parameter', f"base_ref={profile.get('base_ref') or 'main'}",
+               '--stop-after', '8h', '--yes']
+    created = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=300)
+    if created.returncode:
+        raise RuntimeError(created.stderr.strip() or created.stdout.strip() or 'Coder workspace creation failed.')
+    checked = subprocess.run(['coder', 'ssh', '--wait', 'yes', workspace, '--', 'git', '-C', '/home/coder/task',
+                              'rev-parse', 'HEAD'], env=environment, capture_output=True, text=True, timeout=180)
+    if checked.returncode:
+        raise RuntimeError(checked.stderr.strip() or 'Coder workspace checkout validation failed.')
+    base_sha = checked.stdout.strip()
+    execute("""UPDATE execution_leases SET state='ready',workspace_name=?,worktree_path='/home/coder/task',
+        base_sha=?,updated_at=? WHERE run_id=?""", (workspace, base_sha, now(), run_id))
+    return workspace
+
+
 def harness_availability(harness: Dict[str, Any]) -> Dict[str, str]:
     label = harness['label']
     if not harness['installed']:
@@ -585,8 +615,6 @@ def execution_blockers(project: Dict[str, Any], task: Optional[Dict[str, Any]] =
                 blockers.append('Choose a Coder server for this project before using remote execution.')
             elif profile.get('server_status') != 'authorized':
                 blockers.append('Verify the project’s Coder server and API token before using remote execution.')
-            else:
-                blockers.append('Coder is configured for this task, but remote dispatch is the next Phase 1 implementation slice.')
     if not eligible_harnesses():
         candidates = rows('SELECT * FROM harnesses ORDER BY chain_position')
         supported = [h for h in candidates if ADAPTERS[h['key']]['runnable']]
@@ -917,6 +945,11 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
     with RUN_LOCK:
         project, task = project_or_404(project_id), one("SELECT * FROM tasks WHERE id=?", (task_id,))
         assert task
+        backend, _ = effective_execution_backend(project, task)
+        if backend == 'coder':
+            workspace = provision_coder_execution(run_id, project, task)
+            update_run(run_id, 'stopped', f'Coder workspace {workspace} is ready with the project checked out. Install and authenticate a remote harness CLI before agent dispatch can be enabled.')
+            return
         harness, selection = choose_harness(task)
         if permission_retry:
             prior = one('SELECT * FROM attempts WHERE id=? AND task_id=?', (resume_attempt_id, task_id))
