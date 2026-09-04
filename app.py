@@ -813,6 +813,18 @@ def remote_parallel_capacity(profile: Optional[Dict[str, Any]]) -> int:
     return max(1, int(runner['detected_max_tasks'] or 1)) if runner else 1
 
 
+REMOTE_SLOT_STATUSES = ('awaiting_dispatch', 'queued', 'running', 'verifying', 'rotating', 'committing')
+
+
+def runner_slot_runs(coder_server_id: int) -> List[Dict[str, Any]]:
+    """Runs that have been admitted to this runner, whether or not SSH has started yet."""
+    placeholders = ','.join('?' for _ in REMOTE_SLOT_STATUSES)
+    return rows(f'''SELECT r.* FROM runs r JOIN execution_leases l ON l.run_id=r.id
+        LEFT JOIN project_coder_profiles p ON p.project_id=r.project_id
+        WHERE l.backend='coder' AND r.status IN ({placeholders}) AND p.coder_server_id=?
+        ORDER BY r.created_at, r.rowid''', (*REMOTE_SLOT_STATUSES, coder_server_id))
+
+
 def run_backend(run_id: str) -> Optional[str]:
     lease = execution_lease(run_id)
     return lease.get('backend') if lease else None
@@ -1521,20 +1533,23 @@ def request_run(project_id: int, task_id: Optional[int] = None) -> Dict[str, Any
         mode = effective_mode(project, task)
         blockers = execution_blockers(project, task)
         backend, profile = effective_execution_backend(project, task)
-        occupied_remote = [run for run in active if run['status'] in ('awaiting_dispatch', 'queued', 'running', 'verifying', 'rotating', 'committing')]
+        capacity_full = False
         if active:
             if backend != 'coder' or any(run_backend(run['id']) != 'coder' for run in active):
                 blockers.append('Another task in this project has an active or paused run. Finish that run first.')
-            elif len(occupied_remote) >= remote_parallel_capacity(profile):
-                blockers.append(f'The persistent Coder runner has reached its environment capacity ({remote_parallel_capacity(profile)} task(s)).')
+            elif len(runner_slot_runs(profile['coder_server_id'])) >= remote_parallel_capacity(profile):
+                capacity_full = True
         harness, _ = choose_harness(task)
         permissions = permission_snapshot(task)
         if harness:
             problem = permission_blocker(harness['key'], permissions[harness['key']])
             if problem:
                 blockers.append(problem)
-        status = 'blocked' if blockers else ('awaiting_dispatch' if mode == 'supervised' or task['force_gate'] else 'queued')
-        message = ' '.join(blockers) if blockers else (f"Ready to start {harness['label']} ({harness['model']}). Approve dispatch to begin." if status == 'awaiting_dispatch' else 'Queued for execution.')
+        status = 'blocked' if blockers else ('awaiting_capacity' if capacity_full else ('awaiting_dispatch' if mode == 'supervised' or task['force_gate'] else 'queued'))
+        message = ' '.join(blockers) if blockers else (
+            f'The persistent Coder runner is full ({remote_parallel_capacity(profile)} task(s)). Waiting for the next slot.' if status == 'awaiting_capacity'
+            else f"Ready to start {harness['label']} ({harness['model']}). Approve dispatch to begin." if status == 'awaiting_dispatch'
+            else 'Queued for execution.')
         run_id = str(uuid.uuid4())
         execute('INSERT INTO runs(id,project_id,task_id,mode,status,message,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)',
                 (run_id, project_id, task['id'], mode, status, message, now(), now()))
@@ -1548,6 +1563,58 @@ def request_run(project_id: int, task_id: Optional[int] = None) -> Dict[str, Any
 def update_run(run_id: str, status: str, message: str, attempt_id: Optional[int] = None) -> None:
     execute("UPDATE runs SET status=?, message=?, attempt_id=COALESCE(?,attempt_id), updated_at=? WHERE id=?",
             (status, message, attempt_id, now(), run_id))
+    if status in ('complete', 'stopped', 'discarded', 'blocked'):
+        servers = rows('''SELECT DISTINCT p.coder_server_id FROM execution_leases l
+            JOIN runs r ON r.id=l.run_id JOIN project_coder_profiles p ON p.project_id=r.project_id
+            WHERE l.run_id=? AND l.backend='coder' AND p.coder_server_id IS NOT NULL''', (run_id,))
+        for server in servers:
+            dispatch_capacity_waiters(server['coder_server_id'])
+
+
+def dispatch_capacity_waiters(coder_server_id: int) -> None:
+    """Promote FIFO remote work when an admitted task releases a runner slot."""
+    to_start = []
+    with DB_LOCK:
+        with db() as conn:
+            runner = conn.execute('''SELECT detected_max_tasks FROM coder_runners
+                WHERE coder_server_id=? ORDER BY rowid DESC LIMIT 1''', (coder_server_id,)).fetchone()
+            capacity = max(1, int(runner['detected_max_tasks'] or 1)) if runner else 1
+            placeholders = ','.join('?' for _ in REMOTE_SLOT_STATUSES)
+            occupied = conn.execute(f'''SELECT COUNT(*) FROM runs r JOIN execution_leases l ON l.run_id=r.id
+                JOIN project_coder_profiles p ON p.project_id=r.project_id
+                WHERE l.backend='coder' AND r.status IN ({placeholders}) AND p.coder_server_id=?''',
+                (*REMOTE_SLOT_STATUSES, coder_server_id)).fetchone()[0]
+            slots = capacity - occupied
+            if slots < 1:
+                return
+            waiting = conn.execute('''SELECT r.*,t.force_gate FROM runs r JOIN execution_leases l ON l.run_id=r.id
+                JOIN project_coder_profiles p ON p.project_id=r.project_id JOIN tasks t ON t.id=r.task_id
+                WHERE l.backend='coder' AND p.coder_server_id=? AND r.status='awaiting_capacity'
+                ORDER BY r.created_at,r.rowid''', (coder_server_id,)).fetchall()
+            for row in waiting[:slots]:
+                run = dict(row)
+                next_status = 'awaiting_dispatch' if run['mode'] == 'supervised' or run['force_gate'] else 'queued'
+                message = ('A runner slot is available. Approve dispatch to begin.' if next_status == 'awaiting_dispatch'
+                           else 'A runner slot is available. Starting execution.')
+                changed = conn.execute("UPDATE runs SET status=?,message=?,updated_at=? WHERE id=? AND status='awaiting_capacity'",
+                                       (next_status, message, now(), run['id']))
+                if changed.rowcount and next_status == 'queued':
+                    to_start.append((run['id'], run['project_id'], run['task_id']))
+    for args in to_start:
+        threading.Thread(target=run_attempt, args=args, daemon=True).start()
+
+
+def recover_capacity_waiters() -> None:
+    """Upgrade previously blocked capacity-only runs into the durable FIFO queue."""
+    with DB_LOCK, db() as conn:
+        conn.execute("""UPDATE runs SET status='awaiting_capacity',
+            message='Waiting for the next available Coder runner slot.',updated_at=?
+            WHERE status='blocked' AND message LIKE 'The persistent Coder runner has reached its environment capacity (%'""", (now(),))
+        servers = conn.execute('''SELECT DISTINCT p.coder_server_id FROM runs r
+            JOIN execution_leases l ON l.run_id=r.id JOIN project_coder_profiles p ON p.project_id=r.project_id
+            WHERE l.backend='coder' AND r.status='awaiting_capacity' AND p.coder_server_id IS NOT NULL''').fetchall()
+    for server in servers:
+        dispatch_capacity_waiters(server['coder_server_id'])
 
 
 def claim_run(run_id: str, expected: str, status: str, message: str) -> None:
@@ -2719,6 +2786,7 @@ def main() -> None:
     execute("UPDATE runs SET status='stopped',message='The server restarted during this run. Project files were preserved. Review them before retrying.',updated_at=? WHERE status IN ('running','queued','verifying','rotating','committing')", (now(),))
     execute("UPDATE attempts SET status='interrupted',ended_at=? WHERE status='running'", (now(),))
     scan_harnesses()
+    recover_capacity_waiters()
     os.chdir(STATIC_ROOT)
     server = create_server(args.port)
     print(f"Harness Rotation is running at http://{HOST}:{server.server_port}", flush=True)

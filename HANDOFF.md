@@ -81,7 +81,8 @@ Models screen if Codex is not yet authenticated.
 - Runner migration creates a new workspace and preserves the prior one; it does
   not silently discard task work or model logins.
 - Coder tasks run concurrently only up to the runner's detected CPU and memory capacity; each
-  retains its own worktree. Local project-folder runs remain serialized.
+  retains its own worktree. Excess unattended remote tasks wait in a durable FIFO queue and
+  start automatically when a slot is released. Local project-folder runs remain serialized.
 
 ## Next implementation slices
 
@@ -91,14 +92,16 @@ Models screen if Codex is not yet authenticated.
    Delivery uses Coder `GIT_ASKPASS` and the GitHub ID-based `noreply` email.
 2. Add controlled parallel task execution — complete. Coder tasks are admitted
    up to their detected CPU/cgroup-memory capacity (2 GiB reserved per agent), while local tasks stay serialized.
-3. Live-validate two simultaneous remote tasks when the runner reports capacity 2 or higher.
+3. Live validation complete: three remote tasks ran concurrently at the detected capacity of 3;
+   each preserved its worktree and fell back from quota-limited Codex to Claude Code. A fourth
+   task was held at capacity and is now recovered into the durable FIFO queue on restart.
 4. Add Tailscale access after parallel runner behavior is proven.
 
 ## Verification and source locations
 
 - Latest pushed commit: `96febf5` — `Dispatch Coder tasks through persistent runners`
 - Automated tests: `PYTHONPYCACHEPREFIX=/private/tmp/harness-pyc python3 -m unittest discover -s tests -p 'test_*.py'`
-- Latest focused result: 38 Python tests and 7 browser-format checks passing,
+- Latest result: 65 Python tests and 7 browser-format checks passing,
   including remote commit/push/PR state and PR sync, quota handoff state, and
   alternate-authenticated-CLI selection.
 - Remote transport was checked live against the configured runner with an

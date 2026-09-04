@@ -33,7 +33,7 @@ function render(){
  renderProjectBoard(project);
  renderTree();
 }
-function boardColumn(task){const run=task.run_status||task.run?.status; if(task.status==='completed'||run==='complete')return 'done';if(['awaiting_review','awaiting_commit'].includes(run))return 'review';if(['queued','running','verifying','rotating','committing','awaiting_dispatch','awaiting_resume','paused_cooldown','awaiting_external_auth'].includes(run))return 'running';return 'planned'}
+function boardColumn(task){const run=task.run_status||task.run?.status; if(task.status==='completed'||run==='complete')return 'done';if(['awaiting_review','awaiting_commit'].includes(run))return 'review';if(['queued','running','verifying','rotating','committing','awaiting_dispatch','awaiting_capacity','awaiting_resume','paused_cooldown','awaiting_external_auth'].includes(run))return 'running';return 'planned'}
 function targetBadge(task){const remote=task.execution_backend==='coder';return '<span class="execution-badge '+(remote?'remote':'')+'">'+(remote?'◌ Coder · ':'⌂ ')+esc(task.execution_target_label||'Local')+'</span>'}
 function renderProjectBoard(project){
  const host=$('#welcome');if(!project){host.innerHTML='<div class="welcome-mark">↗</div><h1>What do you want to build?</h1><p>Add a local project, then create a task. Rotation keeps the discussion, progress, and handoffs together.</p><button id="welcome-add">Add your first project</button>';$('#welcome-add').onclick=openProjectForm;return}
@@ -60,7 +60,7 @@ function renderTree(){
 $('#toggle-chats').onclick=()=>{state.chatsExpanded=!state.chatsExpanded;renderTree()};
 
 async function openSession(id){state.taskId=id;state.sessionSnapshot=null;state.followOutput=true;render();await refreshSession()}
-function phaseLabel(status){return ({running:'Working',verifying:'Checking results',awaiting_dispatch:'Ready to start',awaiting_review:'Ready for review',awaiting_commit:'Ready to finish',awaiting_resume:'Handoff paused',awaiting_external_auth:'Connect GitHub',rotating:'Switching harnesses',queued:'Starting',committing:'Finishing',paused_cooldown:'Waiting for availability',complete:'Completed',stopped:'Needs attention',discarded:'Closed'})[status]||String(status||'').replaceAll('_',' ')}
+function phaseLabel(status){return ({running:'Working',verifying:'Checking results',awaiting_dispatch:'Ready to start',awaiting_capacity:'Waiting for runner slot',awaiting_review:'Ready for review',awaiting_commit:'Ready to finish',awaiting_resume:'Handoff paused',awaiting_external_auth:'Connect GitHub',rotating:'Switching harnesses',queued:'Starting',committing:'Finishing',paused_cooldown:'Waiting for availability',complete:'Completed',stopped:'Needs attention',discarded:'Closed'})[status]||String(status||'').replaceAll('_',' ')}
 function attemptStatus(attempt,attempts=[]){if(attempt.display_status)return attempt.display_status;if(attempt.status==='quota'){const next=attempts.find(item=>item.id>attempt.id&&item.run_id===attempt.run_id);return 'Usage limit reached'+(next?' · handed to '+harnessName(next.harness_key):'')}return ({running:'Working',verified:'Ready for review',completed:'Finished',failed:'Needs attention',verify_failed:'Checks need attention',discarded:'Closed',interrupted:'Interrupted',merge_failed:'Merge needs attention'})[attempt.status]||phaseLabel(attempt.status)}
 async function refreshSession(){
  const id=state.taskId;if(!id)return;const data=await api('/api/tasks/'+id);if(state.taskId!==id)return;state.sessionData=data;
@@ -87,7 +87,7 @@ function renderRunBanner(data,attempt,isActive){
    (run.status==='awaiting_dispatch'?'<button data-action="approve-dispatch">Start harness</button>':'')+
    (run.status==='awaiting_review'?'<button data-action="complete">'+(data.lease?.backend==='coder'?'Commit, push & create PR':'Finish')+'</button>':run.status==='awaiting_commit'?'<button data-action="approve-commit">Finish</button>':run.status==='stopped'&&data.lease?.backend==='coder'&&attempt?.status==='merge_failed'?'<button data-action="retry-delivery">Retry delivery</button>':'')+
    (['awaiting_resume','paused_cooldown'].includes(run.status)?'<button data-action="resume">Continue</button>':'')+
-   (['awaiting_dispatch','awaiting_commit','awaiting_review','awaiting_resume','paused_cooldown'].includes(run.status)?'<button class="secondary" data-action="discard">Close</button>':'')+'</div></section>';
+   (['awaiting_dispatch','awaiting_capacity','awaiting_commit','awaiting_review','awaiting_resume','paused_cooldown'].includes(run.status)?'<button class="secondary" data-action="discard">Close</button>':'')+'</div></section>';
  }
  if(!isActive&&data.task.status==='pending'&&data.blockers?.length)html+='<section class="run-notice warning"><div><strong>Cannot start yet</strong><p>'+data.blockers.map(esc).join(' ')+'</p></div><button id="configure-harnesses" class="secondary">Open settings</button></section>';
  if(!html&&!run)html='<section class="run-notice quiet"><span>Ready when you are. Send a message to run with new context, or choose Run to start as-is.</span></section>';

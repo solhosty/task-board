@@ -184,9 +184,12 @@ class CoderRunnerTests(unittest.TestCase):
             first_run = app.request_run(self.project, first)
             second_run = app.request_run(self.project, second)
             third_run = app.request_run(self.project, third)
-        self.assertEqual((first_run['status'], second_run['status'], third_run['status']), ('queued', 'queued', 'blocked'))
-        self.assertIn('environment capacity (2 task(s))', third_run['message'])
-        self.assertEqual(thread.return_value.start.call_count, 2)
+            self.assertEqual((first_run['status'], second_run['status'], third_run['status']), ('queued', 'queued', 'awaiting_capacity'))
+            self.assertIn('Waiting for the next slot', third_run['message'])
+            self.assertEqual(thread.return_value.start.call_count, 2)
+            app.update_run(first_run['run_id'], 'complete', 'done')
+            self.assertEqual(app.one('SELECT status FROM runs WHERE id=?', (third_run['run_id'],))['status'], 'queued')
+            self.assertEqual(thread.return_value.start.call_count, 3)
 
     def test_reviewed_remote_attempt_commits_pushes_and_links_pr(self):
         task, run_id = self.task_run()

@@ -128,11 +128,13 @@ print('Implemented the requested feature.', flush=True)
                      'organization_name':'default','template_name':'base','latest_build':{'status':'running'}}
         owner = {'id':'owner-id','username':'owner'}
         with patch.object(app, 'coder_runner_context', return_value=('secret', owner, None)), \
-             patch.object(app, 'coder_json', return_value=workspace):
+             patch.object(app, 'coder_json', return_value=workspace), \
+             patch.object(app, 'refresh_runner_capacity', side_effect=lambda runner, *_args, **_kwargs: runner):
             result = self.api('/api/coder-servers/1/runner', {'workspace_name':'test-runner','max_tasks':2})
-        self.assertEqual(result['runner']['max_tasks'], 2)
+        self.assertEqual(result['runner']['max_tasks'], 1)
         with patch.object(app, 'coder_runner_context', return_value=('secret', owner, result['runner'])), \
-             patch.object(app, 'coder_json', return_value={'workspaces':[workspace, dict(workspace, owner_id='another')]}):
+             patch.object(app, 'coder_json', return_value={'workspaces':[workspace, dict(workspace, owner_id='another')]}), \
+             patch.object(app, 'refresh_runner_capacity', side_effect=lambda runner, *_args, **_kwargs: runner):
             status = self.api('/api/coder-servers/1/runner')
         self.assertEqual(len(status['workspaces']), 1)
         self.assertFalse(status['execution_ready'])
