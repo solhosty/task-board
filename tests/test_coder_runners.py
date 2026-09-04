@@ -150,6 +150,12 @@ class CoderRunnerTests(unittest.TestCase):
         bridge.accept_default.assert_called_once_with()
         self.assertEqual(flow['message'], 'Preparing Claude Code sign-in.')
 
+    def test_claude_login_extracts_a_wrapped_claude_url(self):
+        bridge = object.__new__(app.RemoteClaudeLogin)
+        bridge.lock = threading.RLock()
+        bridge.screen = 'Browserdidntopen\n\nhttps://claude.ai/oauth/authorize?state=abc&code_\nchallenge=def\n\nPastecodehere'
+        self.assertEqual(bridge.verification_url(), 'https://claude.ai/oauth/authorize?state=abc&code_challenge=def')
+
 
 def subprocess_result(stdout='', returncode=0, stderr=''):
     class Result:

@@ -231,6 +231,18 @@ class RemoteClaudeLogin:
             cleaned = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', cleaned)
             return cleaned.replace('\r', '')[-16000:]
 
+    def verification_url(self) -> Optional[str]:
+        """Extract only Claude's browser continuation URL from wrapped PTY output."""
+        with self.lock:
+            screen = self.screen
+        for start in [m.start() for m in re.finditer(r'https://', screen)]:
+            candidate = re.split(r'\n\s*\n', screen[start:], maxsplit=1)[0]
+            candidate = re.sub(r'\s+', '', candidate)
+            parsed = urlparse(candidate)
+            if parsed.scheme == 'https' and parsed.hostname in {'claude.ai', 'platform.claude.com', 'auth.anthropic.com'}:
+                return candidate
+        return None
+
     def close(self) -> None:
         if self.process.poll() is None:
             self.process.terminate()
@@ -1139,6 +1151,7 @@ def remote_claude_login_flow(server_id: int, workspace_id: str) -> Optional[Dict
         bridge = flow.get('bridge')
         if bridge and result['status'] == 'pending':
             result['screen'] = bridge.snapshot()
+            result['verification_url'] = bridge.verification_url()
         return result
 
 
