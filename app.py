@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import argparse
 import errno
+import hashlib
 import os
 import re
 import shutil
@@ -257,7 +258,11 @@ def normalize_coder_url(value: Any) -> str:
 
 
 def coder_template_name(server_name: str, project_name: str) -> str:
-    return f'harness-{slug(server_name, "server")}-{slug(project_name, "project")}'
+    candidate = f'harness-{slug(server_name, "server")}-{slug(project_name, "project")}'
+    if len(candidate) <= 32:
+        return candidate
+    suffix = hashlib.sha1(candidate.encode('utf-8')).hexdigest()[:6]
+    return f'{candidate[:25].rstrip("-")}-{suffix}'
 
 
 def public_coder_server(server: Dict[str, Any]) -> Dict[str, Any]:
