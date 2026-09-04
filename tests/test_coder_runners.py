@@ -138,6 +138,9 @@ class CoderRunnerTests(unittest.TestCase):
         bridge.screen = '\x1b[?25hWelcome\x1b[0m\r\nhttps://example.test/login\x1b]0;title\x07'
         self.assertEqual(bridge.snapshot(), 'Welcome\nhttps://example.test/login')
 
+    def test_claude_theme_matcher_handles_terminal_redraw_without_spaces(self):
+        self.assertIsNotNone(app.re.search(r'choose\s*the\s*text\s*style|choosethetextstyle', 'Choosethetextstylethatlooksbest', app.re.I))
+
 
 def subprocess_result(stdout='', returncode=0, stderr=''):
     class Result:

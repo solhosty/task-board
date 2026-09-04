@@ -203,14 +203,14 @@ class RemoteClaudeLogin:
                 self.screen = (self.screen + text)[-24000:]
                 # Claude's first-run theme picker is cosmetic. Select its default
                 # so the dashboard proceeds directly to the actual account login.
-                if not self.auto_style_selected and 'Choose the text style' in self.screen:
+                if not self.auto_style_selected and re.search(r'choose\s*the\s*text\s*style|choosethetextstyle', self.screen, re.I):
                     self.auto_style_selected = True
                     self.screen = 'Preparing Claude Code sign-in…\n'
                     self._write('1\n')
                 # In SSH/container sessions Claude can ask the user to press c to
                 # reveal/copy its browser URL. Do that non-sensitive step here.
                 elif (self.auto_style_selected and not self.login_url_requested
-                      and re.search(r'press\s+c\b', self.screen, re.I)):
+                      and re.search(r'press\s*c\b|pressc\b', self.screen, re.I)):
                     self.login_url_requested = True
                     self._write('c\n')
 
