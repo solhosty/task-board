@@ -358,6 +358,71 @@ print('Implemented the requested feature.', flush=True)
         events = self.api(f"/api/attempts/{state['attempts'][0]['id']}/log")['events']
         self.assertTrue(any(e['kind']=='message' for e in events))
 
+    def test_manual_session_rotation_keeps_the_same_harness(self):
+        project_id, task_id, run_id = self.create(mode='unattended', location='local')
+        self.wait(task_id, 'complete')
+        rotated = self.api(f'/api/tasks/{task_id}/sessions/rotate', {})
+        self.assertEqual(rotated['session']['session_number'], 2)
+        self.assertEqual(rotated['session']['harness_key'], 'codex')
+        state = self.api(f'/api/tasks/{task_id}')
+        self.assertEqual([session['status'] for session in state['sessions']], ['sealed', 'active'])
+        self.assertEqual(state['sessions'][0]['handoff']['workspace']['base_sha'], self.base)
+
+        # Change the generic pool order: a normal session rollover must still
+        # continue with Codex rather than treating it as a harness failover.
+        app.execute("UPDATE harnesses SET chain_position=CASE key WHEN 'claude' THEN 0 WHEN 'codex' THEN 1 ELSE chain_position END")
+        self.api(f'/api/tasks/{task_id}/messages', {'content':'Continue with a bounded fresh conversation.', 'start':True})
+        state = self.wait(task_id, 'complete')
+        self.assertEqual([attempt['harness_key'] for attempt in state['attempts']], ['codex', 'codex'])
+        self.assertEqual(state['attempts'][1]['session_id'], state['sessions'][1]['id'])
+
+    def test_reconciliation_pauses_when_workspace_differs_from_handoff(self):
+        _, task_id, _ = self.create(mode='unattended', location='local')
+        self.wait(task_id, 'complete')
+        self.api(f'/api/tasks/{task_id}/sessions/rotate', {})
+        (self.repo / 'README.md').write_text('Changed outside the sealed handoff\n')
+        self.api(f'/api/tasks/{task_id}/messages', {'content':'Continue after the external change.', 'start':True})
+        state = self.wait(task_id, 'stopped')
+        self.assertIn('State needs review', state['run']['message'])
+        self.assertEqual(state['sessions'][-1]['integrity_status'], 'mismatch')
+        self.assertEqual(len(state['attempts']), 1)
+
+    def test_context_budget_creates_a_new_session_without_failover(self):
+        project = self.api('/api/projects', {'name':'Budget', 'repo_path':str(self.repo), 'default_mode':'unattended', 'execution_mode':'local'})
+        task = self.api(f"/api/projects/{project['id']}/tasks", {'text':'Implement a bounded session'})
+        self.api(f"/api/tasks/{task['id']}", {'session_budget_chars': 1})
+        self.api(f"/api/projects/{project['id']}/run", {'task_id':task['id']})
+        state = self.wait(task['id'], 'complete')
+        self.assertEqual([session['status'] for session in state['sessions']], ['sealed', 'active'])
+        self.assertEqual(state['sessions'][0]['close_reason'], 'context budget reached')
+        self.assertEqual(state['attempts'][0]['harness_key'], 'codex')
+        self.assertEqual(state['attempts'][0]['session_id'], state['sessions'][1]['id'])
+
+    def test_remote_workspace_snapshot_uses_a_read_only_coder_ssh_helper(self):
+        payload = {'available':True, 'base_sha':'a'*40, 'diff_hash':'b'*64, 'status':' M README.md\n', 'changed_files':['README.md']}
+        result = subprocess.CompletedProcess([], 0, json.dumps(payload), '')
+        runner = {'workspace_name':'private-runner'}
+        with patch.object(app.subprocess, 'run', return_value=result) as remote:
+            snapshot = app.remote_workspace_snapshot(runner, {'CODER_URL':'https://coder.example'}, '/home/coder/task')
+        self.assertEqual(snapshot, payload)
+        command = remote.call_args.args[0]
+        self.assertEqual(command[:5], ['coder', 'ssh', '--wait', 'yes', 'private-runner'])
+        self.assertIn("'git', '-C'", remote.call_args.kwargs['input'])
+        self.assertNotIn('git add', remote.call_args.kwargs['input'])
+
+    def test_remote_snapshot_mismatch_uses_the_same_review_gate(self):
+        project = self.api('/api/projects', {'name':'Remote proof', 'repo_path':str(self.repo)})
+        created = self.api(f"/api/projects/{project['id']}/tasks", {'text':'Preserve remote state'})
+        task = app.one('SELECT * FROM tasks WHERE id=?', (created['id'],))
+        first = app.active_session(task['id'])
+        expected = {'available':True, 'base_sha':'a'*40, 'diff_hash':'b'*64, 'status':'', 'changed_files':[]}
+        next_session = app.rotate_session(task, 'manual session rotation', None, expected)
+        actual = dict(expected, diff_hash='c'*64)
+        matched, detail = app.reconcile_session_snapshot(task, next_session, actual)
+        self.assertFalse(matched)
+        self.assertIn('review is required', detail)
+        self.assertEqual(app.one('SELECT integrity_status FROM task_sessions WHERE id=?', (next_session['id'],))['integrity_status'], 'mismatch')
+
     def test_legacy_messages_are_attributed_without_rewriting_history(self):
         _, task_id, run_id = self.create(mode='unattended', location='local')
         self.wait(task_id, 'complete')

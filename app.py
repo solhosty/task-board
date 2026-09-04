@@ -285,6 +285,7 @@ def init_db() -> None:
           preferred_harness TEXT, preferred_model TEXT, force_gate INTEGER NOT NULL DEFAULT 0,
           degradable INTEGER NOT NULL DEFAULT 0, execution_target TEXT NOT NULL DEFAULT 'project'
           CHECK(execution_target IN ('project','local','coder')),
+          session_budget_chars INTEGER NOT NULL DEFAULT 24000,
           last_attempt_id INTEGER, created_at TEXT NOT NULL,
           UNIQUE(project_id, task_order)
         );
@@ -293,6 +294,16 @@ def init_db() -> None:
           model TEXT, selection TEXT, status TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT,
           worktree_path TEXT, branch_name TEXT, base_sha TEXT, commit_sha TEXT, diff_stat TEXT,
           diff_output TEXT, verify_output TEXT, error TEXT, log_path TEXT, run_id TEXT
+        );
+        CREATE TABLE IF NOT EXISTS task_sessions (
+          id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          session_number INTEGER NOT NULL, harness_key TEXT, model TEXT,
+          status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','sealed','needs_review')),
+          opened_at TEXT NOT NULL, sealed_at TEXT, close_reason TEXT,
+          handoff_json TEXT, integrity_status TEXT NOT NULL DEFAULT 'not_checked'
+          CHECK(integrity_status IN ('not_checked','passed','mismatch','unavailable')),
+          integrity_detail TEXT, baseline_json TEXT,
+          UNIQUE(task_id, session_number)
         );
         CREATE TABLE IF NOT EXISTS task_messages (
           id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id),
@@ -408,6 +419,8 @@ def init_db() -> None:
             conn.execute("ALTER TABLE tasks ADD COLUMN tool_permissions TEXT NOT NULL DEFAULT 'inherit'")
         if 'execution_target' not in task_columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN execution_target TEXT NOT NULL DEFAULT 'project'")
+        if 'session_budget_chars' not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN session_budget_chars INTEGER NOT NULL DEFAULT 24000")
         coder_profile_columns = {item[1] for item in conn.execute('PRAGMA table_info(project_coder_profiles)')}
         if 'default_target' not in coder_profile_columns:
             conn.execute("ALTER TABLE project_coder_profiles ADD COLUMN default_target TEXT NOT NULL DEFAULT 'local'")
@@ -416,6 +429,12 @@ def init_db() -> None:
         attempt_columns = {item[1] for item in conn.execute('PRAGMA table_info(attempts)')}
         if 'tool_permissions' not in attempt_columns:
             conn.execute('ALTER TABLE attempts ADD COLUMN tool_permissions TEXT')
+        if 'session_id' not in attempt_columns:
+            conn.execute('ALTER TABLE attempts ADD COLUMN session_id INTEGER REFERENCES task_sessions(id)')
+        message_columns = {item[1] for item in conn.execute('PRAGMA table_info(task_messages)')}
+        if 'session_id' not in message_columns:
+            conn.execute('ALTER TABLE task_messages ADD COLUMN session_id INTEGER REFERENCES task_sessions(id)')
+        migrate_legacy_sessions(conn)
 
 
 def db() -> sqlite3.Connection:
@@ -439,6 +458,136 @@ def execute(sql: str, params: Tuple[Any, ...] = ()) -> int:
     with DB_LOCK, db() as conn:
         cursor = conn.execute(sql, params)
         return cursor.lastrowid
+
+
+def migrate_legacy_sessions(conn: sqlite3.Connection) -> None:
+    """Give pre-session tasks one durable initial session without losing history."""
+    task_ids = [row['id'] for row in conn.execute(
+        'SELECT id FROM tasks WHERE NOT EXISTS (SELECT 1 FROM task_sessions WHERE task_sessions.task_id=tasks.id)'
+    )]
+    for task_id in task_ids:
+        session_id = conn.execute(
+            "INSERT INTO task_sessions(task_id,session_number,status,opened_at) VALUES(?,1,'active',?)",
+            (task_id, now()),
+        ).lastrowid
+        conn.execute('UPDATE task_messages SET session_id=? WHERE task_id=? AND session_id IS NULL', (session_id, task_id))
+        conn.execute('UPDATE attempts SET session_id=? WHERE task_id=? AND session_id IS NULL', (session_id, task_id))
+
+
+def sessions_for_task(task_id: int) -> List[Dict[str, Any]]:
+    sessions = rows('SELECT * FROM task_sessions WHERE task_id=? ORDER BY session_number', (task_id,))
+    for session in sessions:
+        session['handoff'] = json.loads(session['handoff_json']) if session.get('handoff_json') else None
+        session['baseline'] = json.loads(session['baseline_json']) if session.get('baseline_json') else None
+        session.pop('handoff_json', None)
+        session.pop('baseline_json', None)
+    return sessions
+
+
+def active_session(task_id: int) -> Dict[str, Any]:
+    session = one("SELECT * FROM task_sessions WHERE task_id=? AND status='active' ORDER BY session_number DESC LIMIT 1", (task_id,))
+    if session:
+        return session
+    latest = one('SELECT COALESCE(MAX(session_number),0) AS n FROM task_sessions WHERE task_id=?', (task_id,))
+    session_id = execute("INSERT INTO task_sessions(task_id,session_number,status,opened_at) VALUES(?,?,'active',?)",
+                         (task_id, latest['n'] + 1, now()))
+    return one('SELECT * FROM task_sessions WHERE id=?', (session_id,))
+
+
+def session_message_chars(session_id: int) -> int:
+    value = one('SELECT COALESCE(SUM(LENGTH(content)),0) AS n FROM task_messages WHERE session_id=?', (session_id,))
+    return int(value['n'])
+
+
+def workspace_snapshot(root: Path) -> Dict[str, Any]:
+    if not root.is_dir():
+        return {'available': False, 'reason': 'The preserved working folder is unavailable.'}
+    git_dir = git(['rev-parse', '--git-dir'], root, check=False)
+    if git_dir.returncode:
+        return {'available': False, 'reason': 'This working folder is not a Git repository.'}
+    baseline = git(['rev-parse', '--verify', 'HEAD'], root, check=False).stdout.strip() or None
+    status = git(['status', '--porcelain=v1'], root, check=False).stdout
+    diff = git(['diff', 'HEAD', '--binary', '--'], root, check=False).stdout
+    untracked = git(['ls-files', '--others', '--exclude-standard'], root, check=False).stdout
+    payload = (status + '\n' + diff + '\nUNTRACKED\n' + untracked).encode()
+    return {
+        'available': True,
+        'base_sha': baseline,
+        'status': status[-12000:],
+        'diff_hash': hashlib.sha256(payload).hexdigest(),
+        'changed_files': [line[3:] for line in status.splitlines() if len(line) > 3][:200],
+    }
+
+
+def session_attempt_summary(session_id: int) -> List[Dict[str, Any]]:
+    result = []
+    for attempt in rows('SELECT * FROM attempts WHERE session_id=? ORDER BY id', (session_id,)):
+        events = read_events(attempt.get('log_path'))
+        result.append({
+            'id': attempt['id'], 'harness': attempt.get('harness_key'), 'model': attempt.get('model'),
+            'label': f"{attempt.get('harness_key') or 'Harness'} attempt #{attempt['id']}",
+            'status': attempt['status'], 'verification': (attempt.get('verify_output') or '')[-2000:],
+            'error': attempt.get('error'),
+            'progress': [event['text'] for event in events if event['kind'] == 'message'][-4:],
+        })
+    return result
+
+
+def handoff_pack(task: Dict[str, Any], session: Dict[str, Any], root: Optional[Path], snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    messages = rows("SELECT role,content FROM task_messages WHERE session_id=? AND role IN ('user','assistant') ORDER BY id", (session['id'],))
+    return {
+        'task': task['text'],
+        'source_session': session['session_number'],
+        'harness': session.get('harness_key'),
+        'model': session.get('model'),
+        'messages': [{'role': item['role'], 'content': item['content'][-3000:]} for item in messages[-12:]],
+        'attempts': session_attempt_summary(session['id']),
+        'workspace': snapshot if snapshot is not None else (workspace_snapshot(root) if root else {'available': False, 'reason': 'No workspace snapshot was available.'}),
+        'next_action': 'Inspect the workspace and current diff before making further changes.',
+    }
+
+
+def seal_session(task: Dict[str, Any], session: Dict[str, Any], reason: str, root: Optional[Path], snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    pack = handoff_pack(task, session, root, snapshot)
+    execute("UPDATE task_sessions SET status='sealed',sealed_at=?,close_reason=?,handoff_json=?,baseline_json=? WHERE id=?",
+            (now(), reason, json.dumps(pack, separators=(',', ':')), json.dumps(pack['workspace'], separators=(',', ':')), session['id']))
+    return pack
+
+
+def rotate_session(task: Dict[str, Any], reason: str, root: Optional[Path], snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    session = active_session(task['id'])
+    if session_message_chars(session['id']) == 0 and not rows('SELECT id FROM attempts WHERE session_id=?', (session['id'],)):
+        return session
+    pack = seal_session(task, session, reason, root, snapshot)
+    session_id = execute("""INSERT INTO task_sessions(task_id,session_number,harness_key,model,status,opened_at,integrity_status)
+        VALUES(?,?,?,?, 'active', ?, ?)""",
+        (task['id'], session['session_number'] + 1, session.get('harness_key'), session.get('model'), now(),
+         'not_checked' if pack['workspace'].get('available') else 'unavailable'))
+    return one('SELECT * FROM task_sessions WHERE id=?', (session_id,))
+
+
+def latest_handoff(task_id: int) -> Optional[Dict[str, Any]]:
+    session = one("SELECT * FROM task_sessions WHERE task_id=? AND status='sealed' ORDER BY session_number DESC LIMIT 1", (task_id,))
+    return json.loads(session['handoff_json']) if session and session.get('handoff_json') else None
+
+
+def reconcile_session_snapshot(task: Dict[str, Any], session: Dict[str, Any], actual: Dict[str, Any]) -> Tuple[bool, str]:
+    handoff = latest_handoff(task['id'])
+    if not handoff:
+        execute("UPDATE task_sessions SET integrity_status='passed',integrity_detail=? WHERE id=?", ('Initial session; no predecessor to reconcile.', session['id']))
+        return True, 'Initial session reconciled.'
+    expected = handoff.get('workspace') or {}
+    if not expected.get('available') or not actual.get('available'):
+        execute("UPDATE task_sessions SET integrity_status='unavailable',integrity_detail=? WHERE id=?", ('Git workspace comparison is unavailable for this session.', session['id']))
+        return True, 'Git workspace comparison is unavailable; the harness must inspect the folder.'
+    matches = expected.get('base_sha') == actual.get('base_sha') and expected.get('diff_hash') == actual.get('diff_hash')
+    detail = 'Workspace baseline and diff match the sealed handoff.' if matches else 'Workspace differs from the sealed handoff; review is required before continuing.'
+    execute('UPDATE task_sessions SET integrity_status=?,integrity_detail=? WHERE id=?', ('passed' if matches else 'mismatch', detail, session['id']))
+    return matches, detail
+
+
+def reconcile_session(task: Dict[str, Any], session: Dict[str, Any], root: Path) -> Tuple[bool, str]:
+    return reconcile_session_snapshot(task, session, workspace_snapshot(root))
 
 
 def slug(value: str, fallback: str) -> str:
@@ -1345,11 +1494,59 @@ def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[s
             'worktree': one('SELECT * FROM coder_task_worktrees WHERE task_id=?', (task['id'],))}
 
 
+def remote_workspace_snapshot(runner: Dict[str, Any], environment: Dict[str, str], worktree_path: str) -> Dict[str, Any]:
+    """Read Git state inside a Coder task worktree without modifying it."""
+    if not worktree_path:
+        return {'available': False, 'reason': 'The remote task worktree is unavailable.'}
+    command = shlex.join(['python3', '-', worktree_path])
+    try:
+        checked = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--', command],
+                                 input=(APP_ROOT / 'remote_workspace_snapshot.py').read_text(), env=environment,
+                                 capture_output=True, text=True, timeout=45)
+    except (OSError, subprocess.TimeoutExpired):
+        return {'available': False, 'reason': 'Could not inspect the remote working folder.'}
+    if checked.returncode:
+        return {'available': False, 'reason': 'Could not inspect the remote working folder.'}
+    try:
+        snapshot = json.loads(checked.stdout)
+    except json.JSONDecodeError:
+        return {'available': False, 'reason': 'Remote workspace inspection returned an invalid response.'}
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get('available'), bool):
+        return {'available': False, 'reason': 'Remote workspace inspection returned an invalid response.'}
+    if snapshot['available']:
+        if not re.fullmatch(r'[a-f0-9]{40,64}', str(snapshot.get('base_sha') or '')) or not re.fullmatch(r'[a-f0-9]{64}', str(snapshot.get('diff_hash') or '')):
+            return {'available': False, 'reason': 'Remote workspace inspection returned an invalid Git snapshot.'}
+        snapshot['status'] = str(snapshot.get('status') or '')[-12000:]
+        snapshot['changed_files'] = [str(path)[:500] for path in snapshot.get('changed_files', []) if isinstance(path, str)][:200]
+    else:
+        snapshot['reason'] = str(snapshot.get('reason') or 'Remote workspace inspection is unavailable.')[:500]
+    return snapshot
+
+
+def saved_remote_workspace_snapshot(project: Dict[str, Any], task: Dict[str, Any]) -> Dict[str, Any]:
+    """Inspect an existing task worktree; never create a runner just to rotate a session."""
+    saved = one('SELECT * FROM coder_task_worktrees WHERE task_id=?', (task['id'],))
+    profile = project_coder_profile(project['id'])
+    if not saved or not saved.get('worktree_path') or not profile or not profile.get('coder_server_id'):
+        return {'available': False, 'reason': 'The remote task worktree is unavailable.'}
+    try:
+        server = coder_server_or_404(profile['coder_server_id'])
+        token, _, runner = coder_runner_context(server)
+    except (ValueError, HTTPError, URLError, TimeoutError, OSError):
+        return {'available': False, 'reason': 'Could not access the saved Coder runner.'}
+    if not runner or runner['id'] != saved['runner_id']:
+        return {'available': False, 'reason': 'The saved Coder runner no longer matches this task.'}
+    environment = dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=token,
+                       CODER_ORGANIZATION=server['organization'])
+    return remote_workspace_snapshot(runner, environment, saved['worktree_path'])
+
+
 def choose_remote_harness(task: Dict[str, Any], runner: Dict[str, Any], environment: Dict[str, str],
-                          excluded_keys: Tuple[str, ...] = ()) -> Tuple[Dict[str, Any], str]:
+                          excluded_keys: Tuple[str, ...] = (), locked_key: Optional[str] = None) -> Tuple[Dict[str, Any], str]:
     """Choose only CLIs installed and signed in inside this runner, never locally."""
     configured = {item['key']: item for item in rows("SELECT * FROM harnesses WHERE enabled=1 AND key IN ('codex','claude')")}
-    order = ([task['preferred_harness']] if task.get('preferred_harness') else [])
+    order = ([locked_key] if locked_key else [])
+    order += ([task['preferred_harness']] if task.get('preferred_harness') else [])
     order += [key for key in ('codex', 'claude') if key not in order]
     statuses = {}
     for key in order:
@@ -1364,6 +1561,8 @@ def choose_remote_harness(task: Dict[str, Any], runner: Dict[str, Any], environm
             selected = dict(harness)
             if task.get('preferred_model'):
                 selected['model'] = task['preferred_model']
+            if locked_key == key:
+                return selected, 'remote session continuity'
             return selected, 'remote preferred' if task.get('preferred_harness') == key else 'remote fallback'
     details = '; '.join(f"{key}: {value.get('detail') or ('not connected' if not value.get('authenticated') else 'unavailable')}" for key, value in statuses.items())
     raise ValueError('No supported authenticated harness is available in this persistent runner. Connect Codex or Claude Code in Coder first.' + (f' ({details})' if details else ''))
@@ -1650,17 +1849,34 @@ def choose_harness(task: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]
     return (candidates[0], "fallback") if candidates else (None, "none")
 
 
+def choose_session_harness(task: Dict[str, Any], session: Dict[str, Any], allow_failover: bool = False) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Keep normal session rollover on its established harness.
+
+    The generic rotation pool is consulted only before a session has a harness,
+    after a quota/unavailability failover, or when the established harness is
+    no longer runnable.
+    """
+    key = session.get('harness_key')
+    if key and not allow_failover:
+        chosen = one('SELECT * FROM harnesses WHERE key=?', (key,))
+        if chosen and chosen.get('enabled') and chosen.get('installed') and harness_availability(chosen)['code'] == 'ready':
+            if chosen.get('cooldown_until') and datetime.fromisoformat(chosen['cooldown_until']) > datetime.now(timezone.utc):
+                chosen = None
+            else:
+                chosen = dict(chosen)
+                if session.get('model'):
+                    chosen['model'] = session['model']
+                return chosen, 'session continuity'
+    return choose_harness(task)
+
+
 def task_prompt(task: Dict[str, Any], project: Dict[str, Any]) -> str:
-    messages = rows("SELECT role,content FROM task_messages WHERE task_id=? ORDER BY id", (task['id'],))
+    session = active_session(task['id'])
+    messages = rows("SELECT role,content FROM task_messages WHERE session_id=? ORDER BY id", (session['id'],))
     conversation = "\n\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
-    prior = rows("SELECT * FROM attempts WHERE task_id=? AND status!='running' ORDER BY id DESC LIMIT 6", (task['id'],))
-    handoff = []
-    for attempt in reversed(prior):
-        events = read_events(attempt.get('log_path'))
-        notes = [e['text'] for e in events if e['kind']=='message'][-8:]
-        actions = [e['kind']+': '+e['text']+' ('+e['status']+')' for e in events if e['kind']!='message'][-12:]
-        handoff.append(f"{attempt['harness_key']} attempt #{attempt['id']} — {attempt['status']}\n" + '\n'.join(notes+actions) + '\n' + (attempt.get('error') or ''))
-    handoff_context = '\n\n'.join(handoff)[-20000:]
+    current_progress = json.dumps(session_attempt_summary(session['id']), indent=2)[-12000:]
+    handoff = latest_handoff(task['id'])
+    handoff_context = json.dumps(handoff, indent=2)[-16000:] if handoff else 'No previous session.'
     return f"""You are continuing a task session in the working directory provided to this process.
 
 Task: {task['text']}
@@ -1668,8 +1884,11 @@ Task: {task['text']}
 Conversation:
 {conversation or task['text']}
 
-Previous harness progress (may be incomplete; verify against the code):
-{handoff_context or 'No previous attempts.'}
+Previous sealed-session handoff (may be incomplete; verify against the code):
+{handoff_context}
+
+Current-session harness progress (may be incomplete; verify against the code):
+{current_progress or 'No harness attempts in this session.'}
 
 Read the existing code and current diff before editing. Another harness may have worked on this same session. Preserve all existing uncommitted and untracked work. Work only inside this project folder. Do not commit, stash, reset, clean, or push. Keep changes focused and run relevant tests. Before meaningful tool batches, send a short user-visible progress update explaining what you are checking or changing; do not reveal private chain-of-thought. Finish with a concise summary of changes and tests run. If permissions prevent completing the task, clearly report that rather than claiming success."""
 
@@ -1914,25 +2133,36 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
         assert task
         backend, _ = effective_execution_backend(project, task)
         if backend == 'coder':
+            session = active_session(task_id)
             prepared = provision_coder_execution(run_id, project, task)
             runner, environment, remote_worktree = prepared['runner'], prepared['environment'], prepared['worktree']
+            snapshot = remote_workspace_snapshot(runner, environment, remote_worktree['worktree_path'])
+            if not resume_attempt_id and not permission_retry and task.get('session_budget_chars', 0) and session_message_chars(session['id']) >= int(task['session_budget_chars']):
+                session = rotate_session(task, 'context budget reached', None, snapshot)
+            if not resume_attempt_id and not permission_retry:
+                reconciled, detail = reconcile_session_snapshot(task, session, snapshot)
+                if not reconciled:
+                    update_run(run_id, 'stopped', 'State needs review. ' + detail)
+                    return
             prior = one('SELECT * FROM attempts WHERE id=? AND task_id=?', (resume_attempt_id, task_id)) if resume_attempt_id else None
             excluded = (prior['harness_key'],) if prior and prior.get('harness_key') in ('codex', 'claude') else ()
-            harness, selection = choose_remote_harness(task, runner, environment, excluded)
+            harness, selection = choose_remote_harness(task, runner, environment, excluded,
+                session.get('harness_key') if not resume_attempt_id else None)
             permissions = json.loads(one('SELECT * FROM runs WHERE id=?', (run_id,))['permissions_json'] or '{}')
             permission_mode = permissions.get(harness['key'], 'standard')
             problem = permission_blocker(harness['key'], permission_mode)
             if problem:
                 update_run(run_id, 'stopped', problem)
                 return
-            attempt_id = execute("""INSERT INTO attempts(task_id,harness_key,model,selection,status,started_at,worktree_path,branch_name,base_sha,run_id,tool_permissions)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (task_id, harness['key'], harness['model'], selection, 'running', now(),
+            execute('UPDATE task_sessions SET harness_key=?,model=? WHERE id=?', (harness['key'], harness.get('model'), session['id']))
+            attempt_id = execute("""INSERT INTO attempts(task_id,session_id,harness_key,model,selection,status,started_at,worktree_path,branch_name,base_sha,run_id,tool_permissions)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (task_id, session['id'], harness['key'], harness['model'], selection, 'running', now(),
                 remote_worktree['worktree_path'], remote_worktree['branch_name'], remote_worktree['base_sha'], run_id, permission_mode))
             execute('UPDATE tasks SET last_attempt_id=? WHERE id=?', (attempt_id, task_id))
             file = log_file(attempt_id)
             execute('UPDATE attempts SET log_path=? WHERE id=?', (str(file), attempt_id))
-            execute("INSERT INTO task_messages(task_id,role,content,created_at,attempt_id) VALUES(?,'system',?,?,?)",
-                    (task_id, f"{harness['label']} started in persistent Coder runner {runner['workspace_name']}.", now(), attempt_id))
+            execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at,attempt_id) VALUES(?,?,'system',?,?,?)",
+                    (task_id, session['id'], f"{harness['label']} started in persistent Coder runner {runner['workspace_name']}.", now(), attempt_id))
             update_run(run_id, 'running', f"{harness['label']} is working in persistent runner {runner['workspace_name']}.", attempt_id)
             result, output = run_remote_agent(runner, environment, remote_agent_request(harness, remote_worktree, task, project, permission_mode), file)
             output += result.get('output') or ''
@@ -1965,10 +2195,11 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
                 return
             execute("UPDATE attempts SET status='verified',verify_output=?,diff_output=? WHERE id=?", (verification, result.get('diff') or '', attempt_id))
             if reply.strip():
-                execute("INSERT INTO task_messages(task_id,role,content,created_at,attempt_id) VALUES(?,'assistant',?,?,?)", (task_id, reply.strip(), now(), attempt_id))
+                execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at,attempt_id) VALUES(?,?,'assistant',?,?,?)", (task_id, session['id'], reply.strip(), now(), attempt_id))
             update_run(run_id, 'awaiting_review', f'Verification passed in persistent runner {runner["workspace_name"]}. Review the remote diff before committing or creating a pull request.', attempt_id)
             return
-        harness, selection = choose_harness(task)
+        session = active_session(task_id)
+        harness, selection = choose_session_harness(task, session, allow_failover=bool(resume_attempt_id and not permission_retry))
         if permission_retry:
             prior = one('SELECT * FROM attempts WHERE id=? AND task_id=?', (resume_attempt_id, task_id))
             harness = one('SELECT * FROM harnesses WHERE key=?', (prior['harness_key'],)) if prior else None
@@ -2008,13 +2239,28 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
             except Exception as exc:
                 update_run(run_id, "stopped", f"Worktree setup failed: {exc}")
                 return
+        # A normal rollover starts a fresh conversation on the same harness;
+        # only quota/unavailability paths may consult the next harness.
+        if not resume_attempt_id and not permission_retry and task.get('session_budget_chars', 0) and session_message_chars(session['id']) >= int(task['session_budget_chars']):
+            session = rotate_session(task, 'context budget reached', worktree)
+            harness, selection = choose_session_harness(task, session)
+        if not resume_attempt_id and not permission_retry:
+            reconciled, detail = reconcile_session(task, session, worktree)
+            if not reconciled:
+                update_run(run_id, 'stopped', 'State needs review. ' + detail)
+                return
+        if not harness:
+            update_run(run_id, 'paused_cooldown', 'No eligible harness is available for this task session.')
+            return
+        if session.get('harness_key') != harness['key'] or session.get('model') != harness.get('model'):
+            execute('UPDATE task_sessions SET harness_key=?,model=? WHERE id=?', (harness['key'], harness.get('model'), session['id']))
         bind_local_execution_lease(run_id, worktree, base)
-        attempt_id = execute("""INSERT INTO attempts(task_id,harness_key,model,selection,status,started_at,worktree_path,branch_name,base_sha,run_id)
-          VALUES(?,?,?,?,?,?,?,?,?,?)""", (task_id, harness["key"], harness["model"], selection + (" · resumed" if resume_attempt_id else ""), "running", now(), str(worktree), branch, base, run_id))
+        attempt_id = execute("""INSERT INTO attempts(task_id,session_id,harness_key,model,selection,status,started_at,worktree_path,branch_name,base_sha,run_id)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (task_id, session['id'], harness["key"], harness["model"], selection + (" · resumed" if resume_attempt_id else ""), "running", now(), str(worktree), branch, base, run_id))
         execute("UPDATE tasks SET last_attempt_id=? WHERE id=?", (attempt_id, task_id))
         execute('UPDATE attempts SET tool_permissions=? WHERE id=?', (permission_mode, attempt_id))
-        execute("INSERT INTO task_messages(task_id,role,content,created_at,attempt_id) VALUES(?,'system',?,?,?)",
-                (task_id, f"{harness['label']} started with {'automatic permissions' if permission_mode == 'auto' else 'adapter default permissions'}.", now(), attempt_id))
+        execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at,attempt_id) VALUES(?,?,'system',?,?,?)",
+                (task_id, session['id'], f"{harness['label']} started with {'automatic permissions' if permission_mode == 'auto' else 'adapter default permissions'}.", now(), attempt_id))
         file = log_file(attempt_id)
         execute("UPDATE attempts SET log_path=? WHERE id=?", (str(file), attempt_id))
         update_run(run_id, "running", f"{harness['label']} · {harness['model']} is working in {worktree}. Waiting for CLI output…", attempt_id)
@@ -2031,12 +2277,12 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
         if failure:
             code = code or 1
             output += '\n' + failure
-        execute("INSERT INTO task_messages(task_id,role,content,created_at) VALUES(?,?,?,?)",
-                (task_id, "system", f"{harness['label']} attempt #{attempt_id} ended with exit code {code}. See its attempt log for output.", now()))
+        execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,?,?,?)",
+                (task_id, session['id'], "system", f"{harness['label']} attempt #{attempt_id} ended with exit code {code}. See its attempt log for output.", now()))
         if code == 0:
             reply = reply_file.read_text(encoding='utf-8') if reply_file.exists() else reply
             if reply.strip():
-                execute("INSERT INTO task_messages(task_id,role,content,created_at,attempt_id) VALUES(?,'assistant',?,?,?)", (task_id, reply.strip(), now(), attempt_id))
+                execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at,attempt_id) VALUES(?,?,'assistant',?,?,?)", (task_id, session['id'], reply.strip(), now(), attempt_id))
         if code:
             is_quota = any(pattern.search(output) for pattern in QUOTA_PATTERNS)
             outcome = "quota" if is_quota else "failed"
@@ -2274,6 +2520,7 @@ class API(SimpleHTTPRequestHandler):
                     "pull_requests": task_pull_requests(task_id),
                     "blockers": blockers,
                     "messages": conversation_messages(task_id),
+                    "sessions": sessions_for_task(task_id),
                     "attempts": [present_attempt(a) for a in rows("SELECT * FROM attempts WHERE task_id=? ORDER BY id", (task_id,))]})
                 return
             match = re.match(r"^/api/projects/(\d+)/attempts$", route)
@@ -2529,7 +2776,8 @@ class API(SimpleHTTPRequestHandler):
                     task_id = execute("INSERT INTO tasks(project_id,text,task_order,status,created_at) VALUES(?,?,?,'pending',?)",
                         (project_id, task_text.splitlines()[0][:120], order, now()))
                     execute('UPDATE tasks SET tool_permissions=? WHERE id=?', (permissions, task_id))
-                    execute("INSERT INTO task_messages(task_id,role,content,created_at) VALUES(?,'user',?,?)", (task_id, task_text, now()))
+                    session_id = execute("INSERT INTO task_sessions(task_id,session_number,status,opened_at) VALUES(?,1,'active',?)", (task_id, now()))
+                    execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,'user',?,?)", (task_id, session_id, task_text, now()))
                 submission = request_run(project_id, task_id) if payload.get('start') else None
                 self.send_json({"id": task_id, 'submission': submission}, 201)
                 return
@@ -2573,10 +2821,29 @@ class API(SimpleHTTPRequestHandler):
                 active = current_run(task['project_id'])
                 if active and active['task_id'] == task_id:
                     raise ValueError("This task has an active run; wait for it to finish before adding new instructions")
-                execute("INSERT INTO task_messages(task_id,role,content,created_at) VALUES(?,'user',?,?)", (task_id, content, now()))
+                session = active_session(task_id)
+                execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,'user',?,?)", (task_id, session['id'], content, now()))
                 execute("UPDATE tasks SET status='pending' WHERE id=?", (task_id,))
                 submission = request_run(task['project_id'], task_id) if payload.get('start') else None
                 self.send_json({"ok": True, 'submission': submission}, 201)
+                return
+            match = re.match(r"^/api/tasks/(\d+)/sessions/rotate$", route)
+            if match:
+                task_id = int(match.group(1))
+                task = one('SELECT * FROM tasks WHERE id=?', (task_id,))
+                if not task:
+                    raise ValueError('Task not found')
+                if current_run(task['project_id']):
+                    raise ValueError('Wait for the active run to finish before starting a fresh conversation session.')
+                project = project_or_404(task['project_id'])
+                backend, _ = effective_execution_backend(project, task)
+                if backend == 'coder':
+                    session = rotate_session(task, 'manual session rotation', None, saved_remote_workspace_snapshot(project, task))
+                else:
+                    prior = one('SELECT * FROM attempts WHERE task_id=? ORDER BY id DESC LIMIT 1', (task_id,))
+                    root = Path(prior['worktree_path']) if prior and prior.get('worktree_path') else Path(project['repo_path'])
+                    session = rotate_session(task, 'manual session rotation', root)
+                self.send_json({'session': sessions_for_task(task_id)[-1], 'next_session_id': session['id']})
                 return
             match = re.match(r"^/api/projects/(\d+)/run$", route)
             if match:
@@ -2612,7 +2879,8 @@ class API(SimpleHTTPRequestHandler):
                         raise ValueError('Choose automatic permission review explicitly')
                     claim_run(run['id'],'stopped','queued','Retrying Claude with automatic permission review. Existing work is preserved.')
                     execute("UPDATE runs SET permission_override='auto' WHERE id=?",(run['id'],))
-                    execute("INSERT INTO task_messages(task_id,role,content,created_at) VALUES(?,'system',?,?)",(run['task_id'],'You requested a retry with Claude automatic permission review for this run only.',now()))
+                    session = active_session(run['task_id'])
+                    execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,'system',?,?)",(run['task_id'],session['id'],'You requested a retry with Claude automatic permission review for this run only.',now()))
                 threading.Thread(target=run_attempt,args=(run['id'],run['project_id'],run['task_id'],attempt['id'],True),daemon=True).start()
                 self.send_json({'ok':True});return
             match = re.match(r"^/api/runs/([\w-]+)/(?:approve-commit|complete)$", route)
@@ -2686,7 +2954,7 @@ class API(SimpleHTTPRequestHandler):
                 task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
                 if not task:
                     raise ValueError("Task not found")
-                fields = {name: payload[name] for name in ("text", "mode_override", "preferred_harness", "preferred_model", "force_gate", "degradable", "tool_permissions", "execution_target") if name in payload}
+                fields = {name: payload[name] for name in ("text", "mode_override", "preferred_harness", "preferred_model", "force_gate", "degradable", "tool_permissions", "execution_target", "session_budget_chars") if name in payload}
                 if 'tool_permissions' in fields and fields['tool_permissions'] not in ('inherit','standard','auto','ask'):
                     raise ValueError('Unknown task permission mode')
                 if not fields: raise ValueError("No task updates supplied")
@@ -2698,6 +2966,13 @@ class API(SimpleHTTPRequestHandler):
                     raise ValueError("Mode must be supervised or unattended")
                 if fields.get('execution_target') not in (None, 'project', 'local', 'coder'):
                     raise ValueError('Execution target must be project default, local, or Coder.')
+                if 'session_budget_chars' in fields:
+                    try:
+                        fields['session_budget_chars'] = int(fields['session_budget_chars'])
+                    except (TypeError, ValueError):
+                        raise ValueError('Session context budget must be a whole number of characters.')
+                    if not 0 <= fields['session_budget_chars'] <= 500000:
+                        raise ValueError('Session context budget must be between 0 and 500,000 characters; use 0 to disable automatic rollover.')
                 assignments = ", ".join(f"{name}=?" for name in fields)
                 execute(f"UPDATE tasks SET {assignments} WHERE id=?", tuple(fields.values()) + (task_id,))
                 self.send_json({"ok": True}); return
