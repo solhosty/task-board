@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import argparse
-import base64
 import errno
 import hashlib
 import os
@@ -13,13 +12,12 @@ import re
 import shutil
 import shlex
 import signal
-import sqlite3
 import subprocess
 import threading
 import time
 import uuid
-from queue import Empty, Queue
-from contextlib import closing, nullcontext
+from queue import Empty
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +27,33 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, quote
 from urllib.request import Request, urlopen
 from events import read_events
+from harness_rotation import persistence
+from harness_rotation.adapters import (
+    ADAPTERS,
+    configured_command as build_configured_command,
+    permission_blocker as adapter_permission_blocker,
+)
+from harness_rotation.coder_bridges import (
+    CoderExternalAuthRequired,
+    REMOTE_CODEX_BIN,
+    RemoteClaudeLogin,
+    RemoteCodexAppServer,
+)
+from harness_rotation.run_state import REMOTE_SLOT_STATUSES, RunStateStore
+from harness_rotation.harness_output import (
+    decode_result as decode_harness_result,
+    log_details as read_log_details,
+)
+from harness_rotation import remote_transport
+from harness_rotation import worktrees
+from harness_rotation.sessions import SessionService
+from harness_rotation.coder_config import (
+    slug, normalize_coder_url, coder_template_name, public_coder_server, safe_install_url,
+)
+from harness_rotation.credentials import (
+    KEYCHAIN_SERVICE, keychain_available, keychain_account,
+    save_coder_token, remove_coder_token, read_coder_token,
+)
 from remote_worktree import validate_source
 
 
@@ -62,198 +87,11 @@ QUOTA_PATTERNS = [
     ]
 ]
 
-# Commands are argument lists: no shell interpolation and no configurable command fragments.
-# Each adapter retains its CLI permission checks; cwd is not an OS sandbox.
-ADAPTERS: Dict[str, Dict[str, Any]] = {
-    "codex": {
-        "label": "Codex", "binary": "codex", "runnable": True,
-        "models": ["default"],
-        "build": lambda root, model, prompt: ["codex", "exec", "--json", "--approve-for-me", "--skip-git-repo-check", "--cd", str(root)] + ([] if model in ("", "default") else ["--model", model]) + [prompt],
-        "safety_note": "Uses Codex workspace-write sandbox with automatic approval review.",
-    },
-    "claude": {
-        "label": "Claude Code", "binary": "claude", "runnable": True,
-        "models": ["opus", "sonnet", "haiku", "default"],
-        "build": lambda root, model, prompt: ["claude", "-p", "--permission-mode", "acceptEdits", "--verbose", "--output-format", "stream-json"] + ([] if model in ("", "default") else ["--model", model]) + [prompt],
-        "safety_note": "Uses the installed CLI with its permission checks intact.",
-    },
-    "droid": {
-        "label": "Droid", "binary": "droid", "runnable": True,
-        "models": ["default"],
-        "build": lambda root, model, prompt: ["droid", "exec", "--auto", "medium", "--output-format", "stream-json", "--cwd", str(root)] + ([] if model in ("", "default") else ["--model", model]) + [prompt],
-        "safety_note": "Uses the installed CLI with its permission checks intact.",
-    },
-    "opencode": {
-        "label": "OpenCode", "binary": "opencode", "runnable": True,
-        "models": ["default"],
-        "build": lambda root, model, prompt: ["opencode", "run", "--format", "json"] + ([] if model in ("", "default") else ["--model", model]) + [prompt],
-        "safety_note": "Uses OpenCode run with configured provider permissions.",
-    },
-}
-
 CODER_SETUP_PROFILES = ("auto", "python", "node")
-KEYCHAIN_SERVICE = "Harness Rotation Coder"
-REMOTE_CODEX_BIN = '/home/coder/.codex/packages/standalone/current/bin/codex'
 AUTH_FLOWS = {}
 AUTH_FLOW_LOCK = threading.RLock()
 MODEL_AUTH_FLOWS = {}
 MODEL_AUTH_LOCK = threading.RLock()
-
-
-class CoderExternalAuthRequired(RuntimeError):
-    """A Coder user must finish a provider login before provisioning can continue."""
-
-    def __init__(self, provider_id: str, display_name: str, login_url: str):
-        self.provider_id = provider_id
-        self.display_name = display_name
-        self.login_url = login_url
-        super().__init__(f'{display_name} authorization is required. Open {login_url}')
-
-
-class RemoteCodexAppServer:
-    """A short-lived, private stdio bridge to Codex in one Coder runner.
-
-    The bridge transports JSON-RPC only.  It never receives, persists, or logs
-    OpenAI credentials: Codex owns its managed login in the runner's home.
-    """
-    def __init__(self, workspace_name: str, environment: Dict[str, str]):
-        self.process = subprocess.Popen(
-            ['coder', 'ssh', '--wait', 'yes', workspace_name, '--', REMOTE_CODEX_BIN, 'app-server'],
-            env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1)
-        self.responses: Dict[int, Queue] = {}
-        self.notifications: Queue = Queue()
-        self.next_id = 1
-        self.lock = threading.RLock()
-        self.reader = threading.Thread(target=self._read, daemon=True)
-        self.reader.start()
-        self.request('initialize', {'clientInfo': {'name': 'harness_rotation', 'title': 'Harness Rotation', 'version': '1'}})
-        self.notify('initialized', {})
-
-    def _read(self) -> None:
-        assert self.process.stdout
-        for line in self.process.stdout:
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(payload, dict) and isinstance(payload.get('id'), int):
-                queue = self.responses.get(payload['id'])
-                if queue:
-                    queue.put(payload)
-            elif isinstance(payload, dict):
-                self.notifications.put(payload)
-
-    def send(self, payload: Dict[str, Any]) -> None:
-        if self.process.poll() is not None or not self.process.stdin:
-            raise RuntimeError('The remote Codex connection closed. Start the connection again.')
-        self.process.stdin.write(json.dumps(payload, separators=(',', ':')) + '\n')
-        self.process.stdin.flush()
-
-    def request(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: int = 20) -> Dict[str, Any]:
-        with self.lock:
-            request_id = self.next_id
-            self.next_id += 1
-            reply: Queue = Queue(maxsize=1)
-            self.responses[request_id] = reply
-            self.send({'method': method, 'id': request_id, 'params': params or {}})
-        try:
-            result = reply.get(timeout=timeout)
-        except Empty:
-            raise RuntimeError('Codex did not answer in time. Check that the runner is online and retry.') from None
-        finally:
-            self.responses.pop(request_id, None)
-        if result.get('error'):
-            raise RuntimeError(str(result['error'].get('message') or 'Remote Codex request failed.'))
-        return result.get('result') or {}
-
-    def notify(self, method: str, params: Dict[str, Any]) -> None:
-        self.send({'method': method, 'params': params})
-
-    def close(self) -> None:
-        if self.process.poll() is None:
-            self.process.terminate()
-
-
-class RemoteClaudeLogin:
-    """A temporary PTY bridge for Claude Code's own interactive login flow.
-
-    Its screen and user input are held only in memory. The bridge never reads or
-    persists the credential Claude writes in the runner home.
-    """
-    def __init__(self, workspace_name: str, environment: Dict[str, str]):
-        source = base64.b64encode((APP_ROOT / 'remote_claude_login.py').read_bytes()).decode()
-        launcher = 'import base64;exec(compile(base64.b64decode(' + repr(source) + '),"<remote-claude-login>","exec"))'
-        command = shlex.join(['python3', '-c', launcher])
-        self.process = subprocess.Popen(['coder', 'ssh', '--wait', 'yes', workspace_name, '--', command],
-                                        env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.STDOUT, bufsize=0)
-        self.screen = ''
-        self.login_url_requested = False
-        self.lock = threading.RLock()
-        self.reader = threading.Thread(target=self._read, daemon=True)
-        self.reader.start()
-
-    def _read(self) -> None:
-        assert self.process.stdout
-        while True:
-            chunk = self.process.stdout.read(1024)
-            if not chunk:
-                return
-            text = chunk.decode('utf-8', errors='replace')
-            with self.lock:
-                self.screen = (self.screen + text)[-24000:]
-                # In SSH/container sessions Claude can ask the user to press c to
-                # reveal/copy its browser URL. Do that non-sensitive step here.
-                if (not self.login_url_requested
-                    and re.search(r'press\s*c\b|pressc\b', self.screen, re.I)):
-                    self.login_url_requested = True
-                    self._write('c\n')
-
-    def _write(self, value: str) -> None:
-        if self.process.poll() is None and self.process.stdin:
-            self.process.stdin.write(value.encode('utf-8'))
-            self.process.stdin.flush()
-
-    def send(self, value: str) -> None:
-        if self.process.poll() is not None or not self.process.stdin:
-            raise RuntimeError('The Claude login session closed. Start it again.')
-        if not isinstance(value, str) or not value or len(value) > 8192 or '\x00' in value:
-            raise ValueError('Enter a valid Claude login response.')
-        # Claude's full-screen terminal handles text input, but confirms it only
-        # on the terminal Enter key (CR), not a transport line feed.
-        self._write(value + '\r')
-
-    def accept_default(self) -> None:
-        """Confirm a native terminal menu's currently selected option."""
-        if self.process.poll() is None:
-            self._write('\r')
-
-    def snapshot(self) -> str:
-        with self.lock:
-            # CSI/OSC sequences are terminal rendering controls, not login text.
-            cleaned = re.sub(r'\x1b\][^\x07]*(?:\x07|\x1b\\)', '', self.screen)
-            cleaned = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', cleaned)
-            return cleaned.replace('\r', '')[-16000:]
-
-    def verification_url(self) -> Optional[str]:
-        """Extract only Claude's browser continuation URL from wrapped PTY output."""
-        with self.lock:
-            screen = self.screen
-        for start in [m.start() for m in re.finditer(r'https://', screen)]:
-            candidate = re.split(r'\n\s*\n', screen[start:], maxsplit=1)[0]
-            # Claude's PTY sometimes prints its "Paste code here" prompt directly
-            # after a wrapped URL, without a blank line in between.
-            candidate = re.split(r'Paste\s*code\s*here', candidate, maxsplit=1, flags=re.I)[0]
-            candidate = re.sub(r'\s+', '', candidate)
-            parsed = urlparse(candidate)
-            if parsed.scheme == 'https' and parsed.hostname in {'claude.com', 'claude.ai', 'platform.claude.com', 'auth.anthropic.com'}:
-                return candidate
-        return None
-
-    def close(self) -> None:
-        if self.process.poll() is None:
-            self.process.terminate()
 
 
 def now() -> str:
@@ -261,365 +99,73 @@ def now() -> str:
 
 
 def init_db() -> None:
-    DATA_ROOT.mkdir(exist_ok=True)
-    with db() as conn:
-        conn.executescript("""
-        PRAGMA journal_mode=WAL;
-        CREATE TABLE IF NOT EXISTS projects (
-          id INTEGER PRIMARY KEY, name TEXT NOT NULL, repo_path TEXT NOT NULL UNIQUE,
-          verify_command TEXT NOT NULL, default_mode TEXT NOT NULL DEFAULT 'supervised',
-          auto_failover INTEGER NOT NULL DEFAULT 1,
-          created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS harnesses (
-          id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, label TEXT NOT NULL, binary TEXT NOT NULL,
-          version TEXT, installed INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'unavailable',
-          detail TEXT, billing_confirmed INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 0,
-          chain_position INTEGER NOT NULL DEFAULT 0, model TEXT NOT NULL DEFAULT 'default',
-          cooldown_until TEXT, updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS tasks (
-          id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-          text TEXT NOT NULL, task_order INTEGER NOT NULL, source_line INTEGER,
-          status TEXT NOT NULL DEFAULT 'pending', mode_override TEXT,
-          preferred_harness TEXT, preferred_model TEXT, force_gate INTEGER NOT NULL DEFAULT 0,
-          degradable INTEGER NOT NULL DEFAULT 0, execution_target TEXT NOT NULL DEFAULT 'project'
-          CHECK(execution_target IN ('project','local','coder')),
-          session_budget_chars INTEGER NOT NULL DEFAULT 24000,
-          last_attempt_id INTEGER, created_at TEXT NOT NULL,
-          UNIQUE(project_id, task_order)
-        );
-        CREATE TABLE IF NOT EXISTS attempts (
-          id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id), harness_key TEXT,
-          model TEXT, selection TEXT, status TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT,
-          worktree_path TEXT, branch_name TEXT, base_sha TEXT, commit_sha TEXT, diff_stat TEXT,
-          diff_output TEXT, verify_output TEXT, error TEXT, log_path TEXT, run_id TEXT
-        );
-        CREATE TABLE IF NOT EXISTS task_sessions (
-          id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-          session_number INTEGER NOT NULL, harness_key TEXT, model TEXT,
-          status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','sealed','needs_review')),
-          opened_at TEXT NOT NULL, sealed_at TEXT, close_reason TEXT,
-          handoff_json TEXT, integrity_status TEXT NOT NULL DEFAULT 'not_checked'
-          CHECK(integrity_status IN ('not_checked','passed','mismatch','unavailable')),
-          integrity_detail TEXT, baseline_json TEXT,
-          UNIQUE(task_id, session_number)
-        );
-        CREATE TABLE IF NOT EXISTS task_messages (
-          id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id),
-          role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS runs (
-          id TEXT PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), task_id INTEGER REFERENCES tasks(id),
-          mode TEXT NOT NULL, status TEXT NOT NULL, message TEXT, attempt_id INTEGER,
-          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS execution_leases (
-          id TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE REFERENCES runs(id) ON DELETE CASCADE,
-          task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-          backend TEXT NOT NULL CHECK(backend IN ('local','coder')),
-          state TEXT NOT NULL DEFAULT 'planned' CHECK(state IN ('planned','provisioning','ready','recovering','released','failed')),
-          workspace_id TEXT, workspace_name TEXT, workspace_url TEXT,
-          template_name TEXT, template_version TEXT,
-          worktree_path TEXT, base_sha TEXT, checkpoint_ref TEXT,
-          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS execution_checkpoints (
-          id INTEGER PRIMARY KEY, lease_id TEXT NOT NULL REFERENCES execution_leases(id) ON DELETE CASCADE,
-          attempt_id INTEGER REFERENCES attempts(id) ON DELETE SET NULL,
-          kind TEXT NOT NULL CHECK(kind IN ('git_commit','patch','working_tree')),
-          reference TEXT NOT NULL, base_sha TEXT, created_at TEXT NOT NULL,
-          UNIQUE(lease_id, reference)
-        );
-        CREATE TABLE IF NOT EXISTS task_pull_requests (
-          id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-          provider TEXT NOT NULL DEFAULT 'github', url TEXT NOT NULL,
-          number TEXT, branch_name TEXT, head_sha TEXT,
-          state TEXT NOT NULL DEFAULT 'untracked' CHECK(state IN ('untracked','draft','open','merged','closed')),
-          review_state TEXT NOT NULL DEFAULT 'unknown' CHECK(review_state IN ('unknown','pending','approved','changes_requested')),
-          merged_at TEXT, last_synced_at TEXT, sync_error TEXT,
-          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          UNIQUE(task_id, url)
-        );
-        CREATE TABLE IF NOT EXISTS coder_servers (
-          id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, base_url TEXT NOT NULL UNIQUE,
-          organization TEXT NOT NULL DEFAULT 'default',
-          status TEXT NOT NULL DEFAULT 'unverified' CHECK(status IN ('unverified','reachable','authorized','error')),
-          version TEXT, detail TEXT, capabilities_json TEXT NOT NULL DEFAULT '{}',
-          token_configured INTEGER NOT NULL DEFAULT 0, last_checked_at TEXT,
-          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS project_coder_profiles (
-          project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-          coder_server_id INTEGER REFERENCES coder_servers(id) ON DELETE SET NULL,
-          setup_profile TEXT NOT NULL DEFAULT 'auto' CHECK(setup_profile IN ('auto','python','node')),
-          repo_url TEXT, base_ref TEXT NOT NULL DEFAULT 'main', auth_provider_id TEXT NOT NULL DEFAULT 'github', template_name TEXT NOT NULL,
-          enabled INTEGER NOT NULL DEFAULT 0, default_target TEXT NOT NULL DEFAULT 'local'
-          CHECK(default_target IN ('local','coder')),
-          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS coder_runners (
-          id INTEGER PRIMARY KEY, coder_server_id INTEGER NOT NULL REFERENCES coder_servers(id),
-          deployment_url TEXT NOT NULL, organization TEXT NOT NULL, owner_id TEXT NOT NULL,
-          workspace_id TEXT NOT NULL, workspace_name TEXT NOT NULL, workspace_url TEXT NOT NULL,
-          template_name TEXT NOT NULL, max_tasks INTEGER NOT NULL DEFAULT 1 CHECK(max_tasks BETWEEN 1 AND 8),
-          detected_cpu_count INTEGER, detected_memory_bytes INTEGER, detected_max_tasks INTEGER,
-          capacity_checked_at TEXT,
-          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          UNIQUE(coder_server_id, deployment_url, organization, owner_id)
-        );
-        CREATE TABLE IF NOT EXISTS coder_task_worktrees (
-          task_id INTEGER PRIMARY KEY REFERENCES tasks(id),
-          runner_id INTEGER NOT NULL REFERENCES coder_runners(id),
-          task_key TEXT NOT NULL UNIQUE, repo_url TEXT NOT NULL,
-          worktree_path TEXT, base_sha TEXT, branch_name TEXT,
-          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        );
-        """)
-        lease_columns = {item[1] for item in conn.execute('PRAGMA table_info(execution_leases)')}
-        if 'runner_id' not in lease_columns:
-            conn.execute('ALTER TABLE execution_leases ADD COLUMN runner_id INTEGER REFERENCES coder_runners(id)')
-        runner_columns = {item[1] for item in conn.execute('PRAGMA table_info(coder_runners)')}
-        for column, definition in (
-            ('detected_cpu_count', 'INTEGER'), ('detected_memory_bytes', 'INTEGER'),
-            ('detected_max_tasks', 'INTEGER'), ('capacity_checked_at', 'TEXT'),
-        ):
-            if column not in runner_columns:
-                conn.execute(f'ALTER TABLE coder_runners ADD COLUMN {column} {definition}')
-        columns = {item[1] for item in conn.execute("PRAGMA table_info(attempts)")}
-        if "diff_output" not in columns:
-            conn.execute("ALTER TABLE attempts ADD COLUMN diff_output TEXT")
-        for pos, (key, adapter) in enumerate(ADAPTERS.items()):
-            conn.execute("""INSERT INTO harnesses(key,label,binary,chain_position,updated_at)
-                VALUES(?,?,?,?,?) ON CONFLICT(key) DO NOTHING""", (key, adapter["label"], adapter["binary"], pos, now()))
-        harness_columns = {item[1] for item in conn.execute("PRAGMA table_info(harnesses)")}
-        if 'model_catalog' not in harness_columns:
-            conn.execute("ALTER TABLE harnesses ADD COLUMN model_catalog TEXT")
-            conn.execute("ALTER TABLE harnesses ADD COLUMN model_source TEXT")
-        if 'pool_migrated' not in harness_columns:
-            conn.execute("ALTER TABLE harnesses ADD COLUMN pool_migrated INTEGER DEFAULT 1")
-            conn.execute("UPDATE harnesses SET enabled=installed")
-        project_columns = {item[1] for item in conn.execute('PRAGMA table_info(projects)')}
-        if 'execution_mode' not in project_columns:
-            conn.execute("ALTER TABLE projects ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'local'")
-        if 'auto_failover' not in project_columns:
-            conn.execute("ALTER TABLE projects ADD COLUMN auto_failover INTEGER NOT NULL DEFAULT 1")
-        message_columns = {item[1] for item in conn.execute('PRAGMA table_info(task_messages)')}
-        if 'attempt_id' not in message_columns:
-            conn.execute('ALTER TABLE task_messages ADD COLUMN attempt_id INTEGER REFERENCES attempts(id)')
-        if 'tool_permissions' not in harness_columns:
-            conn.execute("ALTER TABLE harnesses ADD COLUMN tool_permissions TEXT NOT NULL DEFAULT 'standard'")
-        run_columns = {item[1] for item in conn.execute('PRAGMA table_info(runs)')}
-        if 'permission_override' not in run_columns:
-            conn.execute('ALTER TABLE runs ADD COLUMN permission_override TEXT')
-        if 'permissions_json' not in run_columns:
-            conn.execute('ALTER TABLE runs ADD COLUMN permissions_json TEXT')
-        task_columns = {item[1] for item in conn.execute('PRAGMA table_info(tasks)')}
-        if 'tool_permissions' not in task_columns:
-            conn.execute("ALTER TABLE tasks ADD COLUMN tool_permissions TEXT NOT NULL DEFAULT 'inherit'")
-        if 'execution_target' not in task_columns:
-            conn.execute("ALTER TABLE tasks ADD COLUMN execution_target TEXT NOT NULL DEFAULT 'project'")
-        if 'session_budget_chars' not in task_columns:
-            conn.execute("ALTER TABLE tasks ADD COLUMN session_budget_chars INTEGER NOT NULL DEFAULT 24000")
-        coder_profile_columns = {item[1] for item in conn.execute('PRAGMA table_info(project_coder_profiles)')}
-        if 'default_target' not in coder_profile_columns:
-            conn.execute("ALTER TABLE project_coder_profiles ADD COLUMN default_target TEXT NOT NULL DEFAULT 'local'")
-        if 'auth_provider_id' not in coder_profile_columns:
-            conn.execute("ALTER TABLE project_coder_profiles ADD COLUMN auth_provider_id TEXT NOT NULL DEFAULT 'github'")
-        attempt_columns = {item[1] for item in conn.execute('PRAGMA table_info(attempts)')}
-        if 'tool_permissions' not in attempt_columns:
-            conn.execute('ALTER TABLE attempts ADD COLUMN tool_permissions TEXT')
-        if 'session_id' not in attempt_columns:
-            conn.execute('ALTER TABLE attempts ADD COLUMN session_id INTEGER REFERENCES task_sessions(id)')
-        message_columns = {item[1] for item in conn.execute('PRAGMA table_info(task_messages)')}
-        if 'session_id' not in message_columns:
-            conn.execute('ALTER TABLE task_messages ADD COLUMN session_id INTEGER REFERENCES task_sessions(id)')
-        migrate_legacy_sessions(conn)
+    persistence.initialize(DATA_ROOT, DB_PATH, ADAPTERS, now)
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+def db():
+    """Compatibility connection factory used by tests and maintenance scripts."""
+    return persistence.connect(DB_PATH)
 
 
 def rows(sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
-    with DB_LOCK, closing(db()) as conn:
-        return [dict(item) for item in conn.execute(sql, params).fetchall()]
+    return persistence.fetch_all(DB_PATH, DB_LOCK, sql, params)
 
 
 def one(sql: str, params: Tuple[Any, ...] = ()) -> Optional[Dict[str, Any]]:
-    result = rows(sql, params)
-    return result[0] if result else None
+    return persistence.fetch_one(DB_PATH, DB_LOCK, sql, params)
 
 
 def execute(sql: str, params: Tuple[Any, ...] = ()) -> int:
-    with DB_LOCK, db() as conn:
-        cursor = conn.execute(sql, params)
-        return cursor.lastrowid
+    return persistence.execute(DB_PATH, DB_LOCK, sql, params)
 
 
-def migrate_legacy_sessions(conn: sqlite3.Connection) -> None:
-    """Give pre-session tasks one durable initial session without losing history."""
-    task_ids = [row['id'] for row in conn.execute(
-        'SELECT id FROM tasks WHERE NOT EXISTS (SELECT 1 FROM task_sessions WHERE task_sessions.task_id=tasks.id)'
-    )]
-    for task_id in task_ids:
-        session_id = conn.execute(
-            "INSERT INTO task_sessions(task_id,session_number,status,opened_at) VALUES(?,1,'active',?)",
-            (task_id, now()),
-        ).lastrowid
-        conn.execute('UPDATE task_messages SET session_id=? WHERE task_id=? AND session_id IS NULL', (session_id, task_id))
-        conn.execute('UPDATE attempts SET session_id=? WHERE task_id=? AND session_id IS NULL', (session_id, task_id))
+def session_service() -> SessionService:
+    """Build the domain service from the app's replaceable infrastructure seams."""
+    return SessionService(rows, one, execute, now, git, read_events)
 
 
 def sessions_for_task(task_id: int) -> List[Dict[str, Any]]:
-    sessions = rows('SELECT * FROM task_sessions WHERE task_id=? ORDER BY session_number', (task_id,))
-    for session in sessions:
-        session['handoff'] = json.loads(session['handoff_json']) if session.get('handoff_json') else None
-        session['baseline'] = json.loads(session['baseline_json']) if session.get('baseline_json') else None
-        session.pop('handoff_json', None)
-        session.pop('baseline_json', None)
-    return sessions
+    return session_service().for_task(task_id)
 
 
 def active_session(task_id: int) -> Dict[str, Any]:
-    session = one("SELECT * FROM task_sessions WHERE task_id=? AND status='active' ORDER BY session_number DESC LIMIT 1", (task_id,))
-    if session:
-        return session
-    latest = one('SELECT COALESCE(MAX(session_number),0) AS n FROM task_sessions WHERE task_id=?', (task_id,))
-    session_id = execute("INSERT INTO task_sessions(task_id,session_number,status,opened_at) VALUES(?,?,'active',?)",
-                         (task_id, latest['n'] + 1, now()))
-    return one('SELECT * FROM task_sessions WHERE id=?', (session_id,))
+    return session_service().active(task_id)
 
 
 def session_message_chars(session_id: int) -> int:
-    value = one('SELECT COALESCE(SUM(LENGTH(content)),0) AS n FROM task_messages WHERE session_id=?', (session_id,))
-    return int(value['n'])
+    return session_service().message_chars(session_id)
 
 
 def workspace_snapshot(root: Path) -> Dict[str, Any]:
-    if not root.is_dir():
-        return {'available': False, 'reason': 'The preserved working folder is unavailable.'}
-    git_dir = git(['rev-parse', '--git-dir'], root, check=False)
-    if git_dir.returncode:
-        return {'available': False, 'reason': 'This working folder is not a Git repository.'}
-    baseline = git(['rev-parse', '--verify', 'HEAD'], root, check=False).stdout.strip() or None
-    status = git(['status', '--porcelain=v1'], root, check=False).stdout
-    diff = git(['diff', 'HEAD', '--binary', '--'], root, check=False).stdout
-    untracked = git(['ls-files', '--others', '--exclude-standard'], root, check=False).stdout
-    payload = (status + '\n' + diff + '\nUNTRACKED\n' + untracked).encode()
-    return {
-        'available': True,
-        'base_sha': baseline,
-        'status': status[-12000:],
-        'diff_hash': hashlib.sha256(payload).hexdigest(),
-        'changed_files': [line[3:] for line in status.splitlines() if len(line) > 3][:200],
-    }
+    return session_service().workspace_snapshot(root)
 
 
 def session_attempt_summary(session_id: int) -> List[Dict[str, Any]]:
-    result = []
-    for attempt in rows('SELECT * FROM attempts WHERE session_id=? ORDER BY id', (session_id,)):
-        events = read_events(attempt.get('log_path'))
-        result.append({
-            'id': attempt['id'], 'harness': attempt.get('harness_key'), 'model': attempt.get('model'),
-            'label': f"{attempt.get('harness_key') or 'Harness'} attempt #{attempt['id']}",
-            'status': attempt['status'], 'verification': (attempt.get('verify_output') or '')[-2000:],
-            'error': attempt.get('error'),
-            'progress': [event['text'] for event in events if event['kind'] == 'message'][-4:],
-        })
-    return result
+    return session_service().attempt_summary(session_id)
 
 
 def handoff_pack(task: Dict[str, Any], session: Dict[str, Any], root: Optional[Path], snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    messages = rows("SELECT role,content FROM task_messages WHERE session_id=? AND role IN ('user','assistant') ORDER BY id", (session['id'],))
-    return {
-        'task': task['text'],
-        'source_session': session['session_number'],
-        'harness': session.get('harness_key'),
-        'model': session.get('model'),
-        'messages': [{'role': item['role'], 'content': item['content'][-3000:]} for item in messages[-12:]],
-        'attempts': session_attempt_summary(session['id']),
-        'workspace': snapshot if snapshot is not None else (workspace_snapshot(root) if root else {'available': False, 'reason': 'No workspace snapshot was available.'}),
-        'next_action': 'Inspect the workspace and current diff before making further changes.',
-    }
+    return session_service().handoff_pack(task, session, root, snapshot)
 
 
 def seal_session(task: Dict[str, Any], session: Dict[str, Any], reason: str, root: Optional[Path], snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    pack = handoff_pack(task, session, root, snapshot)
-    execute("UPDATE task_sessions SET status='sealed',sealed_at=?,close_reason=?,handoff_json=?,baseline_json=? WHERE id=?",
-            (now(), reason, json.dumps(pack, separators=(',', ':')), json.dumps(pack['workspace'], separators=(',', ':')), session['id']))
-    return pack
+    return session_service().seal(task, session, reason, root, snapshot)
 
 
 def rotate_session(task: Dict[str, Any], reason: str, root: Optional[Path], snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    session = active_session(task['id'])
-    if session_message_chars(session['id']) == 0 and not rows('SELECT id FROM attempts WHERE session_id=?', (session['id'],)):
-        return session
-    pack = seal_session(task, session, reason, root, snapshot)
-    session_id = execute("""INSERT INTO task_sessions(task_id,session_number,harness_key,model,status,opened_at,integrity_status)
-        VALUES(?,?,?,?, 'active', ?, ?)""",
-        (task['id'], session['session_number'] + 1, session.get('harness_key'), session.get('model'), now(),
-         'not_checked' if pack['workspace'].get('available') else 'unavailable'))
-    return one('SELECT * FROM task_sessions WHERE id=?', (session_id,))
+    return session_service().rotate(task, reason, root, snapshot)
 
 
 def latest_handoff(task_id: int) -> Optional[Dict[str, Any]]:
-    session = one("SELECT * FROM task_sessions WHERE task_id=? AND status='sealed' ORDER BY session_number DESC LIMIT 1", (task_id,))
-    return json.loads(session['handoff_json']) if session and session.get('handoff_json') else None
+    return session_service().latest_handoff(task_id)
 
 
 def reconcile_session_snapshot(task: Dict[str, Any], session: Dict[str, Any], actual: Dict[str, Any]) -> Tuple[bool, str]:
-    handoff = latest_handoff(task['id'])
-    if not handoff:
-        execute("UPDATE task_sessions SET integrity_status='passed',integrity_detail=? WHERE id=?", ('Initial session; no predecessor to reconcile.', session['id']))
-        return True, 'Initial session reconciled.'
-    expected = handoff.get('workspace') or {}
-    if not expected.get('available') or not actual.get('available'):
-        execute("UPDATE task_sessions SET integrity_status='unavailable',integrity_detail=? WHERE id=?", ('Git workspace comparison is unavailable for this session.', session['id']))
-        return True, 'Git workspace comparison is unavailable; the harness must inspect the folder.'
-    matches = expected.get('base_sha') == actual.get('base_sha') and expected.get('diff_hash') == actual.get('diff_hash')
-    detail = 'Workspace baseline and diff match the sealed handoff.' if matches else 'Workspace differs from the sealed handoff; review is required before continuing.'
-    execute('UPDATE task_sessions SET integrity_status=?,integrity_detail=? WHERE id=?', ('passed' if matches else 'mismatch', detail, session['id']))
-    return matches, detail
+    return session_service().reconcile_snapshot(task, session, actual)
 
 
 def reconcile_session(task: Dict[str, Any], session: Dict[str, Any], root: Path) -> Tuple[bool, str]:
-    return reconcile_session_snapshot(task, session, workspace_snapshot(root))
-
-
-def slug(value: str, fallback: str) -> str:
-    result = re.sub(r'[^a-z0-9]+', '-', value.lower()).strip('-')
-    return (result or fallback)[:48]
-
-
-def normalize_coder_url(value: Any) -> str:
-    parsed = urlparse(str(value or '').strip())
-    if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ValueError('Enter a Coder server URL such as http://127.0.0.1:3000.')
-    if parsed.path not in ('', '/'):
-        raise ValueError('Use the Coder server base URL without a path.')
-    return f'{parsed.scheme}://{parsed.netloc}'.rstrip('/')
-
-
-def coder_template_name(server_name: str, project_name: str) -> str:
-    candidate = f'harness-{slug(server_name, "server")}-{slug(project_name, "project")}'
-    if len(candidate) <= 32:
-        return candidate
-    suffix = hashlib.sha1(candidate.encode('utf-8')).hexdigest()[:6]
-    return f'{candidate[:25].rstrip("-")}-{suffix}'
-
-
-def public_coder_server(server: Dict[str, Any]) -> Dict[str, Any]:
-    result = dict(server)
-    try:
-        result['capabilities'] = json.loads(result.pop('capabilities_json') or '{}')
-    except json.JSONDecodeError:
-        result['capabilities'] = {}
-    result['token_configured'] = bool(result['token_configured'])
-    return result
+    return session_service().reconcile(task, session, root)
 
 
 def coder_server_or_404(server_id: int) -> Dict[str, Any]:
@@ -656,43 +202,6 @@ def effective_execution_backend(project: Dict[str, Any], task: Dict[str, Any]) -
     return ('coder' if profile and profile['enabled'] and profile.get('default_target') == 'coder' else 'local'), profile
 
 
-def keychain_available() -> bool:
-    return bool(shutil.which('security'))
-
-
-def keychain_account(server_id: int) -> str:
-    return f'coder-server-{server_id}'
-
-
-def save_coder_token(server_id: int, token: str) -> None:
-    if not keychain_available():
-        raise ValueError('macOS Keychain is unavailable; Coder tokens cannot be stored by this Harness server.')
-    result = subprocess.run(['security', 'add-generic-password', '-U', '-s', KEYCHAIN_SERVICE,
-                             '-a', keychain_account(server_id), '-w', token], capture_output=True, text=True, timeout=10)
-    if result.returncode:
-        raise ValueError(result.stderr.strip() or 'Could not save the Coder token in macOS Keychain.')
-
-
-def remove_coder_token(server_id: int) -> None:
-    if not keychain_available():
-        return
-    subprocess.run(['security', 'delete-generic-password', '-s', KEYCHAIN_SERVICE,
-                    '-a', keychain_account(server_id)], capture_output=True, text=True, timeout=10)
-
-
-def read_coder_token(server: Dict[str, Any]) -> Optional[str]:
-    scoped = os.environ.get(f'HARNESS_CODER_TOKEN_{server["id"]}')
-    if scoped:
-        return scoped
-    if os.environ.get('HARNESS_CODER_TOKEN'):
-        return os.environ['HARNESS_CODER_TOKEN']
-    if not server.get('token_configured') or not keychain_available():
-        return None
-    result = subprocess.run(['security', 'find-generic-password', '-w', '-s', KEYCHAIN_SERVICE,
-                             '-a', keychain_account(server['id'])], capture_output=True, text=True, timeout=10)
-    return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
-
-
 def coder_json(base_url: str, path: str, token: Optional[str] = None) -> Dict[str, Any]:
     headers = {'Accept': 'application/json'}
     if token:
@@ -720,11 +229,6 @@ def coder_external_auth_status(server: Dict[str, Any], provider: str = 'github')
         'installation_count': len(payload.get('installations') or []),
         'app_installable': bool(payload.get('app_installable')),
     }
-
-
-def safe_install_url(value: Any) -> Optional[str]:
-    parsed = urlparse(str(value or ''))
-    return str(value) if parsed.scheme == 'https' and parsed.hostname and not parsed.username and not parsed.password else None
 
 
 def device_exchange(server, token, provider, device_code):
@@ -945,53 +449,37 @@ def adapter_metadata() -> Dict[str, Any]:
                   'runnable': value['runnable']} for key, value in ADAPTERS.items()}
 
 
+def run_state_store() -> RunStateStore:
+    """Build the run store from the app's replaceable persistence seams."""
+    return RunStateStore(rows, one, execute, now, project_coder_profile)
+
+
 def current_run(project_id: int) -> Optional[Dict[str, Any]]:
-    return (active_runs(project_id) or [None])[0]
+    return run_state_store().current(project_id)
 
 
 def active_runs(project_id: int) -> List[Dict[str, Any]]:
-    return rows("SELECT * FROM runs WHERE project_id=? AND status NOT IN ('complete','stopped','discarded','blocked') ORDER BY rowid DESC", (project_id,))
+    return run_state_store().active(project_id)
 
 
 def remote_parallel_capacity(profile: Optional[Dict[str, Any]]) -> int:
-    """Use the last capacity measured inside the persistent Coder runner."""
-    if not profile or not profile.get('coder_server_id'):
-        return 1
-    runner = one('SELECT detected_max_tasks FROM coder_runners WHERE coder_server_id=? ORDER BY rowid DESC LIMIT 1',
-                 (profile['coder_server_id'],))
-    return max(1, int(runner['detected_max_tasks'] or 1)) if runner else 1
-
-
-REMOTE_SLOT_STATUSES = ('awaiting_dispatch', 'queued', 'running', 'verifying', 'rotating', 'committing')
+    return run_state_store().remote_capacity(profile)
 
 
 def runner_slot_runs(coder_server_id: int) -> List[Dict[str, Any]]:
-    """Runs that have been admitted to this runner, whether or not SSH has started yet."""
-    placeholders = ','.join('?' for _ in REMOTE_SLOT_STATUSES)
-    return rows(f'''SELECT r.* FROM runs r JOIN execution_leases l ON l.run_id=r.id
-        LEFT JOIN project_coder_profiles p ON p.project_id=r.project_id
-        WHERE l.backend='coder' AND r.status IN ({placeholders}) AND p.coder_server_id=?
-        ORDER BY r.created_at, r.rowid''', (*REMOTE_SLOT_STATUSES, coder_server_id))
+    return run_state_store().runner_slots(coder_server_id)
 
 
 def run_backend(run_id: str) -> Optional[str]:
-    lease = execution_lease(run_id)
-    return lease.get('backend') if lease else None
+    return run_state_store().backend(run_id)
 
 
 def execution_lease(run_id: str) -> Optional[Dict[str, Any]]:
-    return one("SELECT * FROM execution_leases WHERE run_id=?", (run_id,))
+    return run_state_store().lease(run_id)
 
 
 def run_connection_action(run: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Structured UI routing; never infer an account from a human-readable URL."""
-    if not run or run['status'] != 'awaiting_external_auth':
-        return None
-    profile = project_coder_profile(run['project_id'])
-    if not profile or not profile.get('coder_server_id'):
-        return None
-    return {'server_id': profile['coder_server_id'],
-            'provider': profile.get('auth_provider_id') or 'github'}
+    return run_state_store().connection_action(run)
 
 
 def task_pull_requests(task_id: int) -> List[Dict[str, Any]]:
@@ -1043,15 +531,7 @@ def sync_task_pull_request(project: Dict[str, Any], pull_request: Dict[str, Any]
 
 
 def create_execution_lease(run_id: str, task_id: int, backend: str = 'local') -> Dict[str, Any]:
-    if backend not in ('local', 'coder'):
-        raise ValueError('Unknown execution backend')
-    lease = execution_lease(run_id)
-    if lease:
-        return lease
-    lease_id = str(uuid.uuid4())
-    execute("""INSERT INTO execution_leases(id,run_id,task_id,backend,state,created_at,updated_at)
-        VALUES(?,?,?,?,'planned',?,?)""", (lease_id, run_id, task_id, backend, now(), now()))
-    return execution_lease(run_id) or raise_missing_lease(run_id)
+    return run_state_store().create_lease(run_id, task_id, backend)
 
 
 def raise_missing_lease(run_id: str) -> Dict[str, Any]:
@@ -1059,13 +539,7 @@ def raise_missing_lease(run_id: str) -> Dict[str, Any]:
 
 
 def bind_local_execution_lease(run_id: str, worktree: Path, base_sha: Optional[str]) -> None:
-    lease = execution_lease(run_id)
-    if not lease:
-        raise RuntimeError(f'Run {run_id} has no execution lease')
-    if lease['backend'] != 'local':
-        return
-    execute("""UPDATE execution_leases SET state='ready', worktree_path=?, base_sha=?, updated_at=?
-        WHERE run_id=?""", (str(worktree), base_sha, now(), run_id))
+    run_state_store().bind_local(run_id, worktree, base_sha)
 
 
 def coder_runner_context(server: Dict[str, Any]):
@@ -1495,32 +969,10 @@ def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[s
 
 
 def remote_workspace_snapshot(runner: Dict[str, Any], environment: Dict[str, str], worktree_path: str) -> Dict[str, Any]:
-    """Read Git state inside a Coder task worktree without modifying it."""
-    if not worktree_path:
-        return {'available': False, 'reason': 'The remote task worktree is unavailable.'}
-    command = shlex.join(['python3', '-', worktree_path])
-    try:
-        checked = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--', command],
-                                 input=(APP_ROOT / 'remote_workspace_snapshot.py').read_text(), env=environment,
-                                 capture_output=True, text=True, timeout=45)
-    except (OSError, subprocess.TimeoutExpired):
-        return {'available': False, 'reason': 'Could not inspect the remote working folder.'}
-    if checked.returncode:
-        return {'available': False, 'reason': 'Could not inspect the remote working folder.'}
-    try:
-        snapshot = json.loads(checked.stdout)
-    except json.JSONDecodeError:
-        return {'available': False, 'reason': 'Remote workspace inspection returned an invalid response.'}
-    if not isinstance(snapshot, dict) or not isinstance(snapshot.get('available'), bool):
-        return {'available': False, 'reason': 'Remote workspace inspection returned an invalid response.'}
-    if snapshot['available']:
-        if not re.fullmatch(r'[a-f0-9]{40,64}', str(snapshot.get('base_sha') or '')) or not re.fullmatch(r'[a-f0-9]{64}', str(snapshot.get('diff_hash') or '')):
-            return {'available': False, 'reason': 'Remote workspace inspection returned an invalid Git snapshot.'}
-        snapshot['status'] = str(snapshot.get('status') or '')[-12000:]
-        snapshot['changed_files'] = [str(path)[:500] for path in snapshot.get('changed_files', []) if isinstance(path, str)][:200]
-    else:
-        snapshot['reason'] = str(snapshot.get('reason') or 'Remote workspace inspection is unavailable.')[:500]
-    return snapshot
+    return remote_transport.workspace_snapshot(runner, environment, worktree_path, APP_ROOT)
+
+
+
 
 
 def saved_remote_workspace_snapshot(project: Dict[str, Any], task: Dict[str, Any]) -> Dict[str, Any]:
@@ -1569,100 +1021,45 @@ def choose_remote_harness(task: Dict[str, Any], runner: Dict[str, Any], environm
 
 
 def remote_agent_request(harness: Dict[str, Any], worktree: Dict[str, Any], task: Dict[str, Any], project: Dict[str, Any], permission_mode: str) -> str:
-    request = {'harness': harness['key'], 'model': harness.get('model') or 'default', 'prompt': task_prompt(task, project),
-               'permission_mode': permission_mode, 'worktree_path': worktree['worktree_path'], 'base_sha': worktree['base_sha'],
-               'verify_command': project.get('verify_command') or '', 'reply_path': worktree['worktree_path'] + '/.harness-last-message'}
-    encoded = base64.urlsafe_b64encode(json.dumps(request, separators=(',', ':')).encode()).decode()
-    return shlex.join(['python3', '-', encoded])
+    return remote_transport.agent_request(harness, worktree, task_prompt(task, project), project, permission_mode)
+
+
+
 
 
 def run_remote_agent(runner: Dict[str, Any], environment: Dict[str, str], command: str, output_file: Path) -> Tuple[Dict[str, Any], str]:
-    """Run the bounded remote helper and retain the transcript locally for review."""
-    process = subprocess.Popen(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--', command],
-                               env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                               text=True, bufsize=1)
-    assert process.stdin and process.stdout
-    process.stdin.write((APP_ROOT / 'remote_agent_runner.py').read_text())
-    process.stdin.close()
-    captured = []
-    with output_file.open('w', encoding='utf-8') as handle:
-        for line in process.stdout:
-            captured.append(line)
-            handle.write(line)
-    code = process.wait()
-    transcript = ''.join(captured)
-    marker_at = transcript.rfind(REMOTE_RESULT_MARKER)
-    if code or marker_at < 0:
-        raise RuntimeError('The Coder runner did not return a complete agent result. Its task worktree was preserved.')
-    raw = transcript[marker_at + len(REMOTE_RESULT_MARKER):].strip().splitlines()[0]
-    try:
-        result = json.loads(raw)
-    except ValueError as exc:
-        raise RuntimeError('The Coder runner returned an unreadable agent result.') from exc
-    if not isinstance(result, dict):
-        raise RuntimeError('The Coder runner returned an invalid agent result.')
-    return result, transcript[:marker_at]
+    return remote_transport.run_agent(runner, environment, command, output_file, APP_ROOT, REMOTE_RESULT_MARKER)
+
+
+
 
 
 def remote_delivery_request(worktree: Dict[str, Any], task: Dict[str, Any], profile: Dict[str, Any]) -> str:
-    request = {'worktree_path': worktree['worktree_path'], 'branch_name': worktree['branch_name'],
-               'base_sha': worktree['base_sha'], 'repo_url': profile['repo_url'],
-               'base_ref': profile['base_ref'], 'auth_provider_id': profile.get('auth_provider_id') or 'github',
-               'title': task['text']}
-    encoded = base64.urlsafe_b64encode(json.dumps(request, separators=(',', ':')).encode()).decode()
-    return shlex.join(['python3', '-', encoded])
+    return remote_transport.delivery_request(worktree, task, profile)
+
+
+
 
 
 def run_remote_delivery(runner: Dict[str, Any], environment: Dict[str, str], command: str) -> Dict[str, Any]:
-    """Run the fixed remote delivery helper without bringing credentials home."""
-    process = subprocess.Popen(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--', command],
-                               env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, text=True)
-    assert process.stdin and process.stdout
-    process.stdin.write((APP_ROOT / 'remote_delivery_runner.py').read_text())
-    process.stdin.close()
-    transcript = process.stdout.read()
-    code = process.wait()
-    marker_at = transcript.rfind(REMOTE_DELIVERY_MARKER)
-    if code or marker_at < 0:
-        raise RuntimeError('The Coder runner did not return a complete delivery result. The remote worktree was preserved.')
-    try:
-        result = json.loads(transcript[marker_at + len(REMOTE_DELIVERY_MARKER):].strip().splitlines()[0])
-    except ValueError:
-        raise RuntimeError('The Coder runner returned an unreadable delivery result.') from None
-    if not isinstance(result, dict) or result.get('error'):
-        raise RuntimeError((result or {}).get('error') or 'The Coder runner could not deliver the remote task.')
-    if not result.get('commit_sha') or not result.get('pr_url'):
-        raise RuntimeError('The Coder runner returned an incomplete delivery result.')
-    return result
+    return remote_transport.run_delivery(runner, environment, command, APP_ROOT, REMOTE_DELIVERY_MARKER)
+
+
+
 
 
 def remote_pr_status_request(pull_request: Dict[str, Any], profile: Dict[str, Any]) -> str:
-    request = {'action': 'status', 'pr_url': pull_request['url'],
-               'auth_provider_id': profile.get('auth_provider_id') or 'github'}
-    encoded = base64.urlsafe_b64encode(json.dumps(request, separators=(',', ':')).encode()).decode()
-    return shlex.join(['python3', '-', encoded])
+    return remote_transport.pr_status_request(pull_request, profile)
+
+
+
 
 
 def run_remote_pr_status(runner: Dict[str, Any], environment: Dict[str, str], command: str) -> Dict[str, Any]:
-    process = subprocess.Popen(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--', command],
-                               env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, text=True)
-    assert process.stdin and process.stdout
-    process.stdin.write((APP_ROOT / 'remote_delivery_runner.py').read_text())
-    process.stdin.close()
-    transcript = process.stdout.read()
-    code = process.wait()
-    marker_at = transcript.rfind(REMOTE_DELIVERY_MARKER)
-    if code or marker_at < 0:
-        raise RuntimeError('The Coder runner did not return a pull-request status. The task branch was preserved.')
-    try:
-        result = json.loads(transcript[marker_at + len(REMOTE_DELIVERY_MARKER):].strip().splitlines()[0])
-    except ValueError:
-        raise RuntimeError('The Coder runner returned an unreadable pull-request status.') from None
-    if not isinstance(result, dict) or result.get('error') or not result.get('url'):
-        raise RuntimeError((result or {}).get('error') or 'The Coder runner could not read the pull-request status.')
-    return result
+    return remote_transport.run_pr_status(runner, environment, command, APP_ROOT, REMOTE_DELIVERY_MARKER)
+
+
+
 
 
 def harness_availability(harness: Dict[str, Any]) -> Dict[str, str]:
@@ -1900,11 +1297,7 @@ def log_file(attempt_id: int) -> Path:
 
 
 def permission_blocker(key: str, mode: str) -> Optional[str]:
-    if mode == 'ask':
-        return f"{ADAPTERS[key]['label']}: live approval in chat is not supported by this adapter yet. No command was started. Choose a supported permission mode in task settings."
-    if mode == 'auto' and key == 'opencode':
-        return 'OpenCode: automatic review is not supported by this adapter. No command was started. Use harness defaults with your configured OpenCode policy, or choose another harness.'
-    return None
+    return adapter_permission_blocker(ADAPTERS, key, mode)
 
 
 def permission_snapshot(task: Dict[str, Any]) -> Dict[str, str]:
@@ -1914,202 +1307,39 @@ def permission_snapshot(task: Dict[str, Any]) -> Dict[str, str]:
 
 
 def configured_command(harness: Dict[str, Any], root: Path, prompt: str, override: Optional[str] = None) -> List[str]:
-    mode = override or harness.get('tool_permissions') or 'standard'
-    if mode not in ('standard', 'auto', 'ask'):
-        raise ValueError('Unknown permission mode')
-    problem = permission_blocker(harness['key'], mode)
-    if problem:
-        raise ValueError(problem)
-    command = ADAPTERS[harness['key']]['build'](root, harness['model'], prompt)
-    if harness['key']=='claude' and mode=='auto' and '--permission-mode' in command:
-        command[command.index('--permission-mode')+1]='auto'
-    return command
+    return build_configured_command(ADAPTERS, harness, root, prompt, override)
 
 
 def stream_process(command: List[str], cwd: Path, output_file: Path) -> Tuple[int, str]:
-    captured: List[str] = []
-    with output_file.open("w", encoding="utf-8") as handle:
-        handle.write("$ " + " ".join(command) + "\n\n")
-        handle.flush()
-        process = subprocess.Popen(command, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
-        CHILDREN.add(process)
-        def timed_out():
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-        timer = threading.Timer(600, timed_out)
-        timer.daemon = True
-        timer.start()
-        assert process.stdout
-        with process.stdout:
-            for line in process.stdout:
-                captured.append(line)
-                handle.write(line)
-                handle.flush()
-        returncode = process.wait()
-        timer.cancel()
-        CHILDREN.discard(process)
-        if returncode == -signal.SIGTERM:
-            captured.append('\nHarness exceeded the 10-minute execution timeout. Files were preserved. Retry or split this task into a smaller step.\n')
-    return returncode, "".join(captured)
+    return worktrees.stream_process(command, cwd, output_file, CHILDREN)
 
 
 def make_worktree(project: Dict[str, Any], run_id: str) -> Tuple[Path, str, str]:
-    repo = Path(project["repo_path"])
-    base = git(["rev-parse", "HEAD"], repo).stdout.strip()
-    branch = f"harness/{run_id[:8]}"
-    destination = WORKTREE_ROOT / f"project-{project['id']}" / run_id
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    result = git(["worktree", "add", "-b", branch, str(destination), base], repo, check=False)
-    if result.returncode:
-        raise RuntimeError(result.stderr.strip() or "Could not create Git worktree")
-    return destination, branch, base
+    return worktrees.make_worktree(project, run_id, WORKTREE_ROOT, git)
 
 
 def worktree_diff(attempt: Dict[str, Any]) -> str:
-    root = Path(attempt['worktree_path'])
-    if not root.exists():
-        return attempt.get('diff_output') or 'Worktree is no longer available.'
-    if not attempt['base_sha']:
-        return 'This folder has no Git baseline. Changes are in the project folder; no commit was created.'
-    diff = git(['diff', attempt['base_sha'], '--'], root, check=False).stdout
-    untracked = git(['ls-files', '--others', '--exclude-standard', '-z'], root).stdout.split('\0')
-    for path in filter(None, untracked):
-        diff += git(['diff', '--no-index', '--', '/dev/null', path], root, check=False).stdout
-    return diff
+    return worktrees.worktree_diff(attempt, git)
 
 
 def cleanup_worktree(repo: Path, worktree: Path) -> None:
-    if repo.resolve() == worktree.resolve():
-        return  # Local runs must NEVER remove or reset project files.
-    git(["worktree", "remove", "--force", str(worktree)], repo, check=False)
+    worktrees.cleanup_worktree(repo, worktree, git)
 
 
 def decode_result(key: str, output: str) -> Tuple[str, Optional[str]]:
-    """Interpret structured CLI output, including failures that exit with code zero."""
-    messages, failure = [], None
-    for line in output.splitlines():
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        item = event.get('item') if isinstance(event.get('item'), dict) else {}
-        if event.get('type') == 'item.completed' and item.get('type') == 'agent_message':
-            messages.append(item.get('text', ''))
-        if event.get('type') == 'item.completed' and item.get('type') == 'error':
-            failure = item.get('message') or item.get('error') or 'The harness reported an execution error.'
-        if event.get('type') == 'assistant':
-            content = event.get('message', {}).get('content', [])
-            messages.extend(c.get('text', '') for c in content if isinstance(c, dict) and c.get('type') == 'text')
-        if event.get('type') == 'text':
-            messages.append(event.get('part', {}).get('text', ''))
-        if event.get('type') == 'message' and event.get('role') == 'assistant':
-            messages.append(event.get('text', ''))
-        if isinstance(event.get('result'), str):
-            messages = [event['result']]
-        if event.get('is_error') or event.get('type') == 'error' or event.get('permission_denials'):
-            failure = event.get('result') or event.get('message') or str(event.get('error') or event.get('permission_denials'))
-    return ('\n\n'.join(messages).strip() or output[-16000:]), failure
+    return decode_harness_result(key, output)
 
 
 def log_details(attempt: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    path = Path(attempt['log_path']) if attempt and attempt.get('log_path') else None
-    if not path or not path.exists():
-        return {'log': 'No log yet.', 'activity': [], 'session_id': None, 'resume_command': None}
-    with path.open('rb') as handle:
-        prefix = handle.read(65536).decode('utf-8', errors='replace')
-        handle.seek(max(0, path.stat().st_size - 30000))
-        tail = handle.read().decode('utf-8', errors='replace')
-    session_id = None
-    for line in prefix.splitlines():
-        match = re.match(r'^session id:\s*([0-9a-f-]{36})\s*$', line)
-        if match:
-            session_id = match[1]
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(event, dict) and event.get('type') == 'thread.started':
-            candidate = event.get('thread_id', '')
-            if re.fullmatch(r'[0-9a-f-]{36}', candidate):
-                session_id = candidate
-    activity = []
-    for line in tail.splitlines():
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        item = event.get('item') or {}
-        if event.get('type') in ('item.started', 'item.completed'):
-            kind = item.get('type')
-            if kind == 'command_execution':
-                activity.append({'kind': 'command', 'text': item.get('command', '')[:240], 'status': item.get('status', '')})
-            elif kind == 'file_change':
-                activity.append({'kind': 'edit', 'text': ', '.join(c.get('path', '') for c in item.get('changes', []))[:240], 'status': item.get('status', '')})
-            elif kind == 'agent_message':
-                activity.append({'kind': 'message', 'text': item.get('text', '')[:1500], 'status': ''})
-        if event.get('type') == 'assistant':
-            for part in event.get('message', {}).get('content', []):
-                if part.get('type') == 'text':
-                    activity.append({'kind':'message', 'text':part.get('text', '')[:1500], 'status':''})
-                elif part.get('type') == 'tool_use':
-                    inputs = part.get('input') or {}
-                    activity.append({'kind':'tool', 'text':part.get('name', 'Tool') + ' · ' + str(inputs.get('command') or inputs.get('file_path') or inputs.get('path') or '')[:240], 'status':'working'})
-        if event.get('type') == 'message' and event.get('role') == 'assistant':
-            activity.append({'kind':'message', 'text':event.get('text', '')[:1500], 'status':''})
-        if event.get('type') in ('tool_call', 'tool_use'):
-            activity.append({'kind':'tool', 'text':str(event.get('toolName') or event.get('tool_name') or event.get('name') or 'Tool')[:240], 'status':'working'})
-        if event.get('type') == 'text':
-            activity.append({'kind':'message', 'text':event.get('part', {}).get('text', '')[:1500], 'status':''})
-        if event.get('type') == 'tool_use' and isinstance(event.get('part'), dict):
-            part = event['part']
-            activity[-1] = {'kind':'tool', 'text':str(part.get('tool') or 'Tool')[:240], 'status':str(part.get('state', {}).get('status', 'working'))}
-    history = read_events(path)
-    return {'log': tail, 'activity': activity[-6:], 'events': history, 'session_id': session_id,
-            'resume_command': f'codex resume {session_id}' if session_id and attempt['harness_key'] == 'codex' else None}
+    return read_log_details(attempt, read_events)
 
 
 def commit_and_merge(project: Dict[str, Any], task: Dict[str, Any], attempt: Dict[str, Any]) -> Tuple[Optional[str], str, str]:
-    repo, worktree = Path(project["repo_path"]), Path(attempt["worktree_path"])
-    if git(['status', '--porcelain'], repo).stdout.strip() or git(['rev-parse', 'HEAD'], repo).stdout.strip() != attempt['base_sha']:
-        raise RuntimeError('The main project changed during execution. Verified work is preserved in the worktree for review.')
-    git(["add", "-A"], worktree)
-    status = git(["status", "--porcelain"], worktree).stdout.strip()
-    if status:
-        message = "harness: " + task["text"][:68]
-        result = git(["commit", "-m", message], worktree, check=False)
-        if result.returncode:
-            raise RuntimeError(result.stderr.strip() or "Could not commit worktree changes")
-    head = git(["rev-parse", "HEAD"], worktree).stdout.strip()
-    merged = git(["merge", "--ff-only", attempt["branch_name"]], repo, check=False)
-    if merged.returncode:
-        raise RuntimeError("Main repository changed during this run; worktree kept. " + merged.stderr.strip())
-    mark_task_complete(repo, task)
-    return (head,
-            git(["diff", "--stat", attempt["base_sha"], "HEAD"], repo).stdout.strip(),
-            git(["diff", attempt["base_sha"], "HEAD", "--"], repo).stdout)
+    return worktrees.commit_and_merge(project, task, attempt, git)
 
 
 def mark_task_complete(repo: Path, task: Dict[str, Any]) -> None:
-    if task['source_line'] is None:
-        return
-    file = repo / "TASKS.md"
-    content = file.read_text(encoding="utf-8").splitlines(keepends=True)
-    preferred_line = (task["source_line"] or 1) - 1
-    locations = [preferred_line] + [i for i in range(len(content)) if i != preferred_line]
-    for index in locations:
-        if 0 <= index < len(content) and re.match(r"^\s*[-*]\s+\[ \]\s+" + re.escape(task["text"]) + r"\s*$", content[index].rstrip("\n")):
-            content[index] = re.sub(r"(\[) (\])", r"\1x\2", content[index], count=1)
-            file.write_text("".join(content), encoding="utf-8")
-            git(["add", "TASKS.md"], repo)
-            result = git(["commit", "-m", "chore: complete task"], repo, check=False)
-            if result.returncode:
-                raise RuntimeError(result.stderr.strip() or "Could not commit TASKS.md")
-            return
-    raise RuntimeError("Merged work, but could not locate the unchecked task in TASKS.md")
+    worktrees.mark_task_complete(repo, task, git)
 
 
 def run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: Optional[int] = None, permission_retry: bool = False) -> None:
@@ -2377,7 +1607,13 @@ def retry_remote_delivery(run_id: str) -> None:
 def serialize_project(project: Dict[str, Any]) -> Dict[str, Any]:
     project["tasks"] = rows("SELECT * FROM tasks WHERE project_id=? ORDER BY task_order", (project["id"],))
     project['coder_profile'] = project_coder_profile(project['id'])
+    project['board_views'] = [dict(item, config=json.loads(item['config_json'])) for item in rows('SELECT * FROM board_views WHERE project_id=? ORDER BY id', (project['id'],))]
     for task in project['tasks']:
+        history = rows('SELECT harness_key,status,integrity_status FROM task_sessions WHERE task_id=? ORDER BY session_number', (task['id'],))
+        task['session_count'] = len(history)
+        task['harness_history'] = list(dict.fromkeys(item['harness_key'] for item in history if item['harness_key']))
+        task['active_harness'] = next((item['harness_key'] for item in reversed(history) if item['status'] == 'active'), None)
+        task['integrity_status'] = history[-1]['integrity_status'] if history else 'not_checked'
         task['pull_requests'] = task_pull_requests(task['id'])
         task['run'] = one("SELECT * FROM runs WHERE task_id=? ORDER BY rowid DESC LIMIT 1", (task['id'],))
         backend, profile = effective_execution_backend(project, task)
@@ -2432,6 +1668,13 @@ class API(SimpleHTTPRequestHandler):
     def body(self) -> Dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
         return json.loads(self.rfile.read(length) or b"{}")
+
+    def is_dashboard_origin(self) -> bool:
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        host = self.headers.get("Host", "")
+        return origin == "http://" + host or (host.startswith("127.0.0.1:") and origin == "http://127.0.0.1:5173")
 
     def do_GET(self) -> None:
         route = urlparse(self.path).path
@@ -2556,7 +1799,9 @@ class API(SimpleHTTPRequestHandler):
                 with path.open('rb') as handle:
                     shutil.copyfileobj(handle,self.wfile)
                 return
-            self.path = "/index.html" if route == "/" else route
+            # The React product has one canonical surface at /.  Preserve old
+            # bookmarks without letting /ui/index.html serve the retired UI.
+            self.path = "/index.html" if route == '/' or route == '/legacy' or route == '/ui' or route.startswith('/ui/') else route
             return super().do_GET()
         except Exception as exc:
             self.send_json({"error": str(exc)}, 400)
@@ -2564,13 +1809,45 @@ class API(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:
         route = urlparse(self.path).path
         try:
-            origin = self.headers.get("Origin")
-            if origin and origin != "http://" + self.headers.get("Host", ""):
+            if not self.is_dashboard_origin():
                 self.send_json({"error": "Requests must come from this dashboard"}, 403)
                 return
             if not self.headers.get("Content-Type", "").startswith("application/json"):
                 raise ValueError("Expected a JSON request")
             payload = self.body()
+            match = re.fullmatch(r'/api/projects/(\d+)/board-views', route)
+            if match:
+                project_id = int(match[1])
+                project_or_404(project_id)
+                name = str(payload.get('name', '')).strip()[:80]
+                config = payload.get('config', {})
+                if not name or not isinstance(config, dict):
+                    raise ValueError('A view name and configuration are required')
+                stages = config.get('stages', ['planned', 'running', 'review', 'done'])
+                if not isinstance(stages, list) or not stages or any(s not in ('planned', 'running', 'review', 'done') for s in stages):
+                    raise ValueError('Choose at least one valid workflow stage')
+                view_id = payload.get('id')
+                if view_id:
+                    if not one('SELECT id FROM board_views WHERE id=? AND project_id=?', (view_id, project_id)):
+                        raise ValueError('View not found')
+                    execute('UPDATE board_views SET name=?,config_json=? WHERE id=?', (name, json.dumps(config), view_id))
+                else:
+                    view_id = execute('INSERT INTO board_views(project_id,name,config_json,created_at) VALUES(?,?,?,?)', (project_id, name, json.dumps(config), now()))
+                self.send_json({'id': view_id}); return
+            match = re.fullmatch(r'/api/projects/(\d+)/board', route)
+            if match:
+                project_id = int(match[1])
+                project_or_404(project_id)
+                items = payload.get('tasks')
+                expected = {t['id'] for t in rows('SELECT id FROM tasks WHERE project_id=?', (project_id,))}
+                if not isinstance(items, list) or any(not isinstance(t, dict) for t in items) or len(items) != len(expected) or {t.get('id') for t in items} != expected:
+                    raise ValueError('Board must contain every project task exactly once; reload and retry')
+                if any(t.get('workflow_stage') not in ('planned', 'running', 'review', 'done') for t in items):
+                    raise ValueError('Unknown workflow stage')
+                with DB_LOCK, db() as conn:
+                    for position, item in enumerate(items):
+                        conn.execute('UPDATE tasks SET workflow_stage=?,board_position=? WHERE id=? AND project_id=?', (item['workflow_stage'], position, item['id'], project_id))
+                self.send_json({'ok': True}); return
             match = re.match(r'^/api/coder-servers/(\d+)/runner$', route)
             if match:
                 server = coder_server_or_404(int(match.group(1)))
@@ -2775,6 +2052,7 @@ class API(SimpleHTTPRequestHandler):
                     order = one("SELECT COALESCE(MAX(task_order),-1)+1 AS n FROM tasks WHERE project_id=?", (project_id,))["n"]
                     task_id = execute("INSERT INTO tasks(project_id,text,task_order,status,created_at) VALUES(?,?,?,'pending',?)",
                         (project_id, task_text.splitlines()[0][:120], order, now()))
+                    execute("UPDATE tasks SET board_position=? WHERE id=?", (order, task_id))
                     execute('UPDATE tasks SET tool_permissions=? WHERE id=?', (permissions, task_id))
                     session_id = execute("INSERT INTO task_sessions(task_id,session_number,status,opened_at) VALUES(?,1,'active',?)", (task_id, now()))
                     execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,'user',?,?)", (task_id, session_id, task_text, now()))
@@ -2997,8 +2275,7 @@ class API(SimpleHTTPRequestHandler):
     def do_DELETE(self) -> None:
         route = urlparse(self.path).path
         try:
-            origin = self.headers.get("Origin")
-            if origin and origin != "http://" + self.headers.get("Host", ""):
+            if not self.is_dashboard_origin():
                 self.send_json({"error": "Requests must come from this dashboard"}, 403)
                 return
             match = re.match(r"^/api/tasks/(\d+)$", route)

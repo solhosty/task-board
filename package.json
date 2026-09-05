@@ -1,0 +1,12 @@
+{
+  "name":"aludra-workspace",
+  "private":true,
+  "scripts":{
+    "dev":"./scripts/dev.sh",
+    "build":"npm --prefix frontend run build",
+    "test":"npm run test:ui && npm run test:e2e && npm run test:python",
+    "test:ui":"npm --prefix frontend test",
+    "test:e2e":"npm --prefix frontend run test:e2e",
+    "test:python":"PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'"
+  }
+}

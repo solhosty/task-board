@@ -1,0 +1,2 @@
+.savedviews{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));max-width:960px;gap:10px;margin-bottom:18px}.saved{display:flex;min-height:138px;flex-direction:column;gap:8px;border:1px solid #e1e4ed;border-radius:6px;background:#fff;padding:15px}.saved b{font-size:15px}.saved p{margin:0;color:var(--muted);font-size:12px}.saved .button{align-self:flex-start;margin-top:auto}
+@media(max-width:600px){.savedviews{grid-template-columns:1fr}}

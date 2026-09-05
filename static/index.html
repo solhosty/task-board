@@ -1,28 +1,3 @@
-<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Harness Rotation</title><link rel="stylesheet" href="/style.css"></head>
-<body>
-<div class="workspace-shell">
-  <aside class="sidebar">
-    <div class="brand"><span class="brand-mark">↗</span><strong>Rotation</strong><span class="local-tag">LOCAL</span></div>
-    <button id="add-project" class="new-project">Add project</button>
-    <div class="sidebar-heading"><span>CHATS</span><button id="toggle-chats" class="text-button" hidden>Show all</button></div>
-    <nav id="project-tree" aria-label="Projects and chats"></nav>
-    <footer>One goal. Several harnesses.<br><span>Your work stays here.</span></footer>
-  </aside>
-  <main class="main-pane">
-    <header class="topbar"><div><span id="project-name">Your workspace</span><span id="project-path"></span></div><div class="topbar-actions"><button id="workspace-settings" class="icon-button" disabled aria-label="Project settings" title="Project settings">⚙</button><button id="new-goal" disabled>New task</button></div></header>
-    <section id="welcome"><div class="welcome-mark">↗</div><h1>What do you want to build?</h1><p>Add a local project, then create a task. Rotation keeps the discussion, progress, and handoffs together.</p><button id="welcome-add">Add your first project</button></section>
-    <section id="goal-view" class="hidden">
-      <div class="goal-heading"><div><span class="eyebrow">TASK</span><h1 id="goal-title"></h1><p id="task-context" class="muted"></p><div id="pull-requests" aria-live="polite"></div></div><div class="goal-actions"><button id="goal-settings" class="icon-button" aria-label="Task options" title="Task options">•••</button></div></div>
-      <div id="run-banner"></div>
-      <div id="conversation" aria-live="polite"></div>
-      <section id="run-activity" hidden aria-label="Current harness activity"><div id="activity-summary"></div><details id="raw-log"><summary>Live tool output</summary><pre id="live-output" aria-label="Raw harness output"></pre></details></section>
-      <div id="native-session" class="muted"></div>
-      <div class="composer"><button id="jump-latest" type="button" class="secondary" hidden>Jump to latest</button><form id="session-message"><textarea id="message-text" aria-label="Message this task" placeholder="Add context, ask a question, or describe the next change…" required></textarea><div class="composer-actions"><span id="goal-status"></span><button type="button" id="rotate-session" class="secondary" title="Start a fresh conversation on the same harness. It never triggers harness rotation.">New conversation</button><button type="button" id="run-session" class="secondary" title="Creates a run using the task as it stands. You start the selected harness in the next step.">Prepare run</button><button type="submit" id="send-message">Send</button></div></form><p id="session-error" role="alert" class="error"></p></div>
-    </section>
-  </main>
-</div>
-<dialog id="project-dialog"><button class="close" data-close="project-dialog" aria-label="Close project form">×</button><p class="eyebrow">LOCAL PROJECT</p><h2>Add a project</h2><p class="dialog-help">Choose where the code lives. Tasks and harness history stay grouped here.</p><form id="project-form"><label>Project folder<div class="path-picker"><input name="repo_path" placeholder="Choose a folder" required><button id="choose-folder" type="button" class="secondary">Browse</button></div></label><label>Project name<input name="name" placeholder="Filled from folder name"></label><details><summary>Run defaults</summary><label>Verify command<input name="verify_command" value="git diff --check" required></label><label>Working location<select name="execution_mode"><option value="local">Project folder</option><option value="worktree">Isolated Git worktree</option></select></label><label>Run mode<select name="default_mode"><option value="supervised">Ask before running and finishing</option><option value="unattended">Run and finish automatically</option></select></label><label class="switch"><input name="auto_failover" type="checkbox" checked> Continue with the next harness after a limit</label></details><p id="project-error" class="error" role="alert"></p><button>Add project</button></form></dialog>
-<dialog id="new-task-dialog"><button class="close" data-close="new-task-dialog" aria-label="Close new task">×</button><p class="eyebrow" id="new-task-project"></p><h2>New task</h2><p class="dialog-help">Write the outcome you want. Add context in the chat, then prepare a run when you are ready.</p><form id="new-task"><label>What do you want done?<textarea id="new-task-text" required placeholder="Build a personal recipe app with search and meal planning…"></textarea></label><button>Create task</button></form></dialog>
-<dialog id="folder-dialog"><button class="close" data-close="folder-dialog" aria-label="Close folder picker">×</button><p class="eyebrow">ON YOUR COMPUTER</p><h2>Choose a project folder</h2><form id="folder-location" class="path-picker"><input id="folder-path" aria-label="Folder location"><button>Go</button></form><p id="folder-error" class="error"></p><div id="folder-list"></div><div class="folder-actions"><button id="folder-up" class="secondary">Up one folder</button><button id="use-folder">Use this folder</button></div></dialog>
-<dialog id="detail"><button class="close" data-close="detail" aria-label="Close dialog">×</button><p id="detail-kicker" class="eyebrow"></p><h2 id="detail-title"></h2><pre id="detail-body"></pre><div id="detail-form"></div></dialog><div id="toast" role="status"></div><script src="/chat-format.js"></script><script src="/app.js"></script></body></html>
+<!doctype html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><meta name="theme-color" content="#5367ff"/><title>Aludra · Workspace</title>  <script type="module" crossorigin src="/assets/index-cKP2jfnH.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-CIu9EH5N.css">
+</head><body><div id="root"></div></body></html>

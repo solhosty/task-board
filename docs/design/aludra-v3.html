@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Aludra · task operating system</title>
+  <style>
+    :root{--o:#0B0D12;--i:#F5F3EE;--p:#fffefa;--ink:#171a20;--mut:#68707c;--line:#dfddd6;--soft:#eeece6;--blue:#5367FF;--bluep:#eef0ff;--gold:#F3C969;--goldp:#fff7df;--green:#2f7652;--red:#aa4941;--r:12px;--shadow:0 18px 48px #0b0d121e}*{box-sizing:border-box}body{margin:0;background:#e8e7e2;color:var(--ink);font:14px/1.45 Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select,textarea{font:inherit}button{cursor:pointer}.app{min-height:100vh;display:grid;grid-template-columns:232px minmax(0,1fr);background:var(--i)}.rail{display:flex;flex-direction:column;gap:5px;padding:20px 12px;background:var(--o);color:var(--i)}.brand{display:flex;align-items:center;gap:9px;height:44px;padding:0 8px;margin-bottom:18px;font-size:19px;letter-spacing:-.04em}.brand svg{width:29px}.rail-label{margin:15px 8px 5px;color:#858c98;font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase}.nav,.projects{display:grid;gap:3px}.nav button,.project{min-height:42px;display:flex;align-items:center;gap:10px;width:100%;border:0;border-radius:8px;padding:0 10px;background:transparent;color:#b9bec8;text-align:left}.nav button:hover,.nav button.on,.project.on{background:#1a1e27;color:#fff}.ic{display:inline-grid;place-items:center;width:20px;height:20px;font-size:16px}.project{font-size:13px}.project .count{margin-left:auto;color:#808794;font-size:11px}.health{margin-top:auto;padding:13px 8px;border-top:1px solid #292e38;color:#a2a8b3;font-size:12px}.health b{display:block;color:#f6f4ee;font-weight:600}.main{min-width:0;min-height:100vh}.bar{display:flex;align-items:center;justify-content:space-between;gap:15px;min-height:68px;padding:12px 26px;border-bottom:1px solid var(--line);background:#fcfbf7}.crumb{display:flex;align-items:center;gap:8px;min-width:0}.crumb b{font-weight:650}.crumb span{color:var(--mut)}.actions{display:flex;align-items:center;gap:8px}.button{min-height:42px;display:inline-flex;align-items:center;justify-content:center;gap:7px;border:1px solid var(--line);border-radius:9px;padding:0 13px;background:var(--p);color:var(--ink);font-weight:600;white-space:nowrap}.button:hover{border-color:#abb2c0;background:#fff}.button.primary{border-color:var(--blue);background:var(--blue);color:#fff}.button.ghost{border-color:transparent;background:transparent;color:var(--mut)}.button.small{min-height:34px;padding:0 10px;font-size:12px}.page{display:none;padding:25px 26px}.page.on{display:block}.pagehead{display:flex;align-items:flex-end;justify-content:space-between;gap:15px;margin-bottom:20px}.eyebrow{margin:0 0 4px;color:var(--mut);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}h1{margin:0;font-size:25px;line-height:1.18;letter-spacing:-.035em}h2{margin:0;font-size:15px;letter-spacing:-.015em}p{margin:0}.muted{color:var(--mut)}.seg{display:flex;align-items:center;gap:2px;padding:3px;border:1px solid var(--line);border-radius:10px;background:var(--p)}.seg button{min-height:34px;border:0;border-radius:7px;padding:0 10px;background:transparent;color:var(--mut);font-weight:600}.seg button.on{background:var(--soft);color:var(--ink)}.viewbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:18px}.tabs{display:flex;gap:2px;overflow:auto}.tabs button{min-height:40px;border:0;border-bottom:2px solid transparent;padding:0 11px;background:transparent;color:var(--mut);font-weight:600;white-space:nowrap}.tabs button.on{border-color:var(--blue);color:var(--ink)}.board{display:grid;grid-template-columns:repeat(4,minmax(250px,1fr));gap:12px;overflow:auto;padding-bottom:8px}.lane{min-height:544px;padding:10px;border:1px solid var(--line);border-radius:var(--r);background:#eceae4}.lanehead{display:flex;align-items:center;justify-content:space-between;min-height:40px;padding:0 2px 9px}.lanehead .left{display:flex;align-items:center;gap:8px}.dot{width:8px;height:8px;border-radius:50%;background:#9399a3}.run .dot{background:var(--blue)}.review .dot{background:#c28a15}.done .dot{background:var(--green)}.iconbutton{display:inline-grid;place-items:center;width:38px;height:38px;border:0;border-radius:8px;background:transparent;color:var(--mut);font-size:19px}.iconbutton:hover{background:#fff}.cards{display:grid;gap:9px;align-content:start;min-height:470px}.taskcard{display:grid;gap:10px;padding:13px;border:1px solid var(--line);border-radius:10px;background:var(--p);box-shadow:0 1px 0 #00000005;cursor:pointer}.taskcard:hover{border-color:#acb3c3;box-shadow:0 8px 20px #0b0d1210}.taskcard.dragging{opacity:.45}.cardtop,.cardbottom{display:flex;align-items:center;justify-content:space-between;gap:8px}.taskcard h3{margin:0;font-size:14px;font-weight:650;line-height:1.35}.agentstack{display:flex;padding-left:5px}.agent{display:grid;place-items:center;width:25px;height:25px;margin-left:-5px;border:2px solid var(--p);border-radius:7px;background:var(--o);color:white;font-size:9px;font-weight:800}.agent.cl{background:#a95d3c}.agent.cx{background:var(--blue)}.agent.gem{background:#398b71}.state{display:inline-flex;align-items:center;gap:5px;min-height:24px;border:1px solid #e3c774;border-radius:99px;padding:0 8px;background:var(--goldp);color:#715617;font-size:11px;font-weight:650}.state:before{content:"";width:6px;height:6px;border-radius:50%;background:#c9911c}.meta{color:var(--mut);font-size:12px}.pr{display:inline-flex;align-items:center;min-height:24px;padding:0 7px;border:1px solid #c9d0ff;border-radius:6px;background:var(--bluep);color:#3c50d8;font-size:11px;font-weight:650}.more{display:grid;place-items:center;width:28px;height:28px;border:0;border-radius:6px;background:transparent;color:var(--mut);font-size:18px}.more:hover{background:var(--soft)}.empty{padding:22px 10px;color:var(--mut);font-size:12px;text-align:center}.mobileonly{display:none}.focus{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.focusitem{padding:15px;border:1px solid var(--line);border-radius:var(--r);background:var(--p)}.focusitem .focusicon{display:grid;place-items:center;width:34px;height:34px;margin-bottom:13px;border-radius:9px;background:var(--goldp);color:#715617;font-size:16px}.focusitem h2{margin-bottom:5px}.focusitem p{min-height:40px;color:var(--mut);font-size:12px}.focusitem .actions{margin-top:14px}.focusitem .button{flex:1}.table{border:1px solid var(--line);border-radius:var(--r);overflow:hidden;background:var(--p)}.tr{display:grid;grid-template-columns:minmax(230px,1.5fr) 130px 120px 100px;gap:14px;align-items:center;min-height:62px;padding:10px 14px;border-bottom:1px solid var(--line)}.tr:last-child{border:0}.prtitle{font-weight:650}.statusdot{display:inline-flex;align-items:center;gap:7px;color:var(--mut);font-size:12px}.statusdot:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--gold)}.statusdot.good:before{background:var(--green)}.savedviews{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.saved{display:flex;flex-direction:column;gap:8px;min-height:150px;padding:15px;border:1px solid var(--line);border-radius:var(--r);background:var(--p)}.saved b{font-size:15px}.saved p{color:var(--mut);font-size:12px}.saved .button{align-self:flex-start;margin-top:auto}.activity{max-width:860px;border-top:1px solid var(--line)}.event{display:grid;grid-template-columns:78px 26px minmax(0,1fr);gap:12px;padding:14px 0;border-bottom:1px solid var(--line)}.time{color:var(--mut);font-size:12px}.eventmark{display:grid;place-items:center;width:24px;height:24px;border-radius:7px;background:var(--soft);color:var(--blue);font-size:12px}.event b{font-weight:650}.event p{color:var(--mut);font-size:12px}.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.connection{padding:16px;border:1px solid var(--line);border-radius:var(--r);background:var(--p)}.connectiontop{display:flex;align-items:center;gap:10px}.connectionlogo{display:grid;place-items:center;width:34px;height:34px;border-radius:9px;background:var(--o);color:#fff;font-size:11px;font-weight:800}.connection b{font-weight:650}.badge{margin-left:auto;display:inline-flex;min-height:23px;align-items:center;border-radius:99px;padding:0 7px;background:#e9f4ed;color:var(--green);font-size:11px;font-weight:650}.badge.warn{background:var(--goldp);color:#715617}.connection p{margin:13px 0;color:var(--mut);font-size:12px}.settingslayout{display:grid;grid-template-columns:180px minmax(0,1fr);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;background:var(--p)}.settingsnav{padding:10px;background:var(--soft)}.settingsnav button{display:block;width:100%;min-height:40px;border:0;border-radius:8px;padding:0 10px;background:transparent;color:var(--mut);text-align:left;font-weight:600}.settingsnav button.on{background:var(--p);color:var(--ink)}.settingbody{padding:20px}.scope{display:flex;gap:4px;margin-bottom:20px}.scope button{min-height:34px;border:1px solid var(--line);border-radius:8px;padding:0 10px;background:var(--p);color:var(--mut);font-weight:600}.scope button.on{border-color:#b4bdfc;background:var(--bluep);color:#3548d0}.settingrow{display:grid;grid-template-columns:1fr minmax(200px,330px);gap:16px;padding:17px 0;border-top:1px solid var(--line)}.settingrow:first-of-type{border-top:0}.settingrow b{display:block;margin-bottom:3px}.settingrow p{color:var(--mut);font-size:12px}.source{display:block;margin-top:4px;color:var(--mut);font-size:11px}.input{width:100%;min-height:42px;border:1px solid var(--line);border-radius:8px;padding:0 10px;background:#fff}.taskpage{display:none;min-height:100vh}.taskpage.on{display:grid;grid-template-columns:minmax(0,1fr) 310px}.taskmain{display:flex;flex-direction:column;min-height:100vh;background:#fffefa}.taskhead{display:flex;align-items:flex-start;justify-content:space-between;gap:13px;min-height:76px;padding:15px 22px;border-bottom:1px solid var(--line)}.back{display:inline-flex;align-items:center;gap:7px;border:0;padding:0;background:transparent;color:var(--mut);font-weight:650}.taskhead h1{margin-top:5px;font-size:20px}.taskmeta{display:flex;align-items:center;gap:7px;margin-top:8px;color:var(--mut);font-size:12px}.thread{flex:1;display:flex;flex-direction:column;gap:16px;min-height:0;padding:24px clamp(16px,4vw,54px);overflow:auto}.message{max-width:720px}.message.you{align-self:flex-end;max-width:570px}.speaker{margin-bottom:5px;color:var(--mut);font-size:11px;font-weight:650}.message.you .speaker{text-align:right}.bubble{padding:12px 13px;border:1px solid var(--line);border-radius:11px;background:#fff}.message.you .bubble{border-color:#cad0ff;background:var(--bluep)}.sessionevent{display:flex;align-items:center;gap:10px;max-width:720px;margin:2px 0;padding:10px 11px;border:1px solid var(--line);border-radius:9px;background:#f5f4ef;color:var(--mut);font-size:12px}.sessionevent .eventagent{display:grid;place-items:center;flex:none;width:25px;height:25px;border-radius:7px;background:var(--o);color:#fff;font-size:9px;font-weight:800}.sessionevent.failover{border-color:#e4c87d;background:var(--goldp);color:#67511c}.sessionevent.failover .eventagent{background:#a95d3c}.sessionevent button{margin-left:auto;border:0;background:transparent;color:var(--blue);font-weight:650;white-space:nowrap}.runline{max-width:720px;padding-left:12px;border-left:2px solid var(--blue);color:var(--mut);font-size:12px}.composer{position:sticky;bottom:0;padding:13px clamp(16px,4vw,54px) 16px;border-top:1px solid var(--line);background:#fffefa}.compose{border:1px solid #bfc4ce;border-radius:11px;background:#fff;box-shadow:0 6px 20px #0b0d120a}.compose textarea{display:block;width:100%;height:58px;border:0;border-radius:11px 11px 0 0;padding:11px;resize:none;outline:0}.composefoot{display:flex;align-items:center;justify-content:space-between;padding:0 7px 7px}.attach{display:flex;align-items:center;gap:3px}.attach .iconbutton{width:34px;height:34px}.inspector{padding:16px;border-left:1px solid var(--line);background:#f3f2ec}.inspecttabs{display:flex;gap:2px;margin-bottom:16px}.inspecttabs button{flex:1;min-height:35px;border:0;border-radius:7px;background:transparent;color:var(--mut);font-size:12px;font-weight:650}.inspecttabs button.on{background:#fff;color:var(--ink)}.inspectpanel{display:none}.inspectpanel.on{display:block}.inspectsection{padding:0 0 16px;margin-bottom:16px;border-bottom:1px solid var(--line)}.inspectsection:last-child{border:0}.sectiontitle{display:flex;align-items:center;justify-content:space-between;margin-bottom:9px}.summaryline{margin-bottom:9px;color:var(--mut);font-size:12px}.sessionitem{display:block;width:100%;margin:7px 0;border:1px solid var(--line);border-radius:9px;padding:10px;background:#fff;text-align:left}.sessionitem.active{border-color:#aeb8ff}.sessionitem b{display:block;font-size:12px}.sessionitem span{display:block;margin-top:2px;color:var(--mut);font-size:11px}.delivery{padding:10px;border:1px solid var(--line);border-radius:9px;background:#fff}.delivery b{display:block;font-size:12px}.delivery p{margin-top:4px;color:var(--mut);font-size:11px}.overlay{display:none;position:fixed;z-index:20;inset:0;background:#0b0d1266}.overlay.on{display:block}.modal{position:absolute;top:50%;left:50%;width:min(530px,calc(100vw - 32px));max-height:86vh;overflow:auto;transform:translate(-50%,-50%);border-radius:14px;background:#fffefa;box-shadow:var(--shadow)}.modalhead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:19px 20px 15px;border-bottom:1px solid var(--line)}.modalhead h2{font-size:18px}.close{display:grid;place-items:center;flex:none;width:36px;height:36px;border:0;border-radius:8px;background:transparent;color:var(--mut);font-size:21px}.modalbody{display:grid;gap:15px;padding:18px 20px}.modalfoot{display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:14px 20px;border-top:1px solid var(--line)}.field{display:grid;gap:6px}.field label{font-size:12px;font-weight:700}.field small{color:var(--mut);font-size:11px}.textarea{min-height:100px;padding:10px;resize:vertical}.hint{padding:11px;border-radius:9px;background:var(--soft);color:var(--mut);font-size:12px}.files{display:flex;gap:7px;flex-wrap:wrap}.file{display:inline-flex;align-items:center;gap:6px;min-height:32px;border:1px solid var(--line);border-radius:7px;padding:0 8px;background:#fff;font-size:12px}.file button{border:0;background:transparent;color:var(--mut)}.drawer{position:absolute;top:0;right:0;width:min(410px,100%);height:100%;overflow:auto;padding:20px;background:#fffefa;box-shadow:var(--shadow)}.drawer h2{font-size:18px}.attempt{margin-top:10px;padding:11px;border:1px solid var(--line);border-radius:9px;background:#fff}.attempthead{display:flex;justify-content:space-between;gap:8px}.attempt b{font-size:12px}.attempt p{margin-top:4px;color:var(--mut);font-size:12px}.code{display:block;margin-top:8px;border-radius:7px;padding:8px;background:var(--o);color:#f6f4ee;font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}.toast{display:none;position:fixed;z-index:30;right:20px;bottom:20px;max-width:330px;padding:12px 14px;border-radius:10px;background:var(--o);color:#fff;box-shadow:var(--shadow)}.toast.on{display:block}.menubtn{position:fixed;z-index:8;top:13px;left:12px;display:none}.drawerNav{display:none}
+    @media(max-width:850px){.app{grid-template-columns:64px minmax(0,1fr)}.rail{align-items:center;padding:14px 7px}.brand{padding:0;margin-bottom:14px}.brand span,.rail-label,.nav button span:not(.ic),.project span:not(.ic),.project .count,.health{display:none}.nav button,.project{justify-content:center;width:44px;padding:0}.bar{padding:12px 17px}.page{padding:20px 17px}.taskpage.on{grid-template-columns:1fr}.inspector{display:none}.taskmain{min-height:100vh}.detailsfloating{display:inline-grid!important}.board{grid-template-columns:repeat(4,minmax(242px,1fr))}.focus{grid-template-columns:1fr}.settingslayout{grid-template-columns:145px minmax(0,1fr)}}
+    @media(max-width:600px){body{background:var(--i)}.app{display:block}.rail{display:none}.menubtn{display:grid}.bar{min-height:62px;padding:10px 14px 10px 62px}.crumb span{display:none}.actions .button:not(.primary){display:none}.page{padding:17px 14px}.pagehead{align-items:flex-start;flex-direction:column;margin-bottom:15px}h1{font-size:22px}.viewbar{align-items:flex-start;flex-direction:column}.viewbar .seg{width:100%}.viewbar .seg button{flex:1}.tabs{width:100%;border-bottom:1px solid var(--line)}.tabs button{padding:0 9px}.board{display:none}.mobileonly{display:block}.list{display:grid;gap:8px}.list .taskcard{min-height:0}.focus{grid-template-columns:1fr}.tr{grid-template-columns:1fr auto;gap:6px;min-height:76px}.tr .hidephone{display:none}.savedviews,.grid2{grid-template-columns:1fr}.settingslayout{display:block;border:0;background:transparent}.settingsnav{display:flex;gap:4px;overflow:auto;padding:0 0 10px;background:transparent}.settingsnav button{min-width:max-content}.settingbody{padding:13px 0}.settingrow{grid-template-columns:1fr;gap:9px}.taskhead{padding:12px 14px}.taskhead h1{font-size:18px}.taskhead .actions .button:not(.ghost){display:none}.thread{padding:17px 14px 24px}.composer{padding:10px 14px 14px}.message,.message.you,.sessionevent,.runline{max-width:100%}.modal{top:auto;bottom:0;max-height:88vh;transform:translateX(-50%);border-radius:15px 15px 0 0}.drawer{width:100%}.drawerNav{display:block;position:fixed;z-index:19;inset:0 auto 0 0;width:275px;padding:16px;background:var(--o);color:var(--i);box-shadow:var(--shadow)}.drawerNav .rail{display:flex;padding:0;background:transparent}.drawerNav .brand span,.drawerNav .rail-label,.drawerNav .nav button span:not(.ic),.drawerNav .project span:not(.ic),.drawerNav .project .count,.drawerNav .health{display:block}.drawerNav .nav button,.drawerNav .project{justify-content:flex-start;width:100%;padding:0 10px}.drawerNav .health{display:block}.drawerNav .close{margin-left:auto;color:#fff}.toast{right:14px;bottom:14px}}
+  </style>
+</head>
+<body>
+<div class="app" id="app">
+  <button class="iconbutton menubtn" id="openNav" aria-label="Open navigation">☰</button>
+  <aside class="rail" id="rail"><div class="brand"><svg viewBox="0 0 190 125" aria-hidden="true"><path d="M18 106 L64 29 Q75 10 87 29 L136 106 L112 106 L76 49 L42 106 Z" fill="#5367FF"/><path d="M154 27 C154 38 160 44 171 44 C160 44 154 50 154 61 C154 50 148 44 137 44 C148 44 154 38 154 27 Z" fill="#F3C969"/></svg><span>Aludra</span></div><div class="rail-label">Workspace</div><nav class="nav"><button class="on" data-page="board"><span class="ic">▦</span><span>Tasks</span></button><button data-page="activity"><span class="ic">◷</span><span>Activity</span></button></nav><div class="rail-label">Projects</div><div class="projects"><button class="project on" data-page="board"><span class="ic">⌘</span><span>research-harness</span><span class="count">9</span></button><button class="project"><span class="ic">⌁</span><span>aludra</span><span class="count">1</span></button></div><div class="rail-label">Setup</div><nav class="nav"><button data-page="connections"><span class="ic">◎</span><span>Connections</span></button><button data-page="settings"><span class="ic">⚙</span><span>Settings</span></button></nav><div class="health"><b>Workspace ready</b>Coder connected · 3 harnesses</div></aside>
+  <main class="main">
+    <header class="bar"><div class="crumb"><b id="barTitle">research-harness</b><span id="barSub">Task board</span></div><div class="actions" id="globalActions"><button class="button" data-page="settings">Project settings</button><button class="button primary" id="newTask">＋ New task</button></div></header>
+    <section class="page on" id="board"><div class="pagehead"><div><p class="eyebrow">research-harness · 9 tasks</p><h1>Work, in context</h1></div><button class="button" id="editView">Edit view</button></div><div class="viewbar"><div class="tabs"><button class="on" data-view="all">All tasks</button><button data-view="needs">Needs you <span id="needCount">3</span></button><button data-view="prs">Pull requests</button><button data-view="views">+ View</button></div><div class="seg"><button class="on" data-layout="board">Board</button><button data-layout="list">List</button></div></div>
+      <div class="view on" id="all"><div class="board" id="boardGrid"></div><div class="mobileonly list" id="mobileList"></div></div>
+      <div class="view" id="needs"><div class="pagehead"><div><p class="eyebrow">Your decisions</p><h1>Needs you</h1><p class="muted">Three items are paused until you decide.</p></div></div><div class="focus" id="focusGrid"></div></div>
+      <div class="view" id="prs"><div class="pagehead"><div><p class="eyebrow">Delivery</p><h1>Pull requests</h1></div></div><div class="table"><div class="tr"><div class="prtitle">#5 Add durable task sessions</div><span class="statusdot">Review requested</span><span class="hidephone">research-harness</span><button class="button small" data-open-task="sessions">Open task</button></div><div class="tr"><div class="prtitle">#2 Improve remote harness resilience</div><span class="statusdot good">Checks passed</span><span class="hidephone">research-harness</span><button class="button small" data-toast="Opening GitHub pull request">Open PR</button></div></div></div>
+      <div class="view" id="views"><div class="pagehead"><div><p class="eyebrow">Personalized workspaces</p><h1>Saved views</h1><p class="muted">Views change how you see tasks. They never change task state.</p></div><button class="button primary" id="createView">＋ Save current view</button></div><div class="savedviews" id="savedViews"><article class="saved"><b>Engineering handoff</b><p>Tasks with a PR or a review decision.</p><button class="button small" data-toast="Engineering handoff view applied">Use view</button></article><article class="saved"><b>Active runs</b><p>Work that is currently running on a harness.</p><button class="button small" data-toast="Active runs view applied">Use view</button></article></div></div>
+    </section>
+    <section class="page" id="activity"><div class="pagehead"><div><p class="eyebrow">research-harness</p><h1>Activity</h1><p class="muted">Task events, ordered by when they happened.</p></div></div><div class="activity"><div class="event"><time class="time">2 min ago</time><span class="eventmark">↻</span><div><b>Session 3 started on Claude Code</b><p>“Add durable task sessions” continued after a quota failover.</p></div></div><div class="event"><time class="time">18 min ago</time><span class="eventmark">✓</span><div><b>Integrity check passed</b><p>Workspace and diff matched the sealed handoff pack.</p></div></div><div class="event"><time class="time">41 min ago</time><span class="eventmark">◌</span><div><b>PR #5 is ready for review</b><p>Parallel-capacity validation D is waiting on a delivery decision.</p></div></div></div></section>
+    <section class="page" id="connections"><div class="pagehead"><div><p class="eyebrow">Readiness</p><h1>Connections</h1><p class="muted">A connection is ready only when access, availability, and environment are all ready.</p></div></div><div class="grid2"><article class="connection"><div class="connectiontop"><span class="connectionlogo">GH</span><b>GitHub</b><span class="badge">Ready</span></div><p>Repository access is granted to research-harness. Pull requests can be created and reviewed.</p><button class="button small" data-toast="GitHub connection test passed">Test connection</button></article><article class="connection"><div class="connectiontop"><span class="connectionlogo">CD</span><b>Coder workspace</b><span class="badge">Ready</span></div><p>Workspace is running. Git state and configured verification can be read before a session starts.</p><button class="button small" data-toast="Coder workspace is reachable">Open workspace</button></article><article class="connection"><div class="connectiontop"><span class="connectionlogo">CX</span><b>Codex</b><span class="badge warn">Cooling down</span></div><p>Authenticated and configured. This provider is temporarily unavailable for new work.</p><button class="button small" data-toast="Codex availability was refreshed">Refresh status</button></article><article class="connection"><div class="connectiontop"><span class="connectionlogo">CL</span><b>Claude Code</b><span class="badge">Ready</span></div><p>Authenticated and eligible for a supervised failover when Codex becomes unavailable.</p><button class="button small" data-toast="Claude Code connection test passed">Test connection</button></article></div></section>
+    <section class="page" id="settings"><div class="pagehead"><div><p class="eyebrow">research-harness</p><h1>Settings</h1><p class="muted">Choose a scope first. Every value shows where it comes from.</p></div></div><div class="settingslayout"><nav class="settingsnav"><button class="on" data-setcat="execution">Execution</button><button data-setcat="sessions">Sessions</button><button data-setcat="review">Review & delivery</button></nav><div class="settingbody"><div class="scope"><button class="on" data-scope="global">Global</button><button data-scope="project">Project</button><button data-scope="task">Task override</button></div><div id="settingContent"></div></div></div></section>
+  </main>
+</div>
+<section class="taskpage" id="task"><main class="taskmain"><header class="taskhead"><div><button class="back" id="backBoard">← Back to tasks</button><h1 id="taskTitle">Add durable task sessions</h1><div class="taskmeta"><span id="taskStage">Running</span><span>·</span><span>Coder workspace</span><span>·</span><span>Updated 2 min ago</span></div></div><div class="actions"><button class="button ghost" id="taskDetails">Details</button><button class="button" id="moveTask">Move</button></div></header><div class="thread" id="thread"></div><div class="composer"><div class="compose"><textarea aria-label="Message the task" placeholder="Message this task…"></textarea><div class="composefoot"><div class="attach"><button class="iconbutton" title="Attach a file" id="quickAttach">⌕</button><button class="iconbutton" title="Add image" id="quickImage">▧</button></div><button class="button primary small" id="sendMessage">Send</button></div></div></div></main><aside class="inspector" id="inspector"><div class="inspecttabs"><button class="on" data-inspect="overview">Overview</button><button data-inspect="sessions">Sessions</button><button data-inspect="delivery">Delivery</button></div><div class="inspectpanel on" id="overview"><div class="inspectsection"><div class="sectiontitle"><h2>Current work</h2></div><p class="summaryline">Session 3 is verifying the session and handoff changes.</p><div class="agentstack"><span class="agent cx">Cx</span><span class="agent cl">Cl</span></div></div><div class="inspectsection"><div class="sectiontitle"><h2>Task settings</h2><button class="button small" data-page="settings">Edit</button></div><p class="summaryline">Supervised failover · 24k context budget</p></div></div><div class="inspectpanel" id="sessions"><div class="inspectsection"><div class="sectiontitle"><h2>Sessions</h2><button class="button small" id="newSession">New session</button></div><button class="sessionitem" data-session="1"><b>Session 1 · Codex</b><span>Sealed · milestone complete</span></button><button class="sessionitem" data-session="2"><b>Session 2 · Codex</b><span>Sealed · quota reached</span></button><button class="sessionitem active" data-session="3"><b>Session 3 · Claude Code</b><span>Active · integrity passed</span></button></div></div><div class="inspectpanel" id="delivery"><div class="inspectsection"><div class="sectiontitle"><h2>Pull request</h2></div><div class="delivery"><b>PR #5 · open</b><p>1 commit · checks passed · waiting for review</p><button class="button small" data-toast="Opening pull request #5">Open pull request</button></div></div></div></aside></section>
+<div class="overlay" id="overlay"><div class="modal" id="modal"></div></div><div class="toast" id="toast"></div>
+<script>
+(()=>{const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];let active='board',view='all',layout='board',current='sessions',files=[];const tasks=[{id:'ui',title:'I want to make the UI look better here',stage:'planned',h:['cx','cl'],summary:'Ready for follow-up',meta:'2 attempts · local workspace'},{id:'remote',title:'Remote Codex validation',stage:'planned',h:['cx'],summary:'Run closed',meta:'Coder workspace'},{id:'sessions',title:'Add durable task sessions',stage:'running',h:['cx','cl'],summary:'Session 3 · verification running',meta:'Handoff integrity passed'},{id:'parallel',title:'Parallel-capacity validation D',stage:'review',h:['cx','cl'],summary:'Review the proposed delivery',meta:'PR #5 · checks passed',need:'Review delivery'},{id:'mismatch',title:'Continue after external workspace change',stage:'review',h:['cx'],summary:'Workspace state differs from handoff',meta:'Session 2 paused',need:'Resolve state review'},{id:'failover',title:'Choose failover policy for quota event',stage:'review',h:['cx','cl'],summary:'Codex quota reached',meta:'Run paused',need:'Approve failover'},{id:'capacity',title:'Parallel-capacity validation A',stage:'done',h:['cx','cl'],summary:'Remote delivery complete',meta:'PR #2 · open'}];const names={planned:'Planned',running:'Running',review:'Needs review',done:'Done'};function agent(h){return `<div class="agentstack" aria-label="Harnesses used">${h.map(x=>`<span class="agent ${x==='cl'?'cl':x==='gem'?'gem':'cx'}" title="${x==='cl'?'Claude Code':'Codex'}">${x==='cl'?'Cl':'Cx'}</span>`).join('')}</div>`}function card(t,mobile=false){return `<article class="taskcard" draggable="true" data-id="${t.id}"><div class="cardtop">${agent(t.h)}<button class="more" data-card-menu="${t.id}" aria-label="Task options">⋯</button></div>${t.need?`<span class="state">${t.need}</span>`:''}<h3>${t.title}</h3><p class="meta">${t.summary}</p><div class="cardbottom"><span class="meta">${t.meta}</span>${t.id==='parallel'||t.id==='capacity'?'<span class="pr">PR #'+(t.id==='parallel'?'5':'2')+'</span>':''}</div></article>`}function renderBoard(){const lanes=['planned','running','review','done'];$('#boardGrid').innerHTML=lanes.map(s=>`<section class="lane ${s==='running'?'run':s==='review'?'review':s==='done'?'done':''}" data-lane="${s}"><header class="lanehead"><div class="left"><span class="dot"></span><h2>${names[s]}</h2><span class="muted">${tasks.filter(t=>t.stage===s).length}</span></div><button class="iconbutton" data-add-stage="${s}" aria-label="Add task to ${names[s]}">＋</button></header><div class="cards">${tasks.filter(t=>t.stage===s).map(card).join('')||'<p class="empty">Drop a task here</p>'}</div></section>`).join('');$('#mobileList').innerHTML=tasks.filter(t=>layout==='list'||true).map(t=>card(t,true)).join('');bindCards()}function bindCards(){$$('[data-id]').forEach(el=>{el.onclick=e=>{if(e.target.closest('[data-card-menu]'))return;openTask(el.dataset.id)};el.ondragstart=()=>el.classList.add('dragging');el.ondragend=()=>el.classList.remove('dragging')});$$('[data-lane]').forEach(l=>{l.ondragover=e=>e.preventDefault();l.ondrop=e=>{e.preventDefault();const id=$('.dragging')?.dataset.id,t=tasks.find(x=>x.id===id);if(t){t.stage=l.dataset.lane;renderBoard();toast(`${t.title} moved to ${names[t.stage]}`)}}});$$('[data-add-stage]').forEach(b=>b.onclick=()=>newTask(b.dataset.addStage));$$('[data-card-menu]').forEach(b=>b.onclick=e=>{e.stopPropagation();taskMenu(b.dataset.cardMenu)})}function focus(){const map={parallel:{icon:'✓',copy:'PR #5 has passed checks. Decide whether it is ready to deliver.',act:'Review PR'},mismatch:{icon:'!',copy:'The workspace does not match the sealed handoff. Inspect it before continuing.',act:'Inspect state'},failover:{icon:'↻',copy:'Codex reached its quota. Approve a supervised move to Claude Code.',act:'Approve switch'}};$('#focusGrid').innerHTML=tasks.filter(t=>t.need).map(t=>{let d=map[t.id];return `<article class="focusitem"><span class="focusicon">${d.icon}</span><h2>${t.title}</h2><p>${d.copy}</p><div class="actions"><button class="button" data-open-task="${t.id}">View task</button><button class="button primary" data-resolve="${t.id}">${d.act}</button></div></article>`}).join('');$$('[data-resolve]').forEach(b=>b.onclick=()=>resolve(b.dataset.resolve));$$('[data-open-task]').forEach(b=>b.onclick=()=>openTask(b.dataset.openTask))}function openTask(id){current=id;const t=tasks.find(x=>x.id===id)||tasks[2];$('#app').style.display='none';$('#task').classList.add('on');$('#taskTitle').textContent=t.title;$('#taskStage').textContent=names[t.stage];renderThread(t)}function closeTask(){$('#task').classList.remove('on');$('#app').style.display='grid';renderBoard()}function renderThread(t){const generic=[`<article class="message you"><p class="speaker">You · yesterday</p><div class="bubble">${t.title}. Keep the task context compact and make every transition auditable.</div></article>`,`<article class="message"><p class="speaker">Codex · yesterday</p><div class="bubble">I’ve inspected the workspace, captured the Git baseline, and started the implementation.</div></article>`,`<div class="sessionevent"><span class="eventagent">Cx</span><span><b>Session 2 ended</b> · context budget reached</span><button data-session="2">View handoff</button></div>`,`<div class="sessionevent failover"><span class="eventagent">Cl</span><span><b>Session 3 started on Claude Code</b> · Codex quota reached</span><button data-session="3">Why changed?</button></div>`,`<article class="message"><p class="speaker">Claude Code · 2 min ago</p><div class="bubble">I verified the workspace against the handoff pack. The baseline and diff match, so I’m continuing on the same task.</div></article>`,`<div class="runline">Verification running: session rollover tests and handoff integrity checks.</div>`];$('#thread').innerHTML=generic.join('');$$('#thread [data-session]').forEach(b=>b.onclick=()=>sessionDrawer(b.dataset.session));$('#thread').scrollTop=$('#thread').scrollHeight}function showPage(p){if(p==='task')return;active=p;$$('.page').forEach(x=>x.classList.toggle('on',x.id===p));$$('[data-page]').forEach(b=>b.classList.toggle('on',b.dataset.page===p));$('#barTitle').textContent=p==='board'?'research-harness':p[0].toUpperCase()+p.slice(1);$('#barSub').textContent=p==='board'?'Task board':'';$('#globalActions').style.visibility=p==='board'?'visible':'hidden'}function taskMenu(id){const t=tasks.find(x=>x.id===id);modal(`<div class="modalhead"><div><h2>${t.title}</h2><p class="muted">Task actions</p></div>${close()}</div><div class="modalbody"><button class="button" data-modal-task="open">Open task</button><div class="field"><label>Move to</label><select class="input" id="moveSelect">${Object.entries(names).map(([k,n])=>`<option value="${k}" ${t.stage===k?'selected':''}>${n}</option>`).join('')}</select></div></div><div class="modalfoot"><button class="button primary" id="saveMove">Save changes</button></div>`);$('#saveMove').onclick=()=>{t.stage=$('#moveSelect').value;hideModal();renderBoard();toast(`Moved to ${names[t.stage]}`)};$('[data-modal-task]').onclick=()=>{hideModal();openTask(id)}}function resolve(id){const t=tasks.find(x=>x.id===id);let title='Review delivery',copy='PR #5 has passed checks. Mark it ready to deliver when you are satisfied.';if(id==='mismatch'){title='Inspect workspace state';copy='The Git diff differs from the sealed handoff. Decide after comparing the workspace and the handoff evidence.'}if(id==='failover'){title='Approve a harness switch';copy='Codex reported quota exhaustion. This starts a new Claude Code session with the sealed handoff pack.'}modal(`<div class="modalhead"><div><h2>${title}</h2><p class="muted">${t.title}</p></div>${close()}</div><div class="modalbody"><div class="hint">${copy}</div><div class="field"><label>Decision note <span class="muted">optional</span></label><textarea class="input textarea" placeholder="Add context for the task…"></textarea></div></div><div class="modalfoot"><button class="button" data-close>Cancel</button><button class="button primary" id="confirmDecision">Confirm</button></div>`);$('#confirmDecision').onclick=()=>{t.need='';t.stage=id==='parallel'?'done':'running';hideModal();focus();renderBoard();toast(id==='failover'?'Claude Code session approved':'Decision recorded')}}function newTask(stage='planned'){files=[];modal(`<div class="modalhead"><div><h2>New task</h2><p class="muted">Start with the objective. Add an override only when the defaults do not fit.</p></div>${close()}</div><div class="modalbody"><div class="field"><label>What should be done?</label><textarea class="input textarea" id="newTitle" placeholder="Describe the outcome and acceptance criteria…"></textarea></div><div class="field"><label>Attachments</label><input type="file" id="fileInput" multiple hidden><div class="files" id="files"><button class="button small" id="chooseFiles">＋ Add files or images</button></div><small>Attachments travel with the task and are available to its sessions.</small></div><div class="hint"><b>Inherited setup</b><br>Coder workspace · supervised failover · session context budget: 24k characters <button class="button small" id="showOverrides" style="float:right">Change</button></div><div id="overrides" style="display:none" class="field"><label>Task override</label><select class="input"><option>Use project defaults</option><option>Require approval before failover</option><option>Disable automatic failover</option></select></div></div><div class="modalfoot"><button class="button" data-close>Cancel</button><button class="button primary" id="createTask">Create task</button></div>`);$('#chooseFiles').onclick=()=>$('#fileInput').click();$('#fileInput').onchange=e=>{files=[...e.target.files];renderFiles()};$('#showOverrides').onclick=()=>$('#overrides').style.display='grid';$('#createTask').onclick=()=>{const title=$('#newTitle').value.trim();if(!title){toast('Add a task objective first');return}const id='new'+Date.now();tasks.unshift({id,title,stage,h:['cx'],summary:'Ready to start',meta:files.length?`${files.length} attachment${files.length>1?'s':''} · project defaults`:'Project defaults'});hideModal();renderBoard();toast('Task created');openTask(id)}}function renderFiles(){$('#files').innerHTML=files.map((f,i)=>`<span class="file">▧ ${f.name}<button data-file="${i}">×</button></span>`).join('')+'<button class="button small" id="chooseFiles">＋ Add files or images</button>';$('#chooseFiles').onclick=()=>$('#fileInput').click();$$('[data-file]').forEach(b=>b.onclick=()=>{files.splice(+b.dataset.file,1);renderFiles()})}function setting(){const scope=$('.scope button.on')?.dataset.scope||'global';const cat=$('.settingsnav button.on')?.dataset.setcat||'execution';const data={execution:[['Coder workspace','Where task work runs.','Coder workspace · project default'],['Harness order','Which eligible harness starts a task.','Codex, then Claude Code · global default']],sessions:[['Session context budget','Seal a session at this estimated prompt size.','24,000 characters · project default'],['Failover policy','What happens if a harness is unavailable or exhausted.','Supervised failover · project default']],review:[['Pull request behavior','How delivery changes are surfaced.','Create pull request when configured · project default'],['Human approvals','When a run stops for a decision.','Failover and state mismatch · global default']]};$('#settingContent').innerHTML=`<p class="muted" style="margin-bottom:16px">Editing <b>${scope==='global'?'workspace defaults':scope==='project'?'research-harness defaults':'the selected task'}</b>.</p>${data[cat].map((x,i)=>`<div class="settingrow"><div><b>${x[0]}</b><p>${x[1]}</p><span class="source">${x[2]}</span></div><div>${i===0&&cat==='sessions'?'<input class="input" value="24,000 characters">':'<select class="input"><option>'+x[2].split(' · ')[0]+'</option></select>'}</div></div>`).join('')}<button class="button primary" data-toast="Settings saved">Save changes</button>`;$('#settingContent [data-toast]')?.addEventListener('click',e=>toast(e.currentTarget.dataset.toast))}function sessionDrawer(n){const info={1:['Session 1 · Codex','Milestone complete','Implemented the first data model and verified migrations.'],2:['Session 2 · Codex','Quota reached','Sealed after the context budget. The next session received the objective and handoff pack.'],3:['Session 3 · Claude Code','Active · integrity passed','Started after a quota failover. Workspace state matched the sealed handoff.']}[n];$('#overlay').classList.add('on');$('#modal').className='drawer';$('#modal').innerHTML=`<div class="modalhead"><div><h2>${info[0]}</h2><p class="muted">${info[1]}</p></div>${close()}</div><div class="modalbody"><div class="hint"><b>Handoff</b><br>${info[2]}</div><div><h2>Attempts</h2><article class="attempt"><div class="attempthead"><b>${n==='3'?'Attempt 1 · Claude Code':'Attempt '+n+' · Codex'}</b><span class="badge">${n==='3'?'Running':'Completed'}</span></div><p>Objective and handoff pack supplied. Full earlier transcript was not included.</p>${n==='2'?'<span class="code">quota_exhausted → supervised failover</span>':''}</article></div><div><h2>Integrity evidence</h2><article class="attempt"><b>${n==='3'?'Passed':'Sealed baseline'}</b><p>Git baseline, workspace status, diff hash, and verification outcome are retained for review.</p></article></div></div>`;bindClose()}function modal(html){$('#overlay').classList.add('on');$('#modal').className='modal';$('#modal').innerHTML=html;bindClose()}function close(){return '<button class="close" data-close aria-label="Close">×</button>'}function bindClose(){$$('[data-close]').forEach(b=>b.onclick=hideModal)}function hideModal(){$('#overlay').classList.remove('on');$('#modal').innerHTML=''}function toast(msg){const t=$('#toast');t.textContent=msg;t.classList.add('on');clearTimeout(window.t);window.t=setTimeout(()=>t.classList.remove('on'),2600)}function navDrawer(){modal(`<div class="drawerNav"><button class="close" data-close>×</button>${$('#rail').innerHTML}</div>`)}
+renderBoard();focus();setting();$$('[data-page]').forEach(b=>b.addEventListener('click',()=>showPage(b.dataset.page)));$$('.tabs button').forEach(b=>b.onclick=()=>{view=b.dataset.view;$$('.tabs button').forEach(x=>x.classList.toggle('on',x===b));$$('#board .view').forEach(x=>x.classList.toggle('on',x.id===view))});$$('[data-layout]').forEach(b=>b.onclick=()=>{layout=b.dataset.layout;$$('[data-layout]').forEach(x=>x.classList.toggle('on',x===b));$('#boardGrid').style.display=layout==='board'?'grid':'none';$('#mobileList').style.display=layout==='list'?'grid':''});$('#newTask').onclick=()=>newTask();$('#editView').onclick=()=>modal(`<div class="modalhead"><div><h2>Edit current view</h2><p class="muted">Choose the information the task cards should emphasize.</p></div>${close()}</div><div class="modalbody"><div class="field"><label>Group tasks by</label><select class="input"><option>Workflow stage</option><option>Attention state</option></select></div><div class="field"><label>Card detail</label><select class="input"><option>Current activity</option><option>Delivery status</option></select></div></div><div class="modalfoot"><button class="button primary" data-close>Done</button></div>`);$('#createView').onclick=()=>modal(`<div class="modalhead"><div><h2>Save current view</h2><p class="muted">The board and filters are saved only for you.</p></div>${close()}</div><div class="modalbody"><div class="field"><label>View name</label><input class="input" id="viewName" placeholder="e.g. Morning review"></div></div><div class="modalfoot"><button class="button primary" id="saveView">Save view</button></div>`);document.addEventListener('click',e=>{if(e.target.id==='saveView'){let n=$('#viewName').value.trim()||'Untitled view';$('#savedViews').insertAdjacentHTML('beforeend',`<article class="saved"><b>${n}</b><p>Current board grouping and card details.</p><button class="button small" data-toast="${n} view applied">Use view</button></article>`);hideModal();toast('View saved')}if(e.target.matches('[data-toast]'))toast(e.target.dataset.toast)});$$('.settingsnav button').forEach(b=>b.onclick=()=>{$$('.settingsnav button').forEach(x=>x.classList.toggle('on',x===b));setting()});$$('.scope button').forEach(b=>b.onclick=()=>{$$('.scope button').forEach(x=>x.classList.toggle('on',x===b));setting()});$('#backBoard').onclick=closeTask;$('#taskDetails').onclick=()=>{$('#inspector').style.display='block';toast('Task details opened')};$$('[data-inspect]').forEach(b=>b.onclick=()=>{$$('[data-inspect]').forEach(x=>x.classList.toggle('on',x===b));$$('.inspectpanel').forEach(x=>x.classList.toggle('on',x.id===b.dataset.inspect))});$('#newSession').onclick=()=>modal(`<div class="modalhead"><div><h2>Start a fresh session</h2><p class="muted">The current session will be sealed. This keeps Claude Code; it does not rotate harnesses.</p></div>${close()}</div><div class="modalbody"><div class="hint">The next session receives the objective and structured handoff pack. It does not receive the full transcript.</div></div><div class="modalfoot"><button class="button" data-close>Cancel</button><button class="button primary" data-close id="startFresh">Seal and continue</button></div>`);document.addEventListener('click',e=>{if(e.target.id==='startFresh')toast('Fresh Claude Code session started')});$('#moveTask').onclick=()=>taskMenu(current);$('#sendMessage').onclick=()=>{const a=$('.compose textarea');if(!a.value.trim())return;$('#thread').insertAdjacentHTML('beforeend',`<article class="message you"><p class="speaker">You · now</p><div class="bubble">${a.value}</div></article>`);a.value='';$('#thread').scrollTop=$('#thread').scrollHeight;toast('Message added to task')};$('#quickAttach').onclick=()=>toast('Use New task to add durable attachments');$('#quickImage').onclick=()=>toast('Use New task to add durable attachments');$('#openNav').onclick=navDrawer;$('#overlay').onclick=e=>{if(e.target===$('#overlay'))hideModal()};})();
+</script>
+<style>
+  .bar{position:sticky;top:0;z-index:15}
+  .taskhead{position:sticky;top:0;z-index:14;background:#fffefa}
+  .list{grid-template-columns:minmax(0,760px);gap:12px;padding:4px 0 24px}
+  .list .taskcard{box-shadow:0 1px 0 #00000008}
+  .notify{display:inline-grid;place-items:center;min-width:19px;height:19px;margin-left:4px;border-radius:99px;background:var(--blue);color:#fff;font-size:11px;line-height:1}
+  .agent img{width:15px;height:15px;object-fit:contain;filter:brightness(0) invert(1)}
+  .agent svg,.harness-brand svg,.connectionlogo svg{width:15px;height:15px;fill:#fff}
+  #quickImage{display:none}
+  .selectbox{position:relative}.selecttrigger{display:flex;width:100%;min-height:42px;align-items:center;justify-content:space-between;gap:10px;border:1px solid var(--line);border-radius:9px;padding:0 12px;background:#fff;color:var(--ink);font-weight:600;text-align:left}.selecttrigger:after{content:'⌄';color:var(--mut);font-size:17px}.selectoptions{position:absolute;z-index:25;top:calc(100% + 6px);right:0;left:0;display:grid;gap:2px;padding:5px;border:1px solid var(--line);border-radius:9px;background:#fff;box-shadow:0 14px 32px #0b0d1222}.selectoptions[hidden]{display:none}.selectoptions button{min-height:36px;border:0;border-radius:6px;padding:0 9px;background:transparent;text-align:left;color:var(--ink)}.selectoptions button:hover,.selectoptions button[aria-current="true"]{background:var(--bluep);color:#3448cf}.settingbody .selectbox{max-width:330px}.policy{display:grid;gap:10px}.policy-choice{display:flex;align-items:flex-start;gap:10px;padding:12px;border:1px solid var(--line);border-radius:10px;background:#fff}.policy-choice input{margin-top:3px;accent-color:var(--blue)}.policy-choice b{display:block}.policy-choice span{display:block;margin-top:2px;color:var(--mut);font-size:12px}.connection-state{display:inline-flex;align-items:center;gap:6px;margin-left:auto;font-size:11px;font-weight:650}.connection-state:before{content:'';width:7px;height:7px;border-radius:50%;background:var(--green)}.connection-state.warn:before{background:#c28a15}.connection-state.error:before{background:var(--red)}.connection-state.off:before{background:#9298a1}.connection .button{margin-top:2px}
+  select.input{appearance:none;padding-right:38px;background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2368707c' stroke-width='2'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") no-repeat right 12px center}
+  @media(max-width:600px){.bar{top:0}.taskhead{top:0}.list{gap:12px}.settingbody .selectbox{max-width:none}.policy-choice{padding:11px}.notify{min-width:18px;height:18px}.tabs [data-view="needs"]{display:inline-flex;align-items:center}}
+</style>
+<style>
+  .view{display:none}.view.on{display:block}
+  @media (min-width:601px) and (max-width:1100px){
+    .board{grid-template-columns:repeat(2,minmax(0,1fr));overflow:visible}
+    .lane{min-height:430px}.cards{min-height:350px}
+    .focus{grid-template-columns:repeat(2,minmax(0,1fr))}
+  }
+</style>
+<style>
+  /* Aludra action language: one obvious primary action; utilities stay quiet. */
+  .actions{gap:6px}
+  .button{min-height:38px;border-color:transparent;border-radius:8px;padding:0 11px;background:transparent;color:var(--ink);font-size:12px;font-weight:680;letter-spacing:-.01em;box-shadow:none;transition:background .14s ease,color .14s ease,transform .14s ease}
+  .button:hover{border-color:transparent;background:#eeece6}
+  .button.primary{border-color:#4356e8;background:#5367ff;color:#fff;box-shadow:inset 0 1px 0 #7684ff,0 3px 0 #3949cc,0 4px 7px #5367ff2b}
+  .button.primary:hover{border-color:#3347df;background:#4a5df5;transform:translateY(1px);box-shadow:inset 0 1px 0 #7684ff,0 1px 0 #3949cc,0 2px 5px #5367ff24}
+  .button.ghost{padding-inline:7px;color:#596170}
+  .button.small{min-height:30px;padding-inline:8px;font-size:11px}
+  .iconbutton{border:1px solid transparent;border-radius:8px}
+  .iconbutton:hover{background:#eeece6}
+  .seg{gap:0;padding:3px;background:#eeece6;border-color:transparent;border-radius:9px}
+  .seg button{min-height:30px;border-radius:6px;font-size:12px}
+  .seg button.on{background:#fff;color:#20242c;box-shadow:0 1px 2px #0b0d1214}
+  .scope{display:inline-flex;gap:2px;width:max-content;padding:3px;border:1px solid #e4e2dc;border-radius:9px;background:#f1f0eb}
+  .scope button{min-height:30px;border-color:transparent;border-radius:6px;background:transparent;font-size:12px}
+  .scope button.on{border-color:transparent;background:#fff;color:#3448cf;box-shadow:0 1px 2px #0b0d1214}
+  .settingsnav button{position:relative;border-radius:7px;font-size:12px}
+  .settingsnav button.on{background:#fff;color:#20242c;box-shadow:0 1px 2px #0b0d120d}
+  .settingsnav button.on:before{content:"";position:absolute;left:0;top:10px;bottom:10px;width:2px;border-radius:2px;background:var(--blue)}
+  .selecttrigger{min-height:38px;border-color:#dedcd5;border-radius:8px;background:#f9f8f5;font-size:12px;box-shadow:inset 0 1px 0 #fff}
+  .selecttrigger:hover{border-color:#aeb7ca;background:#fff}
+  .selectoptions{border-color:#d9d8d1;border-radius:10px;box-shadow:0 14px 34px #0b0d1220}
+  .selectoptions button{border-radius:7px;font-size:12px;font-weight:600}
+  .policy{gap:7px}
+  .policy-choice{gap:9px;border-color:#e1dfd8;border-radius:8px;padding:10px 11px;box-shadow:0 1px 0 #0b0d1205;transition:border-color .14s ease,background .14s ease}
+  .policy-choice:hover{border-color:#b9c1dc;background:#fcfcff}
+  .policy-choice input{appearance:none;display:grid;place-content:center;flex:none;width:16px;height:16px;margin-top:2px;border:1.5px solid #a3a9b5;border-radius:50%;background:#fff}
+  .policy-choice input:checked{border-color:var(--blue);background:var(--blue)}
+  .policy-choice input:checked:after{content:"";width:5px;height:5px;border-radius:50%;background:#fff}
+  .policy-choice input[type="checkbox"]{border-radius:4px}
+  .policy-choice input[type="checkbox"]:checked:after{width:7px;height:4px;border-bottom:2px solid #fff;border-left:2px solid #fff;border-radius:0;transform:rotate(-45deg) translate(1px,-1px);background:transparent}
+  .policy-choice b{font-size:12px;letter-spacing:-.01em}
+  .policy-choice span{font-size:11px;line-height:1.38}
+  .harness-order{display:grid;gap:7px;width:100%}
+  .harness-row{display:flex;align-items:center;gap:10px;min-height:52px;border:1px solid #e1dfd8;border-radius:9px;padding:8px 10px;background:#fff;box-shadow:0 1px 0 #0b0d1205;cursor:grab;user-select:none}
+  .harness-row:active{cursor:grabbing}.harness-row.dragging{opacity:.42}.harness-row.drop-target{border-color:var(--blue);box-shadow:0 0 0 2px #5367ff22}
+  .harness-handle{width:16px;color:#949aa5;font-size:15px;letter-spacing:-3px;line-height:1;transform:rotate(90deg)}
+  .harness-rank{width:22px;color:#8a919e;font-size:11px;font-weight:750;font-variant-numeric:tabular-nums}
+  .harness-brand{display:grid;place-items:center;flex:none;width:26px;height:26px;border-radius:7px;background:var(--o)}
+  .harness-brand img{width:15px;height:15px;object-fit:contain;filter:brightness(0) invert(1)}
+  .harness-name{min-width:0;flex:1}.harness-name b{display:block;font-size:12px}.harness-name span{display:block;margin-top:1px;color:var(--mut);font-size:11px}
+  .harness-ready{color:var(--green);font-size:11px;font-weight:680}
+  /* Signal shell: clean white planes; gold is reserved for attention only. */
+  body{background:#f7f8fc}
+  .app{background:#f7f8fc}
+  .rail{background:#f8f9fe;color:var(--ink);border-right:1px solid #e2e5ef}
+  .brand{color:var(--o)}
+  .nav button,.project{color:#5d6470}
+  .nav button:hover,.nav button.on,.project.on{background:#e8ebff;color:#2739c6}
+  .rail-label{color:#8991a1}
+  .project .count{color:#8b93a1}
+  .health{border-color:#e2e5ef;color:#747d8c}
+  .health b{color:var(--ink)}
+  .main{background:#fff}
+  .bar{background:#fff;border-bottom-color:#e2e5ef}
+  .page{background:#fff}
+  .board{gap:14px}
+  .lane{border-color:#e1e4ed;background:#f8f9fd;border-radius:10px}
+  .lanehead{border-bottom:0}
+  .taskcard{border-color:#e2e5ed;background:#fff;border-radius:8px;box-shadow:0 1px 0 #0b0d1208}
+  .taskcard:hover{border-color:#a9b3ea;box-shadow:0 5px 16px #5367ff17}
+  .settingslayout{border-color:#e1e4ed;background:#fff}
+  .settingsnav{background:#f6f7fb}
+  .settingsnav button.on{background:#fff}
+  .scope{background:#f3f5fa;border-color:#e1e4ed}
+  .scope button.on{background:#fff}
+  .seg{background:#f3f5fa}
+  .seg button.on{background:#fff}
+  .connection,.focusitem,.table,.saved{background:#fff;border-color:#e1e4ed}
+  .focusitem{display:flex;flex-direction:column;min-height:278px}
+  .focusitem p{min-height:0}
+  .focusitem .actions{margin-top:auto;padding-top:22px}
+  .taskmain,.composer{background:#fff}
+  .inspector{background:#f7f8fc;border-color:#e1e4ed}
+  /* Less "dashboard card soup": crisp work surfaces, colored system states. */
+  h1{letter-spacing:-.048em}
+  .lane{border-radius:6px;border-top-width:3px}
+  .lane:not(.run):not(.review):not(.done){border-top-color:#9fa4ab}
+  .lane.run{border-top-color:var(--blue)}
+  .lane.review{border-top-color:#9fa4ab}
+  .lane.done{border-top-color:var(--green)}
+  .taskcard{position:relative;border-radius:5px;box-shadow:none}
+  .taskcard:hover{box-shadow:3px 3px 0 #5367ff1b}
+  .lanehead{padding-bottom:8px}
+  .lanehead h2{font-size:13px;letter-spacing:-.02em}
+  .taskcard h3{font-size:13px;line-height:1.38}
+  .meta{font-size:11px}
+  .more{border-radius:5px}
+  .tabs button{font-size:12px}
+  .tabs button.on{border-bottom-width:3px}
+  .focusitem{border-radius:6px;box-shadow:none}
+  .focusitem .focusicon{border-radius:6px}
+  .connection,.saved,.table{border-radius:6px;box-shadow:none}
+  .settingslayout{border-radius:6px}
+  .settingbody{padding:24px}
+  .policy-choice{border-radius:6px}
+  .harness-row{border-radius:6px}
+  /* Task conversation: operational feed, not a consumer chat transcript. */
+  .taskpage{background:#fff}
+  .taskmain{background:#fff}
+  .taskhead{min-height:70px;padding:13px 26px;background:#fff;border-bottom-color:#e2e5ef}
+  .taskhead h1{font-size:19px;letter-spacing:-.04em}
+  .taskmeta{margin-top:6px;font-size:11px}
+  .thread{gap:12px;padding:22px clamp(20px,5vw,72px) 26px;background:linear-gradient(90deg,#fff 0,#fff calc(50% - 1px),#fafbfe calc(50% - 1px),#fafbfe 100%)}
+  .message{position:relative;max-width:760px;padding-left:27px}
+  .message:before{content:"";position:absolute;top:4px;left:0;width:10px;height:10px;border:2px solid #5367ff;border-radius:50%;background:#fff}
+  .message:after{content:"";position:absolute;top:17px;bottom:-15px;left:5px;width:1px;background:#e3e6ef}
+  .message:last-of-type:after{display:none}
+  .message.you{align-self:stretch;max-width:760px}
+  .message.you:before{border-radius:3px;border-color:#5367ff;background:#5367ff}
+  .speaker,.message.you .speaker{margin-bottom:4px;text-align:left;color:#737c8e;font-size:10px;letter-spacing:.04em;text-transform:uppercase}
+  .bubble,.message.you .bubble{border:0;border-radius:0;padding:0;background:transparent;color:#252a34;font-size:14px;line-height:1.6}
+  .message.you .bubble{padding:10px 12px;border-left:3px solid #5367ff;background:#f1f3ff}
+  .sessionevent{position:relative;max-width:760px;margin:2px 0 2px 27px;border:1px solid #dfe3ed;border-radius:5px;padding:9px 10px;background:#f8f9fd}
+  .sessionevent:before{content:"";position:absolute;left:-27px;top:12px;width:9px;height:9px;border-radius:50%;background:#0b0d12;box-shadow:0 0 0 3px #fff}
+  .sessionevent.failover{border-color:#e7ca7e;background:#fff9e9}
+  .runline{max-width:760px;margin-left:27px;border-left:2px solid #5367ff;padding:7px 10px;background:#f8f9fd}
+  .composer{padding:12px clamp(20px,5vw,72px) 18px;border-top-color:#e2e5ef;box-shadow:0 -6px 18px #5367ff08}
+  .compose{border-color:#cbd2e2;border-radius:6px;box-shadow:none}
+  .compose:focus-within{border-color:#5367ff;box-shadow:0 0 0 3px #5367ff16}
+  .compose textarea{height:54px;border-radius:6px 6px 0 0}
+  .inspector{background:#fafbfe;border-left-color:#e2e5ef}
+  .inspecttabs{border-bottom:1px solid #e2e5ef;gap:0}
+  .inspecttabs button{border-radius:0;font-size:11px}
+  .inspecttabs button.on{border-bottom:2px solid #5367ff;background:transparent;color:#2739c6}
+  .sessionitem,.delivery{border-color:#dfe3ed;border-radius:5px;box-shadow:none}
+  .sessionitem:hover{border-color:#9eabed;background:#fff}
+  /* Supporting views keep the same operational, content-forward rhythm. */
+  .activity{max-width:920px;border-top:1px solid #e2e5ef}
+  .event{grid-template-columns:92px 28px minmax(0,1fr);gap:14px;padding:16px 0;border-bottom-color:#e7e9f0}
+  .time{font-size:11px;font-variant-numeric:tabular-nums}
+  .eventmark{width:22px;height:22px;border-radius:5px;background:#eef0ff;color:#4052db}
+  .event b{font-size:13px}.event p{margin-top:2px}
+  button.event{width:100%;border-right:0;border-left:0;border-top:0;background:transparent;color:var(--ink);text-align:left;font:inherit;cursor:pointer}
+  button.event:hover{background:#f7f8fc}
+  .grid2{gap:10px;max-width:960px}
+  .connection{display:flex;flex-direction:column;min-height:180px;padding:15px;border-radius:6px}
+  .connectiontop{min-height:34px}.connectionlogo{border-radius:6px}
+  .connection p{margin:12px 0;font-size:12px}.connection .button{margin-top:auto;align-self:flex-start}
+  .connection-state{font-size:10px;text-transform:uppercase;letter-spacing:.04em}
+  .savedviews{max-width:960px;gap:10px}.saved{border-radius:6px;min-height:138px}
+  .list{max-width:900px}.list .taskcard{padding:15px}.list .taskcard+.taskcard{margin-top:2px}
+  .board{grid-template-columns:repeat(4,minmax(220px,1fr));overflow:visible}
+  .attachment-choice{justify-content:flex-start;min-height:50px;padding:0 12px;border:1px solid #e0e4ee;border-radius:6px;background:#fff;font-size:13px}
+  .attachment-choice:hover{border-color:#9aa8ea;background:#f5f6ff}.attachment-choice span{display:grid;place-items:center;width:26px;height:26px;border-radius:5px;background:#eef0ff;color:#4053db;font-size:15px}
+  .attachment-inline-menu{display:flex;gap:6px;width:100%;padding:7px;border:1px solid #dfe3ed;border-radius:6px;background:#f8f9fd}
+  .attachment-inline-menu .button{flex:1;justify-content:flex-start;background:#fff;border:1px solid #e0e4ee}
+  .attachment-inline-menu .button:hover{border-color:#9aa8ea;background:#f5f6ff}
+  /* Gold remains in the brand mark and a tiny review dot, never as a surface wash. */
+  .focusitem .focusicon{background:#eef0ff;color:#3d50dc}
+  .state{border-color:#cdd4ff;background:#f1f3ff;color:#3d50dc}
+  .state:before{background:#5367ff}
+  .badge.warn{background:#f2f4f7;color:#596272}
+  .sessionevent.failover{border-color:#dfe3ed;background:#fff;color:#454d59}
+  @media(max-width:600px){.taskhead{padding:11px 14px}.thread{padding:16px 14px 22px;background:#fff}.composer{padding:10px 14px 14px}.message{padding-left:23px}.sessionevent,.runline{margin-left:23px}.message:after{bottom:-13px}.message.you{max-width:100%}.pagehead h1{max-width:26ch}.focusitem{min-height:236px}.focusitem .actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}.focusitem .button{width:100%;padding-inline:8px}.modalfoot{display:grid;grid-template-columns:1fr 1fr;padding:12px 14px}.modalfoot .button{width:100%}.modalbody{padding:16px 14px}.connection{min-height:154px}.connection .button{min-height:38px}.harness-row{min-height:58px}.harness-name span{line-height:1.25}.settingbody{padding:16px}.taskhead .actions{gap:2px}.taskhead .actions .button.ghost{display:inline-flex!important;min-height:34px}.composefoot .button.primary{min-width:64px}.menubtn{z-index:16;border:1px solid #e0e4ee;background:#f5f6fb;color:#232a36;font-size:18px}.menubtn:hover{background:#eef0ff}#board>.pagehead{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;gap:10px;margin-bottom:14px}#board>.pagehead>div{grid-column:1;grid-row:1}#board>.pagehead>#editView{grid-column:2;grid-row:1;align-self:end;padding-inline:6px}.pagehead .eyebrow{margin-bottom:2px}}
+  @media(max-width:600px){.drawerNav{background:#f8f9fe;color:var(--ink)}.drawerNav .rail{background:transparent}.drawerNav .brand span,.drawerNav .rail-label,.drawerNav .nav button span:not(.ic),.drawerNav .project span:not(.ic),.drawerNav .project .count,.drawerNav .health{color:inherit}.drawerNav .close{color:var(--ink)}}
+  #globalActions .button:first-child{color:#535b68}
+  #newTask{padding-inline:13px}
+  .focusitem .button.primary,.modalfoot .button.primary{min-height:42px;border-radius:10px}
+  .modalfoot .button:not(.primary){background:#f1f0eb}
+  .modalfoot .button:not(.primary):hover{background:#e9e7df}
+  #settingContent{max-width:760px}
+  .settingrow{grid-template-columns:minmax(0,1fr);gap:10px;padding:19px 0}
+  .settingrow p{max-width:640px;line-height:1.45}
+  .settingrow > div:last-child{width:min(100%,600px)}
+  .settingrow .policy{width:100%}
+  @media (min-width:601px) and (max-width:1100px){.settingrow{grid-template-columns:minmax(0,1fr)}.settingrow p{max-width:640px}}
+  @media(max-width:600px){.scope{width:100%}.scope button{flex:1}.button{min-height:40px}.settingsnav button.on:before{left:7px}}
+</style>
+<style>
+  /* Layout safety: every view must contain itself at every supported width. */
+  html,body{max-width:100%;overflow-x:clip}
+  .app,.main,.page,.pagehead,.bar,.crumb,.taskhead,.taskmain,.thread,.settingbody,.settingrow,.harness-row,.harness-name,.connection,.focusitem,.saved,.taskcard,.tr{min-width:0}
+  h1,h2,h3,p,.meta,.muted,.source,.harness-name span,.connection p,.focusitem p,.saved p,.event p,.bubble{overflow-wrap:anywhere}
+  .board{grid-template-columns:repeat(4,minmax(0,1fr));max-width:100%}
+  .tabs{flex-wrap:wrap;overflow:visible}
+  .crumb b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .attempt .actions{flex-wrap:wrap}.attempt .actions .button{min-width:0}
+  @media (min-width:601px) and (max-width:1100px){.board{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  @media (min-width:1101px) and (max-width:1230px){.board{grid-template-columns:repeat(3,minmax(0,1fr))}}
+  @media(max-width:600px){
+    .scope{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:2px}
+    .scope button{min-width:0;padding-inline:4px;white-space:normal;line-height:1.15}
+    .tabs{width:100%;overflow:visible}
+    .tabs button{min-width:0;flex:1;padding-inline:7px;white-space:normal;line-height:1.15}
+    .bar{gap:8px}.bar .actions{min-width:0}.bar .actions .button{min-width:0;padding-inline:10px}
+    .harness-row{gap:7px;padding-inline:8px}.harness-rank{width:18px}.harness-ready{display:none}
+    .connectiontop{min-width:0}.connectiontop b{min-width:0;overflow-wrap:anywhere}
+  }
+</style>
+<script>
+  if (window.matchMedia('(max-width:600px)').matches) {
+    document.querySelectorAll('[data-layout]').forEach(button => {
+      button.classList.toggle('on', button.dataset.layout === 'list');
+    });
+  }
+  (() => {
+    const escapeHtml = value => value.replace(/[&<>"']/g, character => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    })[character]);
+    let queuedAttachment = null;
+    const attachmentInput = document.createElement('input');
+    attachmentInput.type = 'file';
+    attachmentInput.hidden = true;
+    attachmentInput.accept = 'image/*,.pdf,.txt,.md,.json,.csv';
+    document.body.append(attachmentInput);
+    attachmentInput.addEventListener('change', () => {
+      queuedAttachment = attachmentInput.files && attachmentInput.files[0];
+      if (queuedAttachment) document.getElementById('toast').textContent = `${queuedAttachment.name} ready to send`;
+    });
+    const send = document.getElementById('sendMessage');
+    const attach = document.getElementById('quickAttach');
+    const image = document.getElementById('quickImage');
+    attach.onclick = () => { attachmentInput.accept = 'image/*,.pdf,.txt,.md,.json,.csv'; attachmentInput.click(); };
+    image.onclick = () => { attachmentInput.accept = 'image/*'; attachmentInput.click(); };
+    send.onclick = () => {
+      const composer = document.querySelector('.compose textarea');
+      const body = composer.value.trim();
+      if (!body && !queuedAttachment) return;
+      const attachment = queuedAttachment ? `<p class="meta">Attachment · ${escapeHtml(queuedAttachment.name)}</p>` : '';
+      document.getElementById('thread').insertAdjacentHTML('beforeend', `<article class="message you"><p class="speaker">You · now</p><div class="bubble">${body ? escapeHtml(body) : 'Shared an attachment.'}${attachment}</div></article>`);
+      composer.value = '';
+      queuedAttachment = null;
+      attachmentInput.value = '';
+      document.getElementById('thread').scrollTop = document.getElementById('thread').scrollHeight;
+    };
+  })();
+</script>
+<script>
+(() => {
+  const by = selector => document.querySelector(selector);
+  const all = selector => [...document.querySelectorAll(selector)];
+  let visibleStages = ['planned', 'running', 'review', 'done'];
+  const toast = message => {
+    const node = by('#toast');
+    node.textContent = message;
+    node.classList.add('on');
+    clearTimeout(window.aludraToast);
+    window.aludraToast = setTimeout(() => node.classList.remove('on'), 2400);
+  };
+  const closeOverlay = () => {
+    by('#overlay').classList.remove('on');
+    by('#modal').replaceChildren();
+  };
+  const openOverlay = (html, kind = 'modal') => {
+    const modal = by('#modal');
+    modal.className = kind;
+    modal.innerHTML = html;
+    by('#overlay').classList.add('on');
+    all('[data-close]').forEach(button => button.addEventListener('click', closeOverlay));
+    bindSelects(modal);
+  };
+  const choice = (id, value, options) => `<div class="selectbox"><button class="selecttrigger" type="button" data-select-trigger="${id}" aria-expanded="false">${value}</button><div class="selectoptions" data-select-options="${id}" hidden>${options.map(option => `<button type="button" data-select-value="${option}">${option}</button>`).join('')}</div></div>`;
+  const bindSelects = root => {
+    all('[data-select-trigger]', root).forEach(trigger => trigger.onclick = () => {
+      const options = by(`[data-select-options="${trigger.dataset.selectTrigger}"]`);
+      const open = options.hasAttribute('hidden');
+      all('.selectoptions').forEach(menu => menu.setAttribute('hidden', ''));
+      all('[data-select-trigger]').forEach(button => button.setAttribute('aria-expanded', 'false'));
+      if (open) { options.removeAttribute('hidden'); trigger.setAttribute('aria-expanded', 'true'); }
+    });
+    all('[data-select-value]', root).forEach(option => option.onclick = () => {
+      const box = option.closest('.selectbox');
+      box.querySelector('.selecttrigger').textContent = option.dataset.selectValue;
+      box.querySelector('.selectoptions').setAttribute('hidden', '');
+      box.querySelector('.selecttrigger').setAttribute('aria-expanded', 'false');
+    });
+  };
+  const upgradeNativeSelect = select => {
+    if (select.dataset.upgraded) return;
+    select.dataset.upgraded = 'true';
+    const box = document.createElement('div');
+    box.className = 'selectbox native-selectbox';
+    const trigger = document.createElement('button');
+    trigger.type = 'button';
+    trigger.className = 'selecttrigger';
+    trigger.textContent = select.options[select.selectedIndex]?.text || 'Choose an option';
+    const menu = document.createElement('div');
+    menu.className = 'selectoptions';
+    menu.hidden = true;
+    [...select.options].forEach(option => {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.textContent = option.text;
+      item.onclick = () => {
+        select.value = option.value;
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+        trigger.textContent = option.text;
+        menu.hidden = true;
+      };
+      menu.append(item);
+    });
+    trigger.onclick = () => {
+      const willOpen = menu.hidden;
+      all('.selectoptions').forEach(candidate => candidate.hidden = true);
+      menu.hidden = !willOpen;
+    };
+    box.append(trigger, menu);
+    select.after(box);
+    select.hidden = true;
+  };
+  const upgradeNativeSelects = () => all('select.input').forEach(upgradeNativeSelect);
+  const sessionDetails = {
+    '1': { title: 'Session 1 · OpenAI Codex', state: 'Sealed after milestone', transition: 'Initial session · OpenAI Codex', transitionNote: 'Work began on the task’s first eligible harness.', attempt: 'Attempt 1 · OpenAI Codex', body: 'Created the schema and passed the migration check.', integrity: 'Baseline recorded', note: 'A continuation brief was sealed with the objective, decisions, Git baseline, changed files, and verification evidence.', native: 'Open native Codex session' },
+    '2': { title: 'Session 2 · OpenAI Codex', state: 'Sealed after quota', transition: 'Quota failover · new session', transitionNote: 'Codex reached a provider limit. The next eligible harness started a separate session after handoff review.', attempt: 'Attempt 2 · OpenAI Codex', body: 'Reached provider quota after the handoff verification passed.', integrity: 'Handoff sealed', note: 'This is a harness change boundary. Claude Code received the continuation brief, not the full transcript.', native: 'Open native Codex session' },
+    '3': { title: 'Session 3 · Anthropic Claude Code', state: 'Active · state check passed', transition: 'Quota failover · Anthropic Claude Code', transitionNote: 'This new harness session received the sealed continuation brief and validated the workspace before proceeding.', attempt: 'Attempt 1 · Anthropic Claude Code', body: 'Checking the task-session work and configured verification.', integrity: 'Workspace matches', note: 'The new session validated the Git baseline and diff before continuing.' }
+  };
+  const openSession = id => {
+    const session = sessionDetails[id] || sessionDetails['3'];
+    const nativeAction = session.native ? `<button class="button small" type="button" data-toast="Native Codex continuation opened">${session.native}</button>` : '';
+    openOverlay(`<div class="modalhead"><div><h2>${session.title}</h2><p class="muted">${session.state}</p></div><button class="close" data-close aria-label="Close">×</button></div><div class="modalbody"><section><h2>Transition</h2><article class="attempt"><b>${session.transition}</b><p>${session.transitionNote}</p></article></section><section class="attempt"><b>Continuation brief</b><p>${session.note}</p><button class="button small" type="button" data-toast="Continuation brief opened">Review brief</button></section><section><h2>Run history</h2><article class="attempt"><div class="attempthead"><b>${session.attempt}</b><span class="badge">${id === '3' ? 'Running' : 'Completed'}</span></div><p>${session.body}</p><div class="actions"><button class="button small" type="button" data-toast="Run details opened">View run details</button>${nativeAction}</div></article></section><section><h2>State check</h2><article class="attempt"><b>${session.integrity}</b><p>Git baseline, workspace status, diff hash, and verification evidence are available for review.</p></article></section></div>`, 'drawer');
+  };
+  const brandMarks = {
+    codex: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zM8.3065 12.863l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zm1.0976-2.3654l2.602-1.4998 2.6069 1.4998v2.9994l-2.5974 1.4997-2.6067-1.4997Z"/></svg>',
+    claude: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.3041 3.541h-3.6718l6.696 16.918H24Zm-10.6082 0L0 20.459h3.7442l1.3693-3.5527h7.0052l1.3693 3.5528h3.7442L10.5363 3.5409Zm-.3712 10.2232 2.2914-5.9456 2.2914 5.9456Z"/></svg>',
+    github: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>',
+    coder: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.862 6.67H24v10.663h-9.138zM6.945 15.304c-1.934 0-3.366-1.264-3.366-3.305s1.432-3.323 3.366-3.365c1.411-.03 2.787.99 2.878 2.543l3.472-.106c-.076-2.802-2.33-4.706-6.35-4.706S0 8.558 0 12c0 3.426 3.046 5.635 6.945 5.635 3.898 0 6.29-1.935 6.38-4.782l-3.472-.077c-.152 1.553-1.497 2.528-2.908 2.528Z"/></svg>'
+  };
+  const brandify = () => {
+    all('.agent').forEach(mark => {
+      const isClaude = mark.classList.contains('cl');
+      mark.setAttribute('aria-label', isClaude ? 'Anthropic Claude Code' : 'OpenAI Codex');
+      mark.title = isClaude ? 'Anthropic Claude Code' : 'OpenAI Codex';
+      if (mark.dataset.brandified) return;
+      mark.dataset.brandified = 'true';
+      mark.innerHTML = isClaude ? brandMarks.claude : brandMarks.codex;
+    });
+    all('.harness-brand[data-brand]').forEach(mark => {
+      mark.innerHTML = brandMarks[mark.dataset.brand] || '';
+    });
+  };
+  const bindHarnessOrder = root => {
+    const order = root.querySelector('.harness-order');
+    if (!order) return;
+    let dragged = null;
+    const updateRanks = () => [...order.children].forEach((row, index) => row.querySelector('.harness-rank').textContent = String(index + 1).padStart(2, '0'));
+    [...order.children].forEach(row => {
+      row.addEventListener('dragstart', () => { dragged = row; row.classList.add('dragging'); });
+      row.addEventListener('dragend', () => { row.classList.remove('dragging'); [...order.children].forEach(item => item.classList.remove('drop-target')); updateRanks(); });
+      row.addEventListener('dragover', event => { event.preventDefault(); if (row !== dragged) row.classList.add('drop-target'); });
+      row.addEventListener('dragleave', () => row.classList.remove('drop-target'));
+      row.addEventListener('drop', event => {
+        event.preventDefault();
+        if (!dragged || row === dragged) return;
+        const before = event.clientY < row.getBoundingClientRect().top + row.offsetHeight / 2;
+        order.insertBefore(dragged, before ? row : row.nextSibling);
+        row.classList.remove('drop-target');
+        updateRanks();
+        toast('Harness order updated');
+      });
+    });
+  };
+  const renderSettings = () => {
+    if (!by('#settings').classList.contains('on')) return;
+    const scope = by('.scope button.on')?.dataset.scope || 'global';
+    const category = by('.settingsnav button.on')?.dataset.setcat || 'execution';
+    const label = scope === 'global' ? 'workspace defaults' : scope === 'project' ? 'research-harness defaults' : 'this task';
+    const content = by('#settingContent');
+    if (category === 'execution') content.innerHTML = `<p class="muted" style="margin-bottom:16px">Editing <b>${label}</b>.</p><div class="settingrow"><div><b>Harness order</b><p>Drag eligible harnesses into the order Aludra should use. The highest available harness starts the task; a quota or availability failover moves to the next eligible one.</p><span class="source">Project default · OpenAI Codex, then Anthropic Claude Code</span></div><div class="harness-order" aria-label="Harness order"><article class="harness-row" draggable="true"><span class="harness-handle" aria-hidden="true">•••</span><span class="harness-rank">01</span><span class="harness-brand" data-brand="codex" aria-label="OpenAI Codex"></span><span class="harness-name"><b>OpenAI Codex</b><span>Eligible and authenticated</span></span><span class="harness-ready">Ready</span></article><article class="harness-row" draggable="true"><span class="harness-handle" aria-hidden="true">•••</span><span class="harness-rank">02</span><span class="harness-brand" data-brand="claude" aria-label="Anthropic Claude Code"></span><span class="harness-name"><b>Anthropic Claude Code</b><span>Eligible and authenticated</span></span><span class="harness-ready">Ready</span></article></div></div><div class="settingrow"><div><b>Failover confirmation</b><p>Choose whether a person confirms an eligible switch after a provider is unavailable or reaches its quota.</p><span class="source">Global default · Ask before switching</span></div><div>${choice('failover', 'Ask before switching', ['Ask before switching', 'Switch automatically when eligible', 'Never switch automatically'])}</div></div><button class="button primary" type="button" data-save-settings>Save changes</button>`;
+    if (category === 'sessions') content.innerHTML = `<p class="muted" style="margin-bottom:16px">Editing <b>${label}</b>.</p><div class="settingrow"><div><b>Context budget</b><p>When this limit is reached, seal a continuation brief and open a fresh work session on the same harness. Provider outages still follow the failover policy.</p><span class="source">Project default · 24k characters</span></div><div>${choice('budget', '24k characters', ['8k characters', '24k characters', '48k characters', '96k characters', 'No automatic rollover'])}</div></div><div class="settingrow"><div><b>Session rollover</b><p>Turn on durable session records for this task after the handoff rules are ready to use.</p><span class="source">Task setting</span></div><div><label class="policy-choice"><input type="checkbox"><span><b>Enable task session rollover</b>Off by default until session handoff validation is complete.</span></label></div></div><button class="button primary" type="button" data-save-settings>Save changes</button>`;
+    if (category === 'review') content.innerHTML = `<p class="muted" style="margin-bottom:16px">Editing <b>${label}</b>.</p><div class="settingrow"><div><b>Human decisions</b><p>Choose which transitions stop for review.</p><span class="source">Global default · quota failover and workspace mismatch</span></div><div class="policy"><label class="policy-choice"><input checked type="checkbox"><span><b>Review a harness switch</b>Ask before a quota or availability failover.</span></label><label class="policy-choice"><input checked type="checkbox"><span><b>Review workspace mismatch</b>Keep work stopped until the state check is reviewed.</span></label></div></div><button class="button primary" type="button" data-save-settings>Save changes</button>`;
+    bindSelects(content);
+    bindHarnessOrder(content);
+    all('[data-save-settings]', content).forEach(button => button.onclick = () => toast('Settings saved'));
+  };
+  const decorateConnections = () => {
+    if (!by('#connections').classList.contains('on')) return;
+    const grid = by('#connections .grid2');
+    grid.innerHTML = `<article class="connection"><div class="connectiontop"><span class="connectionlogo" aria-label="GitHub">${brandMarks.github}</span><b>GitHub</b><span class="connection-state">Connected</span></div><p>Repository access and pull-request permissions are ready.</p><button class="button small" type="button" data-toast="GitHub check passed">Test connection</button></article><article class="connection"><div class="connectiontop"><span class="connectionlogo" aria-label="Coder workspace">${brandMarks.coder}</span><b>Coder workspace</b><span class="connection-state">Ready</span></div><p>Workspace is available and its state can be checked before a work session starts.</p><button class="button small" type="button" data-toast="Coder workspace opened">Open workspace</button></article><article class="connection"><div class="connectiontop"><span class="connectionlogo" aria-label="OpenAI Codex">${brandMarks.codex}</span><b>OpenAI Codex</b><span class="connection-state warn">Quota cooldown</span></div><p>Authenticated, but temporarily unavailable for a new attempt. Existing session history remains accessible.</p><button class="button small" type="button" data-toast="OpenAI availability refreshed">Refresh status</button></article><article class="connection"><div class="connectiontop"><span class="connectionlogo" aria-label="Anthropic Claude Code">${brandMarks.claude}</span><b>Anthropic Claude Code</b><span class="connection-state error">Needs re-auth</span></div><p>The local CLI is present, but the runner session needs authentication before it can be selected.</p><button class="button small" type="button" data-toast="Authentication flow started">Reconnect</button></article><article class="connection"><div class="connectiontop"><span class="connectionlogo">＋</span><b>Add a harness</b><span class="connection-state off">Not configured</span></div><p>Only installed and authenticated adapters can join this project’s harness order.</p><button class="button small" type="button" data-toast="Connection setup opened">Add connection</button></article>`;
+    all('[data-toast]', grid).forEach(button => button.onclick = () => toast(button.dataset.toast));
+  };
+  const decorateActivity = () => {
+    if (!by('#activity').classList.contains('on')) return;
+    const feed = by('#activity .activity');
+    feed.innerHTML = `<button class="event" type="button" data-activity-task="sessions"><time class="time">2 min ago</time><span class="eventmark">↻</span><span><b>Session 3 started on Claude Code</b><p>“Add durable task sessions” continued after a quota failover.</p></span></button><button class="event" type="button" data-activity-task="sessions"><time class="time">18 min ago</time><span class="eventmark">✓</span><span><b>Integrity check passed</b><p>Workspace and diff matched the sealed handoff pack.</p></span></button><button class="event" type="button" data-activity-task="parallel"><time class="time">41 min ago</time><span class="eventmark">◌</span><span><b>PR #5 is ready for review</b><p>Parallel-capacity validation D is waiting on a delivery decision.</p></span></button>`;
+  };
+  const applySavedView = kind => {
+    by('[data-page="board"]').click();
+    requestAnimationFrame(() => {
+      const shown = kind === 'runs' ? ['running'] : ['review', 'done'];
+      all('[data-lane]').forEach(lane => lane.style.display = shown.includes(lane.dataset.lane) ? '' : 'none');
+      toast(kind === 'runs' ? 'Active runs view applied' : 'Engineering handoff view applied');
+    });
+  };
+  const decorateSavedViews = () => {
+    all('#savedViews .saved').forEach((card, index) => {
+      const button = card.querySelector('.button');
+      if (button && !button.dataset.savedView) button.dataset.savedView = index === 1 ? 'runs' : 'handoff';
+    });
+  };
+  const applyView = () => {
+    visibleStages = all('[data-view-stage]').filter(check => check.checked).map(check => check.value);
+    all('[data-lane]').forEach(lane => lane.style.display = visibleStages.includes(lane.dataset.lane) ? '' : 'none');
+    closeOverlay();
+    toast(`${visibleStages.length} stages shown`);
+  };
+  const stageChoice = (stage, title, description) => `<label class="policy-choice"><input ${visibleStages.includes(stage) ? 'checked' : ''} type="checkbox" data-view-stage value="${stage}"><span><b>${title}</b>${description}</span></label>`;
+  const openViewEditor = () => openOverlay(`<div class="modalhead"><div><h2>Edit current view</h2><p class="muted">Choose the stages and details this saved view shows.</p></div><button class="close" data-close aria-label="Close">×</button></div><div class="modalbody"><div class="field"><label>Visible stages</label><div class="policy">${stageChoice('planned', 'Planned', 'Tasks that have not started.')}${stageChoice('running', 'Running', 'Active work sessions.')}${stageChoice('review', 'Needs review', 'Work waiting on a person.')}${stageChoice('done', 'Done', 'Completed work and delivery history.')}</div></div><div class="field"><label>Card emphasis</label>${choice('card-emphasis', 'Current activity', ['Current activity', 'Human decisions', 'Delivery status'])}</div></div><div class="modalfoot"><button class="button" type="button" data-close>Cancel</button><button class="button primary" type="button" id="applyView">Apply view</button></div>`);
+  by('#editView').onclick = openViewEditor;
+  all('[data-page]').forEach(button => button.addEventListener('click', () => requestAnimationFrame(() => { renderSettings(); decorateConnections(); decorateActivity(); decorateSavedViews(); })));
+  document.addEventListener('click', event => {
+    if (event.target.closest('.settingsnav button, .scope button')) requestAnimationFrame(renderSettings);
+    if (event.target.closest('#applyView')) applyView();
+    if (event.target.closest('[data-session]')) openSession(event.target.closest('[data-session]').dataset.session);
+    const activityTask = event.target.closest('[data-activity-task]');
+    if (activityTask) document.querySelector(`[data-id="${activityTask.dataset.activityTask}"]`)?.click();
+    const taskLink = event.target.closest('[data-open-task]');
+    if (taskLink) document.querySelector(`[data-id="${taskLink.dataset.openTask}"]`)?.click();
+    const savedView = event.target.closest('[data-saved-view]');
+    if (savedView) applySavedView(savedView.dataset.savedView);
+  });
+  all('.sessionitem').forEach(button => button.onclick = () => openSession(button.dataset.session));
+  by('#taskDetails').onclick = () => openOverlay(`<div class="modalhead"><div><h2>Task details</h2><p class="muted">Execution context and session history.</p></div><button class="close" data-close aria-label="Close">×</button></div><div class="modalbody"><section class="inspectsection"><div class="sectiontitle"><h2>Current work</h2></div><p class="summaryline">Claude Code is verifying the durable-session and handoff changes.</p><div class="agentstack"><span class="agent cx" aria-label="OpenAI Codex"></span><span class="agent cl" aria-label="Anthropic Claude Code"></span></div></section><section class="inspectsection"><div class="sectiontitle"><h2>Sessions</h2><button class="button small" type="button" data-toast="Start a fresh session flow opened">New session</button></div><button class="sessionitem" data-session="1"><b>Session 1 · OpenAI Codex</b><span>Sealed · milestone complete</span></button><button class="sessionitem" data-session="2"><b>Session 2 · OpenAI Codex</b><span>Sealed · quota reached</span></button><button class="sessionitem active" data-session="3"><b>Session 3 · Anthropic Claude Code</b><span>Active · workspace matches</span></button></section><section class="inspectsection"><div class="sectiontitle"><h2>Delivery</h2></div><div class="delivery"><b>PR #5 · open</b><p>Checks passed · waiting for review.</p><button class="button small" type="button" data-toast="Pull request opened">Open pull request</button></div></section></div>`, 'drawer');
+  const taskSettingsLink = document.querySelector('#task [data-page="settings"]');
+  if (taskSettingsLink) taskSettingsLink.onclick = () => {
+    by('#backBoard').click();
+    requestAnimationFrame(() => by('[data-page="settings"]').click());
+  };
+  const sharedAttachmentInput = document.querySelector('body > input[type="file"]');
+  const attachmentButton = by('#quickAttach');
+  attachmentButton.setAttribute('aria-label', 'Add attachment');
+  attachmentButton.title = 'Add attachment';
+  attachmentButton.onclick = () => openOverlay(`<div class="modalhead"><div><h2>Add to message</h2><p class="muted">Choose what you want to attach.</p></div><button class="close" data-close aria-label="Close">×</button></div><div class="modalbody"><button class="button attachment-choice" type="button" data-attachment-kind="file"><span aria-hidden="true">⌁</span>Attach file</button><button class="button attachment-choice" type="button" data-attachment-kind="image"><span aria-hidden="true">▧</span>Choose image</button></div>`);
+  const needsButton = by('[data-view="needs"]');
+  by('#newTask').innerHTML = '<span aria-hidden="true">+</span> New task';
+  needsButton.innerHTML = 'Needs you <span class="notify">3</span>';
+  new MutationObserver(brandify).observe(document.body, { childList: true, subtree: true });
+  new MutationObserver(upgradeNativeSelects).observe(document.body, { childList: true, subtree: true });
+  // Saved views can be created from the existing prototype flow. Decorate those
+  // cards as they arrive so a freshly saved view is immediately usable.
+  new MutationObserver(decorateSavedViews).observe(by('#savedViews'), { childList: true });
+  brandify();
+  renderSettings();
+  decorateConnections();
+  decorateActivity();
+  decorateSavedViews();
+  upgradeNativeSelects();
+  document.addEventListener('click', event => {
+    const attachmentChoice = event.target.closest('[data-attachment-kind]');
+    if (attachmentChoice && sharedAttachmentInput) {
+      sharedAttachmentInput.accept = attachmentChoice.dataset.attachmentKind === 'image' ? 'image/*' : 'image/*,.pdf,.txt,.md,.json,.csv';
+      closeOverlay();
+      sharedAttachmentInput.click();
+    }
+    const toastButton = event.target.closest('[data-toast]');
+    if (toastButton) toast(toastButton.dataset.toast);
+  });
+  // Both the conversation composer and task creation use one attachment entry
+  // point. The file type is chosen deliberately, instead of exposing two
+  // competing controls or a browser-default picker as the primary UI.
+  document.addEventListener('click', event => {
+    const chooser = event.target.closest('#chooseFiles');
+    const input = by('#fileInput');
+    if (!chooser || !input) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const files = by('#files');
+    files.querySelector('.attachment-inline-menu')?.remove();
+    const picker = document.createElement('div');
+    picker.className = 'attachment-inline-menu';
+    picker.innerHTML = '<button class="button small" type="button" data-task-attachment-kind="file">⌁ Attach file</button><button class="button small" type="button" data-task-attachment-kind="image">▧ Choose image</button>';
+    files.append(picker);
+    picker.querySelectorAll('[data-task-attachment-kind]').forEach(button => button.onclick = () => {
+      input.accept = button.dataset.taskAttachmentKind === 'image' ? 'image/*' : 'image/*,.pdf,.txt,.md,.json,.csv';
+      picker.remove();
+      input.click();
+    });
+  }, true);
+})();
+</script>
+</body>
+</html>

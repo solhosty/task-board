@@ -1,5 +1,24 @@
 # Harness Rotation
 
+## Run the redesigned Aludra UI
+
+For the production-style dashboard, build the frontend once and start the Python application:
+
+```bash
+cd frontend && npm run build
+cd .. && python3 app.py
+```
+
+Open the printed `http://127.0.0.1:4173` URL. The React application is served at `/`.
+
+For frontend hot reload, leave the Python server running and use a second terminal:
+
+```bash
+cd frontend && npm run dev
+```
+
+Vite proxies API requests to the Python server on port `4173`.
+
 A local workspace for goals that can continue across coding harnesses.
 
 A project is a named folder containing local code. Each project has many tasks. A task is a persistent goal—a feature, fix, or entire app—with its conversation and harness attempts kept together. See [DOMAIN.md](DOMAIN.md).
@@ -33,6 +52,29 @@ python3 app.py
 ```
 
 Open the URL printed in the terminal. The server prefers port 4173 and chooses a free port if that port is occupied. Use `python3 app.py --port 4180` to request another port. Ctrl-C stops the server. State is stored in `.harness/`; `--data-dir PATH` selects another state directory.
+
+## Backend structure
+
+`app.py` remains the dependency-light executable and compatibility API. Backend
+responsibilities that need independent evolution live in `harness_rotation/`:
+
+- `adapters.py` owns the supported CLI command contracts.
+- `coder_config.py` owns Coder URL validation, naming, and public presentation.
+- `credentials.py` owns Coder token lookup and Keychain operations.
+- `remote_transport.py` owns the validated SSH protocol used by Coder task helpers.
+- `worktrees.py` owns local Git worktree, harness-process, and merge mechanics.
+- `run_state.py` owns active-run queries, runner-slot queries, and execution leases.
+- `harness_output.py` owns reply decoding and saved-log presentation.
+- `coder_bridges.py` owns the private Codex JSON-RPC and Claude login transports
+  used inside persistent Coder runners.
+- `persistence.py` owns SQLite connections, the current schema, and numbered,
+  idempotent migrations.
+- `sessions.py` owns durable task-session rotation, handoff construction, and
+  workspace-integrity reconciliation.
+
+New backend behavior should enter through one of these boundaries rather than add
+another responsibility directly to the HTTP handler. Existing tests and maintenance
+scripts may continue to import `app` while modules are extracted incrementally.
 
 ## Workspace
 
