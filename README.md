@@ -76,6 +76,22 @@ New backend behavior should enter through one of these boundaries rather than ad
 another responsibility directly to the HTTP handler. Existing tests and maintenance
 scripts may continue to import `app` while modules are extracted incrementally.
 
+### Runner payloads
+
+`infra/runner/` holds the programs that execute *inside* a persistent Coder
+runner rather than on the desktop. Each is sent over Coder SSH as stdin and run
+by `python3 -`, so they must stay standard-library only and must never import
+`app` or `harness_rotation`. The host reads them through
+`harness_rotation.remote_transport.payload`, which is the single place that
+knows the directory.
+
+- `remote_worktree.py` creates the isolated per-task checkout and pins its base ref.
+- `remote_agent_runner.py` runs one bounded Codex/Claude attempt plus verification.
+- `remote_delivery_runner.py` commits, pushes, and opens or reads the GitHub PR.
+- `remote_runner_capacity.py` probes cgroup CPU/memory to set the admission limit.
+- `remote_workspace_snapshot.py` fingerprints remote Git state read-only.
+- `remote_claude_login.py` proxies Claude Code's interactive login over a PTY.
+
 ## Workspace
 
 - Browse local folders, name a project, and add it to the sidebar. Git and TASKS.md are not required to organize projects.

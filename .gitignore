@@ -3,3 +3,12 @@ __pycache__/
 *.py[cod]
 .DS_Store
 
+
+# Node dependencies (never committed; restore with `npm --prefix frontend ci`)
+frontend/node_modules/
+
+# Regenerated build and test artifacts
+frontend/test-results/
+frontend/playwright-report/
+test-results/
+frontend/*.tsbuildinfo

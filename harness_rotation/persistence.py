@@ -234,6 +234,62 @@ def _aludra_board(connection: sqlite3.Connection) -> None:
         name TEXT NOT NULL, config_json TEXT NOT NULL, created_at TEXT NOT NULL)""")
 
 
+def _scoped_harness_order(connection: sqlite3.Connection) -> None:
+    """A project or task may carry its own complete harness ordering.  Rows
+    exist only where a scope overrides what it inherits, so an absent scope
+    falls through to its parent rather than storing a copy of it."""
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS harness_orders (
+          id INTEGER PRIMARY KEY,
+          scope TEXT NOT NULL CHECK(scope IN ('project','task')),
+          scope_id INTEGER NOT NULL,
+          harness_key TEXT NOT NULL,
+          position INTEGER NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(scope, scope_id, harness_key)
+        )""")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_harness_orders_scope ON harness_orders(scope, scope_id, position)")
+
+
+def _task_memory_mode(connection: sqlite3.Connection) -> None:
+    _add_column(connection, "tasks", "memory_mode", "TEXT NOT NULL DEFAULT 'inherit'")
+
+
+def _scoped_harness_models(connection: sqlite3.Connection) -> None:
+    """Per-harness model choices a project, and then a task, may narrow.
+
+    The harnesses table keeps the global choice, so a missing row here means the
+    wider scope still decides and no model is copied forward on save.
+    """
+    connection.execute("""CREATE TABLE IF NOT EXISTS project_harness_models (
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        harness_key TEXT NOT NULL, model TEXT NOT NULL, updated_at TEXT NOT NULL,
+        PRIMARY KEY(project_id, harness_key))""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS task_harness_models (
+        task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        harness_key TEXT NOT NULL, model TEXT NOT NULL, updated_at TEXT NOT NULL,
+        PRIMARY KEY(task_id, harness_key))""")
+
+
+def _task_attachments(connection: sqlite3.Connection) -> None:
+    """Files and images a user adds to a task conversation.
+
+    The bytes live on disk beside the logs rather than in SQLite, so a large
+    image never inflates the state database or a task query; the row records
+    where they are and which message introduced them.
+    """
+    connection.execute("""CREATE TABLE IF NOT EXISTS task_attachments (
+        id INTEGER PRIMARY KEY,
+        task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        session_id INTEGER REFERENCES task_sessions(id),
+        message_id INTEGER REFERENCES task_messages(id),
+        filename TEXT NOT NULL, media_type TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('image','file')),
+        byte_size INTEGER NOT NULL, sha256 TEXT NOT NULL,
+        stored_path TEXT NOT NULL, created_at TEXT NOT NULL)""")
+
+
 MIGRATIONS = (
     Migration("001_execution_lease_runner", _runner_link),
     Migration("002_runner_capacity", _runner_capacity),
@@ -246,6 +302,10 @@ MIGRATIONS = (
     Migration("009_execution_targets", _execution_targets),
     Migration("010_task_sessions", _sessions),
     Migration("011_aludra_board", _aludra_board),
+    Migration("012_task_memory_mode", _task_memory_mode),
+    Migration("013_scoped_harness_models", _scoped_harness_models),
+    Migration("014_task_attachments", _task_attachments),
+    Migration("015_scoped_harness_order", _scoped_harness_order),
 )
 
 

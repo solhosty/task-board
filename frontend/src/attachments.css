@@ -1,0 +1,17 @@
+/* Attachments in the task timeline and composer. An image is shown as a small
+   preview so a screenshot is recognizable without opening it; anything else is
+   a labelled chip. Both link to the stored file. */
+.attachments{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
+.attachment{position:relative;display:flex;margin:0;border:1px solid #dce1e9;border-radius:8px;background:#fff;overflow:hidden}
+.attachment a,.attachment>span{display:flex;align-items:center;gap:8px;padding:7px 9px;color:#2a3140;text-decoration:none;font-size:12px}
+.attachment.image a,.attachment.image>span{flex-direction:column;align-items:flex-start;gap:6px;padding:6px}
+.attachment img{max-width:190px;max-height:150px;border-radius:5px;object-fit:cover}
+.attachment figcaption{display:flex;align-items:baseline;gap:6px;max-width:210px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.attachment small{color:#7b8491;font-size:10px}
+.attachment>button{display:grid;place-items:center;width:22px;border:0;border-left:1px solid #eceff4;background:#fafbfd;color:#6c7480;cursor:pointer}
+.attachment.image>button{position:absolute;top:5px;right:5px;width:20px;height:20px;border:1px solid #dce1e9;border-radius:5px;background:#ffffffe6}
+.attachment>button:hover{background:#fff1ee;color:#a74231}
+.composer .attachments{margin:4px 0 0;padding:0 2px}
+.attachment figcaption{flex-direction:column;gap:1px;align-items:flex-start}
+.attempt-list .attachments{margin-top:8px}
+.attempt-list .attachment figcaption{max-width:150px}

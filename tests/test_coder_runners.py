@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import app
-import remote_delivery_runner as delivery
+from infra.runner import remote_delivery_runner as delivery
 
 
 class CoderRunnerTests(unittest.TestCase):

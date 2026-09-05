@@ -7,6 +7,7 @@ import json
 import argparse
 import errno
 import hashlib
+import mimetypes
 import os
 import re
 import shutil
@@ -24,7 +25,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, parse_qs
 from urllib.request import Request, urlopen
 from events import read_events
 from harness_rotation import persistence
@@ -44,6 +45,8 @@ from harness_rotation.harness_output import (
     decode_result as decode_harness_result,
     log_details as read_log_details,
 )
+from harness_rotation import attachments as attachment_store
+from harness_rotation import memories as memory_store
 from harness_rotation import remote_transport
 from harness_rotation import worktrees
 from harness_rotation.sessions import SessionService
@@ -54,7 +57,39 @@ from harness_rotation.credentials import (
     KEYCHAIN_SERVICE, keychain_available, keychain_account,
     save_coder_token, remove_coder_token, read_coder_token,
 )
-from remote_worktree import validate_source
+from infra.runner.remote_worktree import validate_source
+
+
+def memory_scope(value: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Resolve a memory scope key from the UI into a project row, or None for
+    the global store."""
+    if not value or value == "global":
+        return None
+    match = re.fullmatch(r"project:(\d+)", value)
+    if not match:
+        raise ValueError("Unknown memory scope")
+    return project_or_404(int(match.group(1)))
+
+
+def harness_order_scope(value: Optional[str]) -> Tuple[str, int]:
+    """Parse a scope key from the UI into (scope, id).  Global has no id."""
+    if not value or value == "global":
+        return "global", 0
+    match = re.fullmatch(r"(project|task):(\d+)", value or "")
+    if not match:
+        raise ValueError("Unknown harness order scope")
+    scope, scope_id = match.group(1), int(match.group(2))
+    if scope == "project":
+        project_or_404(scope_id)
+    elif not one("SELECT id FROM tasks WHERE id=?", (scope_id,)):
+        raise ValueError("Task not found")
+    return scope, scope_id
+
+
+def memory_harness(value: str) -> str:
+    if value not in ("claude", "codex"):
+        raise ValueError("That harness does not keep memory Aludra can edit")
+    return value
 
 
 def browse_directory(location: Optional[str] = None) -> Dict[str, Any]:
@@ -446,7 +481,8 @@ def adapter_metadata() -> Dict[str, Any]:
     saved = {h['key']: h for h in rows('SELECT * FROM harnesses')}
     return {key: {'models': json.loads(saved[key]['model_catalog']) if saved[key].get('model_catalog') else value['models'],
                   'model_source': saved[key].get('model_source') or 'Scan to discover available models',
-                  'runnable': value['runnable']} for key, value in ADAPTERS.items()}
+                  'runnable': value['runnable'],
+                  'attachment_note': value.get('attachment_note', '')} for key, value in ADAPTERS.items()}
 
 
 def run_state_store() -> RunStateStore:
@@ -614,7 +650,7 @@ def refresh_runner_capacity(runner: Dict[str, Any], environment: Dict[str, str],
             pass
     command = shlex.join(['python3', '-'])
     probed = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--', command],
-                            input=(APP_ROOT / 'remote_runner_capacity.py').read_text(), env=environment,
+                            input=remote_transport.payload(APP_ROOT, 'remote_runner_capacity.py'), env=environment,
                             capture_output=True, text=True, timeout=45)
     if probed.returncode:
         return runner
@@ -951,7 +987,7 @@ def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[s
     request = {'repo_url': repo_url, 'base_ref': profile.get('base_ref') or 'main', 'task_key': saved['task_key']}
     command = shlex.join(['python3', '-', json.dumps(request)])
     checked = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--', command],
-                             input=(APP_ROOT / 'remote_worktree.py').read_text(), env=environment,
+                             input=remote_transport.payload(APP_ROOT, 'remote_worktree.py'), env=environment,
                              capture_output=True, text=True, timeout=300)
     if checked.returncode:
         execute("UPDATE execution_leases SET state='failed',updated_at=? WHERE run_id=?", (now(), run_id))
@@ -1010,9 +1046,7 @@ def choose_remote_harness(task: Dict[str, Any], runner: Dict[str, Any], environm
         status = remote_codex_account(runner, environment) if key == 'codex' else remote_claude_account(runner, environment)
         statuses[key] = status
         if status.get('installed') and status.get('authenticated'):
-            selected = dict(harness)
-            if task.get('preferred_model'):
-                selected['model'] = task['preferred_model']
+            selected = with_effective_model(harness, model_snapshot(task))
             if locked_key == key:
                 return selected, 'remote session continuity'
             return selected, 'remote preferred' if task.get('preferred_harness') == key else 'remote fallback'
@@ -1090,6 +1124,11 @@ def execution_blockers(project: Dict[str, Any], task: Optional[Dict[str, Any]] =
     if task:
         backend, profile = effective_execution_backend(project, task)
         if backend == 'coder':
+            if task_attachments(task['id']):
+                # The remote helper receives one base64 request over SSH and has
+                # no channel for file bytes, so a remote run would silently drop
+                # what the user attached. Say so instead of running without it.
+                blockers.append('Attachments are delivered to local runs only. Remove them or run this task locally.')
             if not profile or not profile.get('coder_server_id'):
                 blockers.append('Choose a Coder server for this project before using remote execution.')
             elif profile.get('server_status') != 'authorized':
@@ -1221,8 +1260,56 @@ def claim_run(run_id: str, expected: str, status: str, message: str) -> None:
             raise ValueError('This run already changed state. Refresh before trying again.')
 
 
-def eligible_harnesses() -> List[Dict[str, Any]]:
-    all_items = rows("SELECT * FROM harnesses WHERE enabled=1 AND installed=1 ORDER BY chain_position")
+def global_harness_order() -> List[str]:
+    return [item["key"] for item in rows("SELECT key FROM harnesses ORDER BY chain_position")]
+
+
+def scoped_harness_order(scope: str, scope_id: int) -> Optional[List[str]]:
+    """The ordering stored for one scope, or None when it inherits."""
+    stored = rows("SELECT harness_key FROM harness_orders WHERE scope=? AND scope_id=? ORDER BY position",
+                  (scope, scope_id))
+    keys = [item["harness_key"] for item in stored if item["harness_key"] in ADAPTERS]
+    if not keys:
+        return None
+    # A harness added since this override was saved is unknown to it; append it
+    # in global order so a new harness is never silently dropped from a scope.
+    return keys + [key for key in global_harness_order() if key not in keys]
+
+
+def resolve_harness_order(task: Optional[Dict[str, Any]] = None) -> Tuple[List[str], str]:
+    """Task order, else project order, else the global chain."""
+    # Callers sometimes pass a partial task (smoke tests, synthetic rotation
+    # checks); an absent id simply means there is no override at that scope.
+    if task and task.get("id"):
+        own = scoped_harness_order("task", task["id"])
+        if own:
+            return own, "task"
+    if task and task.get("project_id"):
+        project = scoped_harness_order("project", task["project_id"])
+        if project:
+            return project, "project"
+    return global_harness_order(), "global"
+
+
+def set_harness_order(scope: str, scope_id: int, order: List[str]) -> None:
+    if not isinstance(order, list) or set(order) != set(ADAPTERS) or len(order) != len(ADAPTERS):
+        raise ValueError("Order must contain each harness exactly once")
+    with DB_LOCK, db() as conn:
+        conn.execute("DELETE FROM harness_orders WHERE scope=? AND scope_id=?", (scope, scope_id))
+        for position, key in enumerate(order):
+            conn.execute(
+                "INSERT INTO harness_orders(scope,scope_id,harness_key,position,updated_at) VALUES(?,?,?,?,?)",
+                (scope, scope_id, key, position, now()))
+
+
+def clear_harness_order(scope: str, scope_id: int) -> None:
+    execute("DELETE FROM harness_orders WHERE scope=? AND scope_id=?", (scope, scope_id))
+
+
+def eligible_harnesses(task: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    order, _ = resolve_harness_order(task)
+    by_key = {item["key"]: item for item in rows("SELECT * FROM harnesses WHERE enabled=1 AND installed=1")}
+    all_items = [by_key[key] for key in order if key in by_key]
     moment = datetime.now(timezone.utc)
     available = []
     for item in all_items:
@@ -1235,15 +1322,13 @@ def eligible_harnesses() -> List[Dict[str, Any]]:
 
 
 def choose_harness(task: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
-    candidates = eligible_harnesses()
+    candidates = eligible_harnesses(task)
+    models = model_snapshot(task)
     if task["preferred_harness"]:
         for candidate in candidates:
             if candidate["key"] == task["preferred_harness"]:
-                chosen = dict(candidate)
-                if task["preferred_model"]:
-                    chosen['model'] = task['preferred_model']
-                return chosen, "preferred"
-    return (candidates[0], "fallback") if candidates else (None, "none")
+                return with_effective_model(candidate, models), "preferred"
+    return (with_effective_model(candidates[0], models), "fallback") if candidates else (None, "none")
 
 
 def choose_session_harness(task: Dict[str, Any], session: Dict[str, Any], allow_failover: bool = False) -> Tuple[Optional[Dict[str, Any]], str]:
@@ -1260,11 +1345,42 @@ def choose_session_harness(task: Dict[str, Any], session: Dict[str, Any], allow_
             if chosen.get('cooldown_until') and datetime.fromisoformat(chosen['cooldown_until']) > datetime.now(timezone.utc):
                 chosen = None
             else:
-                chosen = dict(chosen)
-                if session.get('model'):
-                    chosen['model'] = session['model']
+                # A model chosen after this session opened applies to its next
+                # attempt; only an unchanged configuration keeps the recorded one.
+                chosen = with_effective_model(chosen, model_snapshot(task))
                 return chosen, 'session continuity'
     return choose_harness(task)
+
+
+def task_attachments(task_id: int) -> List[Dict[str, Any]]:
+    """Every attachment still on disk for this task, oldest first.
+
+    Attachments stay with the task rather than one session: a screenshot added
+    before a rollover is usually still the thing being worked on afterwards.
+    """
+    return attachment_store.existing(
+        rows("SELECT * FROM task_attachments WHERE task_id=? ORDER BY id", (task_id,)))
+
+
+# A new task carries its first files in the create request itself, so they are
+# stored before the harness can start; a larger set is added from the task page.
+MAX_NEW_TASK_ATTACHMENTS = 10
+
+
+def store_task_attachment(task_id: int, session_id: int, filename: str, data: bytes,
+                          message_id: Optional[int] = None) -> int:
+    stored = attachment_store.save(DATA_ROOT, task_id, filename, data)
+    return execute("""INSERT INTO task_attachments(task_id,session_id,message_id,filename,media_type,kind,
+        byte_size,sha256,stored_path,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (task_id, session_id, message_id, stored['filename'], stored['media_type'], stored['kind'],
+         stored['byte_size'], stored['sha256'], stored['stored_path'], now()))
+
+
+def task_attachment_or_404(task_id: int, attachment_id: int) -> Dict[str, Any]:
+    record = one("SELECT * FROM task_attachments WHERE id=? AND task_id=?", (attachment_id, task_id))
+    if not record:
+        raise ValueError("Attachment not found")
+    return record
 
 
 def task_prompt(task: Dict[str, Any], project: Dict[str, Any]) -> str:
@@ -1274,12 +1390,15 @@ def task_prompt(task: Dict[str, Any], project: Dict[str, Any]) -> str:
     current_progress = json.dumps(session_attempt_summary(session['id']), indent=2)[-12000:]
     handoff = latest_handoff(task['id'])
     handoff_context = json.dumps(handoff, indent=2)[-16000:] if handoff else 'No previous session.'
+    described = attachment_store.describe(task_attachments(task['id']))
+    attached = ('\n' + described + '\n') if described else ''
     return f"""You are continuing a task session in the working directory provided to this process.
 
 Task: {task['text']}
 
 Conversation:
 {conversation or task['text']}
+{attached}
 
 Previous sealed-session handoff (may be incomplete; verify against the code):
 {handoff_context}
@@ -1306,8 +1425,71 @@ def permission_snapshot(task: Dict[str, Any]) -> Dict[str, str]:
             for h in rows('SELECT * FROM harnesses')}
 
 
-def configured_command(harness: Dict[str, Any], root: Path, prompt: str, override: Optional[str] = None) -> List[str]:
-    return build_configured_command(ADAPTERS, harness, root, prompt, override)
+MODEL_TABLES = {'project': ('project_harness_models', 'project_id'), 'task': ('task_harness_models', 'task_id')}
+
+
+def scoped_models(scope: str, owner_id: int) -> Dict[str, str]:
+    """The model choices recorded at one scope. A missing key means inherit."""
+    table, column = MODEL_TABLES[scope]
+    return {item['harness_key']: item['model'] for item in
+            rows('SELECT harness_key,model FROM %s WHERE %s=?' % (table, column), (owner_id,))}
+
+
+def save_scoped_model(scope: str, owner_id: int, key: str, model: Optional[str]) -> None:
+    """Record or clear one scope's model choice. Clearing restores inheritance
+    rather than freezing the wider scope's current value."""
+    table, column = MODEL_TABLES[scope]
+    if model is None:
+        execute('DELETE FROM %s WHERE %s=? AND harness_key=?' % (table, column), (owner_id, key))
+        return
+    execute('INSERT INTO %s(%s,harness_key,model,updated_at) VALUES(?,?,?,?) '
+            'ON CONFLICT(%s,harness_key) DO UPDATE SET model=excluded.model,updated_at=excluded.updated_at'
+            % (table, column, column), (owner_id, key, model, now()))
+
+
+def requested_model(value: Any) -> Optional[str]:
+    """A model choice is an explicit ID, or None for "inherit the wider scope"."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text == 'inherit':
+        return None
+    if len(text) > 160:
+        raise ValueError('Model ID is too long')
+    return text
+
+
+def model_snapshot(task: Optional[Dict[str, Any]] = None, project_id: Optional[int] = None) -> Dict[str, Dict[str, str]]:
+    """Effective model per harness, with the scope that decided it.
+
+    Rotation membership stays global; each scope only narrows which model the
+    harness runs. A project narrows it for its own work and a task narrows it
+    again for one goal, so nothing a user sets leaks outward.
+    """
+    snapshot = {item['key']: {'model': item['model'] or 'default', 'source': 'global'}
+                for item in rows('SELECT key,model FROM harnesses')}
+    owner = project_id if project_id is not None else (task or {}).get('project_id')
+    for scope, owner_id in (('project', owner), ('task', (task or {}).get('id'))):
+        for key, model in (scoped_models(scope, owner_id).items() if owner_id else ()):
+            if key in snapshot:
+                snapshot[key] = {'model': model, 'source': scope}
+    if task and task.get('preferred_model') and task.get('preferred_harness') in snapshot:
+        # The task's own harness pin predates scoped models and still applies.
+        if snapshot[task['preferred_harness']]['source'] != 'task':
+            snapshot[task['preferred_harness']] = {'model': task['preferred_model'], 'source': 'task'}
+    return snapshot
+
+
+def with_effective_model(harness: Dict[str, Any], snapshot: Dict[str, Dict[str, str]]) -> Dict[str, Any]:
+    chosen = dict(harness)
+    chosen['model'] = snapshot.get(harness['key'], {}).get('model') or harness.get('model') or 'default'
+    return chosen
+
+
+def configured_command(harness: Dict[str, Any], root: Path, prompt: str, override: Optional[str] = None,
+                       memory: Optional[str] = None,
+                       attachments: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+    return build_configured_command(ADAPTERS, harness, root, prompt, override, memory, attachments)
 
 
 def stream_process(command: List[str], cwd: Path, output_file: Path) -> Tuple[int, str]:
@@ -1320,6 +1502,27 @@ def make_worktree(project: Dict[str, Any], run_id: str) -> Tuple[Path, str, str]
 
 def worktree_diff(attempt: Dict[str, Any]) -> str:
     return worktrees.worktree_diff(attempt, git)
+
+
+def attempt_files(attempt: Dict[str, Any]) -> Dict[str, Any]:
+    """The files one attempt produced, as the dashboard shows them.
+
+    A remote attempt keeps its work in the Coder runner, and a merged local one
+    may have had its worktree removed, so the answer says why a list is empty
+    rather than implying the harness changed nothing.
+    """
+    root = Path(attempt.get('worktree_path') or '')
+    if not root.is_dir():
+        remote = str(attempt.get('worktree_path') or '').startswith('/home/coder/')
+        return {'files': [], 'available': False,
+                'reason': 'This attempt worked in a Coder runner; review its files through the diff and transcript.'
+                          if remote else 'This attempt’s workspace is no longer on this machine.'}
+    files = []
+    for item in worktrees.changed_files(attempt, git):
+        media, _ = mimetypes.guess_type(item['path'])
+        files.append(dict(item, media_type=media or 'text/plain',
+                          kind='image' if (media or '').startswith('image/') else 'file'))
+    return {'files': files, 'available': True, 'worktree': str(root)}
 
 
 def cleanup_worktree(repo: Path, worktree: Path) -> None:
@@ -1495,7 +1698,8 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
         execute("UPDATE attempts SET log_path=? WHERE id=?", (str(file), attempt_id))
         update_run(run_id, "running", f"{harness['label']} · {harness['model']} is working in {worktree}. Waiting for CLI output…", attempt_id)
         run = one('SELECT * FROM runs WHERE id=?', (run_id,))
-        command = configured_command(harness, worktree, task_prompt(task, project), permission_mode)
+        command = configured_command(harness, worktree, task_prompt(task, project), permission_mode,
+                                     task.get('memory_mode'), task_attachments(task_id))
         reply_file = file.with_suffix('.reply.txt')
         if command[0] == 'codex':
             command = command[:-1] + ['--output-last-message', str(reply_file)] + command[-1:]
@@ -1608,7 +1812,15 @@ def serialize_project(project: Dict[str, Any]) -> Dict[str, Any]:
     project["tasks"] = rows("SELECT * FROM tasks WHERE project_id=? ORDER BY task_order", (project["id"],))
     project['coder_profile'] = project_coder_profile(project['id'])
     project['board_views'] = [dict(item, config=json.loads(item['config_json'])) for item in rows('SELECT * FROM board_views WHERE project_id=? ORDER BY id', (project['id'],))]
+    project['harness_models'] = model_snapshot(project_id=project['id'])
+    task_models: Dict[int, Dict[str, str]] = {}
+    for item in rows('SELECT m.task_id,m.harness_key,m.model FROM task_harness_models m '
+                     'JOIN tasks t ON t.id=m.task_id WHERE t.project_id=?', (project['id'],)):
+        task_models.setdefault(item['task_id'], {})[item['harness_key']] = item['model']
     for task in project['tasks']:
+        task['harness_models'] = task_models.get(task['id'], {})
+        if task['preferred_harness'] in ADAPTERS and task['preferred_model']:
+            task['harness_models'].setdefault(task['preferred_harness'], task['preferred_model'])
         history = rows('SELECT harness_key,status,integrity_status FROM task_sessions WHERE task_id=? ORDER BY session_number', (task['id'],))
         task['session_count'] = len(history)
         task['harness_history'] = list(dict.fromkeys(item['harness_key'] for item in history if item['harness_key']))
@@ -1674,7 +1886,12 @@ class API(SimpleHTTPRequestHandler):
         if not origin:
             return True
         host = self.headers.get("Host", "")
-        return origin == "http://" + host or (host.startswith("127.0.0.1:") and origin == "http://127.0.0.1:5173")
+        if origin == "http://" + host:
+            return True
+        # The Vite dev server serves the same product on 5173 and proxies /api
+        # here, under either loopback hostname.
+        loopback = ("127.0.0.1", "localhost")
+        return host.split(":")[0] in loopback and origin in ["http://%s:5173" % name for name in loopback]
 
     def do_GET(self) -> None:
         route = urlparse(self.path).path
@@ -1685,6 +1902,30 @@ class API(SimpleHTTPRequestHandler):
                     harness['availability'] = harness_availability(harness)
                 self.send_json({"api_version": 9, "projects": [serialize_project(item) for item in rows("SELECT * FROM projects ORDER BY id DESC")], "harnesses": harnesses,
                                 "coder_servers": [public_coder_server(item) for item in rows('SELECT * FROM coder_servers ORDER BY name')], "adapters": adapter_metadata()})
+                return
+            if route == "/api/harness-order":
+                scope, scope_id = harness_order_scope(
+                    parse_qs(urlparse(self.path).query).get("scope", ["global"])[0])
+                if scope == "global":
+                    self.send_json({"order": global_harness_order(), "source": "global",
+                                    "inherited": global_harness_order(), "overridden": False})
+                    return
+                own = scoped_harness_order(scope, scope_id)
+                if scope == "task":
+                    task = one("SELECT * FROM tasks WHERE id=?", (scope_id,))
+                    inherited = scoped_harness_order("project", task["project_id"]) or global_harness_order()
+                else:
+                    inherited = global_harness_order()
+                self.send_json({"order": own or inherited, "source": scope if own else "inherited",
+                                "inherited": inherited, "overridden": bool(own)})
+                return
+            if route == "/api/memories":
+                self.send_json(memory_store.overview(rows("SELECT * FROM projects ORDER BY id DESC")))
+                return
+            match = re.fullmatch(r"/api/memories/(\w+)", route)
+            if match:
+                scope = parse_qs(urlparse(self.path).query).get("scope", ["global"])[0]
+                self.send_json(memory_store.entries(memory_harness(match.group(1)), memory_scope(scope)))
                 return
             match = re.match(r'^/api/coder-servers/(\d+)/runner$', route)
             if match:
@@ -1757,6 +1998,7 @@ class API(SimpleHTTPRequestHandler):
                     if problem:
                         blockers.append(problem)
                 self.send_json({"task": task, "next_harness": {'key': selected['key'], 'label': selected['label'], 'model': selected['model'], 'selection': selection} if selected else None,
+                    "harness_models": model_snapshot(task),
                     "run": task_run,
                     "connection_action": run_connection_action(task_run),
                     "lease": execution_lease(task_run['id']) if task_run else None,
@@ -1764,7 +2006,24 @@ class API(SimpleHTTPRequestHandler):
                     "blockers": blockers,
                     "messages": conversation_messages(task_id),
                     "sessions": sessions_for_task(task_id),
+                    "attachments": task_attachments(task_id),
                     "attempts": [present_attempt(a) for a in rows("SELECT * FROM attempts WHERE task_id=? ORDER BY id", (task_id,))]})
+                return
+            match = re.match(r"^/api/tasks/(\d+)/attachments/(\d+)$", route)
+            if match:
+                record = task_attachment_or_404(int(match.group(1)), int(match.group(2)))
+                path = Path(record['stored_path'])
+                if not path.is_file():
+                    raise ValueError('That attachment is no longer stored on this machine.')
+                self.send_response(200)
+                self.send_header('Content-Type', record['media_type'])
+                self.send_header('Content-Length', str(path.stat().st_size))
+                # Inline so the dashboard can preview an image; the filename is
+                # the sanitized one, never the browser's original text.
+                self.send_header('Content-Disposition', 'inline; filename="%s"' % record['filename'])
+                self.end_headers()
+                with path.open('rb') as handle:
+                    shutil.copyfileobj(handle, self.wfile)
                 return
             match = re.match(r"^/api/projects/(\d+)/attempts$", route)
             if match:
@@ -1780,6 +2039,28 @@ class API(SimpleHTTPRequestHandler):
                     self.send_json({"diff": attempt["diff_output"], "worktree": attempt["worktree_path"]})
                     return
                 self.send_json({"diff": worktree_diff(attempt), "worktree": attempt["worktree_path"]})
+                return
+            match = re.match(r"^/api/attempts/(\d+)/files$", route)
+            if match:
+                attempt = one("SELECT * FROM attempts WHERE id=?", (int(match.group(1)),))
+                if not attempt:
+                    raise ValueError("Attempt not found")
+                listing = attempt_files(attempt)
+                wanted = parse_qs(urlparse(self.path).query).get('path', [None])[0]
+                if wanted is None:
+                    self.send_json(listing)
+                    return
+                chosen = next((item for item in listing['files'] if item['path'] == wanted and item['exists']), None)
+                if not chosen:
+                    raise ValueError("That file is not part of this attempt's changes.")
+                path = worktrees.resolve_within(Path(attempt['worktree_path']), wanted)
+                self.send_response(200)
+                self.send_header('Content-Type', chosen['media_type'])
+                self.send_header('Content-Length', str(path.stat().st_size))
+                self.send_header('Content-Disposition', 'inline; filename="%s"' % attachment_store.safe_name(wanted))
+                self.end_headers()
+                with path.open('rb') as handle:
+                    shutil.copyfileobj(handle, self.wfile)
                 return
             match = re.match(r"^/api/attempts/(\d+)/log$", route)
             if match:
@@ -1799,6 +2080,12 @@ class API(SimpleHTTPRequestHandler):
                 with path.open('rb') as handle:
                     shutil.copyfileobj(handle,self.wfile)
                 return
+            # An unmatched /api path is a bug or a stale server, not a file
+            # request.  Answering in JSON keeps the client's error readable
+            # instead of handing it the index page with an HTML content type.
+            if route.startswith("/api/"):
+                self.send_json({"error": "Unknown API route: %s. If you just updated Aludra, restart the Python server." % route}, 404)
+                return
             # The React product has one canonical surface at /.  Preserve old
             # bookmarks without letting /ui/index.html serve the retired UI.
             self.path = "/index.html" if route == '/' or route == '/legacy' or route == '/ui' or route.startswith('/ui/') else route
@@ -1815,6 +2102,24 @@ class API(SimpleHTTPRequestHandler):
             if not self.headers.get("Content-Type", "").startswith("application/json"):
                 raise ValueError("Expected a JSON request")
             payload = self.body()
+            if route == "/api/memories/claude/global":
+                self.send_json(memory_store.claude_set_global(
+                    bool(payload.get("enabled")), payload.get("directory")))
+                return
+            if route == "/api/memories/codex/enable":
+                self.send_json(memory_store.codex_enable())
+                return
+            match = re.fullmatch(r"/api/memories/(\w+)/notes", route)
+            if match:
+                memory_harness(match.group(1))
+                self.send_json(memory_store.codex_add_note(str(payload.get("text", ""))))
+                return
+            match = re.fullmatch(r"/api/memories/(\w+)", route)
+            if match:
+                self.send_json(memory_store.save(
+                    memory_harness(match.group(1)),
+                    memory_scope(str(payload.get("scope", "global"))), payload))
+                return
             match = re.fullmatch(r'/api/projects/(\d+)/board-views', route)
             if match:
                 project_id = int(match[1])
@@ -1951,10 +2256,37 @@ class API(SimpleHTTPRequestHandler):
                 order = payload.get('order')
                 if not isinstance(order, list) or len(order) != len(ADAPTERS) or any(not isinstance(key, str) for key in order) or set(order) != set(ADAPTERS):
                     raise ValueError('Order must contain each harness exactly once')
-                with DB_LOCK, db() as conn:
-                    for position, key in enumerate(order):
-                        conn.execute('UPDATE harnesses SET chain_position=?,updated_at=? WHERE key=?', (position, now(), key))
-                self.send_json({'ok': True})
+                scope, scope_id = harness_order_scope(str(payload.get('scope', 'global')))
+                if scope == 'global':
+                    with DB_LOCK, db() as conn:
+                        for position, key in enumerate(order):
+                            conn.execute('UPDATE harnesses SET chain_position=?,updated_at=? WHERE key=?', (position, now(), key))
+                else:
+                    set_harness_order(scope, scope_id, order)
+                self.send_json({'ok': True, 'scope': scope})
+                return
+            match = re.match(r'^/api/(projects|tasks)/(\d+)/harness-models$', route)
+            if match:
+                scope = 'project' if match.group(1) == 'projects' else 'task'
+                owner_id = int(match.group(2))
+                key = str(payload.get('harness') or '')
+                if key not in ADAPTERS:
+                    raise ValueError('Unknown harness')
+                model = requested_model(payload.get('model'))
+                if scope == 'project':
+                    project_or_404(owner_id)
+                    save_scoped_model(scope, owner_id, key, model)
+                else:
+                    task = one('SELECT * FROM tasks WHERE id=?', (owner_id,))
+                    if not task:
+                        raise ValueError('Task not found')
+                    save_scoped_model(scope, owner_id, key, model)
+                    if task.get('preferred_harness') == key:
+                        # Keep the legacy pin and the scoped choice from disagreeing.
+                        execute('UPDATE tasks SET preferred_model=? WHERE id=?', (model, owner_id))
+                self.send_json({'harness_models': model_snapshot(
+                    one('SELECT * FROM tasks WHERE id=?', (owner_id,)) if scope == 'task' else None,
+                    project_id=owner_id if scope == 'project' else None)})
                 return
             if route == "/api/directories":
                 self.send_json(browse_directory(payload.get("path")))
@@ -2048,14 +2380,31 @@ class API(SimpleHTTPRequestHandler):
                 permissions = payload.get('tool_permissions', 'inherit')
                 if permissions not in ('inherit', 'standard', 'auto', 'ask'):
                     raise ValueError('Unknown task permission mode')
+                memory_mode = payload.get('memory_mode', 'inherit')
+                if memory_mode not in ('inherit', 'read_write', 'read_only', 'off'):
+                    raise ValueError('Unknown task memory mode')
+                # Decode before creating anything: a rejected file should not
+                # leave a half-described task on the board.
+                incoming = payload.get('attachments') or []
+                if not isinstance(incoming, list) or len(incoming) > MAX_NEW_TASK_ATTACHMENTS:
+                    raise ValueError('Attach at most %d files when creating a task.' % MAX_NEW_TASK_ATTACHMENTS)
+                pending = [(str(item.get('filename') or ''), attachment_store.decode(item.get('data')))
+                           for item in incoming]
+                for filename, _ in pending:
+                    attachment_store.classify(filename)
                 with DB_LOCK:
                     order = one("SELECT COALESCE(MAX(task_order),-1)+1 AS n FROM tasks WHERE project_id=?", (project_id,))["n"]
                     task_id = execute("INSERT INTO tasks(project_id,text,task_order,status,created_at) VALUES(?,?,?,'pending',?)",
                         (project_id, task_text.splitlines()[0][:120], order, now()))
                     execute("UPDATE tasks SET board_position=? WHERE id=?", (order, task_id))
-                    execute('UPDATE tasks SET tool_permissions=? WHERE id=?', (permissions, task_id))
+                    execute('UPDATE tasks SET tool_permissions=?,memory_mode=? WHERE id=?',
+                            (permissions, memory_mode, task_id))
                     session_id = execute("INSERT INTO task_sessions(task_id,session_number,status,opened_at) VALUES(?,1,'active',?)", (task_id, now()))
-                    execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,'user',?,?)", (task_id, session_id, task_text, now()))
+                    message_id = execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,'user',?,?)", (task_id, session_id, task_text, now()))
+                for filename, data in pending:
+                    store_task_attachment(task_id, session_id, filename, data, message_id)
+                # Attachments are stored before the run is requested, so a task
+                # started on creation still reaches its harness with them.
                 submission = request_run(project_id, task_id) if payload.get('start') else None
                 self.send_json({"id": task_id, 'submission': submission}, 201)
                 return
@@ -2087,6 +2436,17 @@ class API(SimpleHTTPRequestHandler):
                 pull_request = one("SELECT * FROM task_pull_requests WHERE task_id=? AND url=?", (task_id, url))
                 self.send_json({'pull_request': pull_request}, 201)
                 return
+            match = re.match(r"^/api/tasks/(\d+)/attachments$", route)
+            if match:
+                task_id = int(match.group(1))
+                task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
+                if not task:
+                    raise ValueError("Task not found")
+                attachment_id = store_task_attachment(
+                    task_id, active_session(task_id)['id'], str(payload.get('filename') or ''),
+                    attachment_store.decode(payload.get('data')))
+                self.send_json({'attachment': one("SELECT * FROM task_attachments WHERE id=?", (attachment_id,))}, 201)
+                return
             match = re.match(r"^/api/tasks/(\d+)/messages$", route)
             if match:
                 task_id = int(match.group(1))
@@ -2100,7 +2460,11 @@ class API(SimpleHTTPRequestHandler):
                 if active and active['task_id'] == task_id:
                     raise ValueError("This task has an active run; wait for it to finish before adding new instructions")
                 session = active_session(task_id)
-                execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,'user',?,?)", (task_id, session['id'], content, now()))
+                message_id = execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,'user',?,?)", (task_id, session['id'], content, now()))
+                # Attachments are uploaded before the message they belong to;
+                # sending the message is what ties them to a point in the thread.
+                execute("UPDATE task_attachments SET message_id=?,session_id=? WHERE task_id=? AND message_id IS NULL",
+                        (message_id, session['id'], task_id))
                 execute("UPDATE tasks SET status='pending' WHERE id=?", (task_id,))
                 submission = request_run(task['project_id'], task_id) if payload.get('start') else None
                 self.send_json({"ok": True, 'submission': submission}, 201)
@@ -2232,9 +2596,11 @@ class API(SimpleHTTPRequestHandler):
                 task = one("SELECT * FROM tasks WHERE id=?", (task_id,))
                 if not task:
                     raise ValueError("Task not found")
-                fields = {name: payload[name] for name in ("text", "mode_override", "preferred_harness", "preferred_model", "force_gate", "degradable", "tool_permissions", "execution_target", "session_budget_chars") if name in payload}
+                fields = {name: payload[name] for name in ("text", "mode_override", "preferred_harness", "preferred_model", "force_gate", "degradable", "tool_permissions", "memory_mode", "execution_target", "session_budget_chars") if name in payload}
                 if 'tool_permissions' in fields and fields['tool_permissions'] not in ('inherit','standard','auto','ask'):
                     raise ValueError('Unknown task permission mode')
+                if 'memory_mode' in fields and fields['memory_mode'] not in ('inherit', 'read_write', 'read_only', 'off'):
+                    raise ValueError('Unknown task memory mode')
                 if not fields: raise ValueError("No task updates supplied")
                 if "text" in fields:
                     fields["text"] = str(fields["text"]).strip()[:120]
@@ -2253,6 +2619,11 @@ class API(SimpleHTTPRequestHandler):
                         raise ValueError('Session context budget must be between 0 and 500,000 characters; use 0 to disable automatic rollover.')
                 assignments = ", ".join(f"{name}=?" for name in fields)
                 execute(f"UPDATE tasks SET {assignments} WHERE id=?", tuple(fields.values()) + (task_id,))
+                if 'preferred_model' in fields or 'preferred_harness' in fields:
+                    saved = one("SELECT preferred_harness,preferred_model FROM tasks WHERE id=?", (task_id,))
+                    if saved['preferred_harness'] in ADAPTERS:
+                        save_scoped_model('task', task_id, saved['preferred_harness'],
+                                          requested_model(saved['preferred_model']))
                 self.send_json({"ok": True}); return
             match = re.match(r"^/api/projects/(\d+)/task-order$", route)
             if match:
@@ -2278,6 +2649,27 @@ class API(SimpleHTTPRequestHandler):
             if not self.is_dashboard_origin():
                 self.send_json({"error": "Requests must come from this dashboard"}, 403)
                 return
+            if route == "/api/harness-order":
+                scope, scope_id = harness_order_scope(
+                    parse_qs(urlparse(self.path).query).get("scope", ["global"])[0])
+                if scope == "global":
+                    raise ValueError("The global order is the root; it has nothing to inherit")
+                clear_harness_order(scope, scope_id)
+                self.send_json({"ok": True})
+                return
+            match = re.fullmatch(r"/api/memories/(\w+)/([a-z0-9-]+)", route)
+            if match:
+                scope = parse_qs(urlparse(self.path).query).get("scope", ["global"])[0]
+                self.send_json(memory_store.delete(
+                    memory_harness(match.group(1)), memory_scope(scope), match.group(2)))
+                return
+            match = re.match(r"^/api/tasks/(\d+)/attachments/(\d+)$", route)
+            if match:
+                record = task_attachment_or_404(int(match.group(1)), int(match.group(2)))
+                attachment_store.remove(record)
+                execute("DELETE FROM task_attachments WHERE id=?", (record['id'],))
+                self.send_json({"ok": True})
+                return
             match = re.match(r"^/api/tasks/(\d+)$", route)
             if not match:
                 raise ValueError("Unknown API route")
@@ -2288,10 +2680,13 @@ class API(SimpleHTTPRequestHandler):
             active = current_run(task["project_id"])
             if active and active["task_id"] == task_id:
                 raise ValueError("Finish or close this task's active run before deleting it")
+            attachment_store.remove_task(DATA_ROOT, task_id)
             with DB_LOCK, db() as conn:
+                conn.execute("DELETE FROM task_attachments WHERE task_id=?", (task_id,))
                 conn.execute("DELETE FROM task_messages WHERE task_id=?", (task_id,))
                 conn.execute("DELETE FROM attempts WHERE task_id=?", (task_id,))
                 conn.execute("DELETE FROM runs WHERE task_id=?", (task_id,))
+                conn.execute("DELETE FROM harness_orders WHERE scope='task' AND scope_id=?", (task_id,))
                 conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
                 remaining = conn.execute("SELECT id FROM tasks WHERE project_id=? ORDER BY task_order", (task["project_id"],)).fetchall()
                 for position, item in enumerate(remaining):

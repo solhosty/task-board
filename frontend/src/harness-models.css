@@ -1,0 +1,6 @@
+.harness-order li .harness-state{margin-left:auto;color:var(--muted);font-size:11px}
+.harness-order li .harness-model{flex:none;width:212px}
+.harness-order li .model-select{min-height:34px;font-size:12px}
+.harness-order li b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.select-content{max-height:min(320px,var(--radix-select-content-available-height));overflow-y:auto}
+@media(max-width:760px){.harness-order li{flex-wrap:wrap}.harness-order li .harness-model{width:100%}}

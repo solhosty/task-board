@@ -110,6 +110,6 @@ Models screen if Codex is not yet authenticated.
 Relevant implementation files:
 
 - `app.py` — dashboard API, runner lifecycle, dispatch, state transitions.
-- `remote_worktree.py` — isolated remote Git checkout creation.
-- `remote_agent_runner.py` — bounded in-runner Codex/Claude execution.
+- `infra/runner/remote_worktree.py` — isolated remote Git checkout creation.
+- `infra/runner/remote_agent_runner.py` — bounded in-runner Codex/Claude execution.
 - `CODER_PHASE_1.md` — detailed architecture and decisions.

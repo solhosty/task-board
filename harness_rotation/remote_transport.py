@@ -8,6 +8,17 @@ import shlex
 import subprocess
 from typing import Any, Dict, Tuple
 
+# Helper programs that execute *inside* the Coder runner rather than here. They
+# are sent over SSH as stdin, so they must stay stdlib-only and must never
+# import from this package. `infra/runner/` is their one canonical location.
+RUNNER_PAYLOADS = Path("infra") / "runner"
+
+
+def payload(app_root: Path, name: str) -> str:
+    """Read a runner payload program for transmission over Coder SSH."""
+    return (app_root / RUNNER_PAYLOADS / name).read_text()
+
+
 
 def agent_request(harness: Dict[str, Any], worktree: Dict[str, Any], prompt: str,
                   project: Dict[str, Any], permission_mode: str) -> str:
@@ -51,7 +62,7 @@ def workspace_snapshot(runner: Dict[str, Any], environment: Dict[str, str], work
     try:
         checked = subprocess.run(
             ["coder", "ssh", "--wait", "yes", runner["workspace_name"], "--", command],
-            input=(app_root / "remote_workspace_snapshot.py").read_text(), env=environment,
+            input=payload(app_root, "remote_workspace_snapshot.py"), env=environment,
             capture_output=True, text=True, timeout=45,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -85,7 +96,7 @@ def run_agent(runner: Dict[str, Any], environment: Dict[str, str], command: str,
         text=True, bufsize=1,
     )
     assert process.stdin and process.stdout
-    process.stdin.write((app_root / "remote_agent_runner.py").read_text())
+    process.stdin.write(payload(app_root, "remote_agent_runner.py"))
     process.stdin.close()
     captured = []
     with output_file.open("w", encoding="utf-8") as handle:
@@ -115,7 +126,7 @@ def _run_delivery_helper(runner: Dict[str, Any], environment: Dict[str, str], co
         stderr=subprocess.STDOUT, text=True,
     )
     assert process.stdin and process.stdout
-    process.stdin.write((app_root / "remote_delivery_runner.py").read_text())
+    process.stdin.write(payload(app_root, "remote_delivery_runner.py"))
     process.stdin.close()
     transcript = process.stdout.read()
     code = process.wait()

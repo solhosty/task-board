@@ -8,13 +8,22 @@ export async function api<T = any>(path:string, method='GET', body?:unknown):Pro
 }
 export type Run={id:string;status:string;message:string;attempt_id?:number};
 export type PR={id:number;url:string;number:number;state:string;review_state:string};
-export type Task={id:number;project_id:number;text:string;status:string;workflow_stage?:string;board_position:number;run?:Run;session_count:number;harness_history:string[];active_harness?:string;integrity_status:string;pull_requests:PR[];execution_backend:string;execution_target_label:string;created_at:string;[key:string]:any};
+export type Task={id:number;project_id:number;text:string;status:string;workflow_stage?:string;board_position:number;run?:Run;session_count:number;harness_history:string[];active_harness?:string;integrity_status:string;pull_requests:PR[];execution_backend:string;execution_target_label:string;harness_models:Record<string,string>;created_at:string;[key:string]:any};
 export type ViewConfig={stages:string[];layout:string;density:string;fields:string[];sort:string};
 export type SavedView={id:number;name:string;config:ViewConfig};
-export type Project={id:number;name:string;repo_path:string;tasks:Task[];board_views:SavedView[];coder_profile:any;[key:string]:any};
+export type Project={id:number;name:string;repo_path:string;tasks:Task[];board_views:SavedView[];coder_profile:any;harness_models:Record<string,ModelChoice>;[key:string]:any};
 export type Harness={key:string;label:string;enabled:number;installed:number;model:string;availability:{code:string;label:string;reason:string};[key:string]:any};
-export type Bootstrap={api_version:number;projects:Project[];harnesses:Harness[];coder_servers:any[];adapters:Record<string,any>};
+export type ModelChoice={model:string;source:string};
+export type AdapterInfo={models:string[];model_source:string;runnable:boolean};
+export type Bootstrap={api_version:number;projects:Project[];harnesses:Harness[];coder_servers:any[];adapters:Record<string,AdapterInfo>};
+export function modelName(id:string){return id==='default'?'Harness default':id;}
 export const stages:Record<string,string>={planned:'Planned',running:'Running',review:'Needs review',done:'Done'};
 export function stageOf(task:Task):string {if(task.workflow_stage)return task.workflow_stage; if(task.status==='completed'||task.run?.status==='complete')return 'done';if(['awaiting_review','awaiting_commit'].includes(task.run?.status||''))return 'review';if(['running','queued','verifying','rotating','committing','awaiting_dispatch','awaiting_capacity','awaiting_resume','paused_cooldown','awaiting_external_auth'].includes(task.run?.status||''))return 'running';return 'planned';}
 export function attention(task:Task):string {if(task.integrity_status==='mismatch')return 'Workspace state needs review';return ({awaiting_review:'Review completed work',awaiting_commit:'Approve delivery',awaiting_dispatch:'Approve harness start',awaiting_resume:'Approve continuation',awaiting_external_auth:'Connect repository account',stopped:'Investigate stopped task',blocked:'Resolve execution blocker'} as Record<string,string>)[task.run?.status||'']||'';}
 export function label(value?:string){return (value||'Ready').replaceAll('_',' ').replace(/^\w/,x=>x.toUpperCase());}
+export type MemoryEntry={id:string;title:string;description:string;type:string;body:string;updated_at:string;path:string};
+export type MemoryScope={key:string;label:string;project_id?:number;available:boolean;count:number;path:string|null};
+export type MemoryHarness={key:string;label:string;status:string;summary:string;global_enabled:boolean;supports_notes:boolean;scopes:MemoryScope[]};
+export type MemoryOverview={types:string[];harnesses:MemoryHarness[]};
+export type MemoryList={entries:MemoryEntry[];path:string;pending:boolean};
+export type HarnessOrderState={order:string[];source:string;inherited:string[];overridden:boolean};

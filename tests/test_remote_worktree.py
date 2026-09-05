@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 
-from remote_worktree import prepare, validate_source
+from infra.runner.remote_worktree import prepare, validate_source
 
 
 class RemoteWorktreeTests(unittest.TestCase):

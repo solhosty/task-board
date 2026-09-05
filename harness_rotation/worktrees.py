@@ -70,6 +70,53 @@ def worktree_diff(attempt: Dict[str, Any], git: Git) -> str:
     return diff
 
 
+def changed_files(attempt: Dict[str, Any], git: Git) -> List[Dict[str, Any]]:
+    """Every file this attempt added or changed in its worktree.
+
+    This is the diff expressed as files rather than as text, so the dashboard
+    can show what a harness produced -- including the binary results a textual
+    diff can only describe as "binary files differ".
+    """
+    root = Path(attempt.get("worktree_path") or "")
+    if not root.is_dir() or not attempt.get("base_sha"):
+        return []
+    listed: List[Dict[str, Any]] = []
+    status = git(["diff", "--name-status", "-z", attempt["base_sha"], "--"], root, check=False).stdout
+    fields = [field for field in status.split("\0") if field]
+    index = 0
+    while index < len(fields):
+        code = fields[index]
+        # A rename carries both names; the new path is the one on disk now.
+        step = 3 if code[:1] in ("R", "C") else 2
+        path = fields[index + step - 1] if index + step - 1 < len(fields) else None
+        if path:
+            listed.append({"path": path, "status": _CHANGE_NAMES.get(code[:1], "changed")})
+        index += step
+    for path in filter(None, git(["ls-files", "--others", "--exclude-standard", "-z"], root).stdout.split("\0")):
+        listed.append({"path": path, "status": "added"})
+    for item in listed:
+        file = root / item["path"]
+        item["exists"] = file.is_file()
+        item["byte_size"] = file.stat().st_size if item["exists"] else 0
+    return sorted(listed, key=lambda item: item["path"])
+
+
+_CHANGE_NAMES = {"A": "added", "M": "modified", "D": "deleted", "R": "renamed", "C": "copied", "T": "changed"}
+
+
+def resolve_within(root: Path, relative: str) -> Path:
+    """One file inside a worktree, or a refusal.
+
+    Attempt paths come back to us over HTTP, and a worktree can hold symlinks a
+    harness created, so resolve both sides before comparing them.
+    """
+    base = root.resolve()
+    target = (base / relative).resolve()
+    if not target.is_file() or base not in target.parents:
+        raise ValueError("That file is not part of this attempt's workspace.")
+    return target
+
+
 def cleanup_worktree(repo: Path, worktree: Path, git: Git) -> None:
     if repo.resolve() != worktree.resolve():
         git(["worktree", "remove", "--force", str(worktree)], repo, check=False)

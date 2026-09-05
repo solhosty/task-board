@@ -116,7 +116,7 @@ class RemoteClaudeLogin:
         environment: Dict[str, str],
         login_script: Optional[Path] = None,
     ):
-        script = login_script or Path(__file__).resolve().parents[1] / "remote_claude_login.py"
+        script = login_script or Path(__file__).resolve().parents[1] / "infra" / "runner" / "remote_claude_login.py"
         source = base64.b64encode(script.read_bytes()).decode()
         launcher = (
             "import base64;exec(compile(base64.b64decode("
