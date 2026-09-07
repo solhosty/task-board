@@ -23,7 +23,7 @@ export function attention(task:Task):string {if(task.integrity_status==='mismatc
 export function label(value?:string){return (value||'Ready').replaceAll('_',' ').replace(/^\w/,x=>x.toUpperCase());}
 export type MemoryEntry={id:string;title:string;description:string;type:string;body:string;updated_at:string;path:string};
 export type MemoryScope={key:string;label:string;project_id?:number;available:boolean;count:number;path:string|null};
-export type MemoryHarness={key:string;label:string;status:string;summary:string;global_enabled:boolean;supports_notes:boolean;scopes:MemoryScope[]};
+export type MemoryHarness={key:string;label:string;status:string;summary:string;count_label:string;count_hint:string|null;global_enabled:boolean;supports_notes:boolean;scopes:MemoryScope[]};
 export type MemoryOverview={types:string[];harnesses:MemoryHarness[]};
 export type MemoryList={entries:MemoryEntry[];path:string;pending:boolean};
 export type HarnessOrderState={order:string[];source:string;inherited:string[];overridden:boolean};
