@@ -1,12 +1,13 @@
 """Validated transport to task helpers running in persistent Coder workspaces."""
 
 import base64
+import hashlib
 import json
 from pathlib import Path
 import re
 import shlex
 import subprocess
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 # Helper programs that execute *inside* the Coder runner rather than here. They
 # are sent over SSH as stdin, so they must stay stdlib-only and must never
@@ -21,16 +22,65 @@ def payload(app_root: Path, name: str) -> str:
 
 
 def agent_request(harness: Dict[str, Any], worktree: Dict[str, Any], prompt: str,
-                  project: Dict[str, Any], permission_mode: str) -> str:
+                  project: Dict[str, Any], permission_mode: str,
+                  attachments: List[Dict[str, Any]] = None) -> str:
     request = {
         "harness": harness["key"], "model": harness.get("model") or "default",
         "prompt": prompt, "permission_mode": permission_mode,
         "worktree_path": worktree["worktree_path"], "base_sha": worktree["base_sha"],
         "verify_command": project.get("verify_command") or "",
         "reply_path": worktree["worktree_path"] + "/.harness-last-message",
+        "attachments": attachments or [],
     }
     encoded = base64.urlsafe_b64encode(json.dumps(request, separators=(",", ":")).encode()).decode()
     return shlex.join(["python3", "-", encoded])
+
+
+def stage_attachments(runner: Dict[str, Any], environment: Dict[str, str], task_key: str,
+                      attachments: List[Dict[str, Any]], app_root: Path) -> List[Dict[str, Any]]:
+    """Copy verified local files to the runner's non-Git attachment store."""
+    if not attachments:
+        return []
+    metadata, transfer = [], []
+    for item in attachments:
+        path = Path(item.get("stored_path") or "")
+        data = path.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != item.get("sha256") or len(data) != item.get("byte_size"):
+            raise RuntimeError("An attachment changed or is missing locally. Remove it or add it again before retrying.")
+        details = {key: item[key] for key in ("id", "filename", "media_type", "kind", "byte_size", "sha256")}
+        metadata.append(details)
+        transfer.append({"sha256": digest, "data": base64.b64encode(data).decode()})
+    request = base64.urlsafe_b64encode(json.dumps({"task_key": task_key, "attachments": metadata}, separators=(",", ":")).encode()).decode()
+    command = shlex.join(["python3", "-c", payload(app_root, "remote_attachment_stager.py"), request])
+    try:
+        checked = subprocess.run(
+            ["coder", "ssh", "--wait", "yes", runner["workspace_name"], "--", command],
+            input=json.dumps(transfer, separators=(",", ":")), env=environment,
+            capture_output=True, text=True, timeout=180,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Attachment transfer to the Coder runner failed; retry this task.") from exc
+    if checked.returncode:
+        raise RuntimeError("Attachment transfer to the Coder runner failed; retry this task.")
+    try:
+        staged = json.loads(checked.stdout)
+    except ValueError as exc:
+        raise RuntimeError("The Coder runner returned an unreadable attachment transfer result; retry this task.") from exc
+    if not isinstance(staged, list) or len(staged) != len(metadata):
+        raise RuntimeError("The Coder runner did not confirm every attachment; retry this task.")
+    expected = {item["id"]: item for item in metadata}
+    if len(expected) != len(metadata) or {item.get("id") for item in staged} != set(expected):
+        raise RuntimeError("The Coder runner did not confirm every attachment; retry this task.")
+    for item in staged:
+        original = expected.get(item.get("id"))
+        remote_path = str(item.get("stored_path") or "")
+        expected_path = "/home/coder/.harness-runner/attachments/%s/%s-%s" % (
+            task_key, original["sha256"][:12], original["filename"])
+        if (not original or item.get("sha256") != original["sha256"] or
+                remote_path != expected_path):
+            raise RuntimeError("The Coder runner returned an invalid attachment location; retry this task.")
+    return staged
 
 
 def delivery_request(worktree: Dict[str, Any], task: Dict[str, Any], profile: Dict[str, Any]) -> str:

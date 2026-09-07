@@ -977,11 +977,6 @@ def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[s
         AND workspace_name IS NOT NULL AND runner_id IS NULL LIMIT 1""", (task['id'],))
     if legacy:
         raise ValueError('This task has a legacy task workspace. It was preserved; create a new task or explicitly migrate its work to a persistent runner.')
-    provider_id = profile.get('auth_provider_id') or 'github'
-    external_auth = coder_external_auth_status(server, provider_id)
-    if not external_auth['authenticated']:
-        execute("UPDATE execution_leases SET state='failed',updated_at=? WHERE run_id=?", (now(), run_id))
-        raise CoderExternalAuthRequired(provider_id, external_auth['display_name'], external_auth['login_url'])
     runner, environment = ensure_coder_runner(server, profile)
     saved = reserve_runner_worktree(run_id, task, runner, repo_url)
     request = {'repo_url': repo_url, 'base_ref': profile.get('base_ref') or 'main', 'task_key': saved['task_key']}
@@ -1054,8 +1049,20 @@ def choose_remote_harness(task: Dict[str, Any], runner: Dict[str, Any], environm
     raise ValueError('No supported authenticated harness is available in this persistent runner. Connect Codex or Claude Code in Coder first.' + (f' ({details})' if details else ''))
 
 
-def remote_agent_request(harness: Dict[str, Any], worktree: Dict[str, Any], task: Dict[str, Any], project: Dict[str, Any], permission_mode: str) -> str:
-    return remote_transport.agent_request(harness, worktree, task_prompt(task, project), project, permission_mode)
+def remote_agent_request(harness: Dict[str, Any], worktree: Dict[str, Any], task: Dict[str, Any], project: Dict[str, Any], permission_mode: str,
+                         attachments: Optional[List[Dict[str, Any]]] = None) -> str:
+    return remote_transport.agent_request(harness, worktree, task_prompt(task, project, attachments), project, permission_mode, attachments)
+
+
+def stage_remote_attachments(runner: Dict[str, Any], environment: Dict[str, str], worktree: Dict[str, Any], task_id: int) -> List[Dict[str, Any]]:
+    """Return remote paths for every stored attachment, or fail before an agent starts."""
+    records = rows("SELECT * FROM task_attachments WHERE task_id=? ORDER BY id", (task_id,))
+    existing = attachment_store.existing(records)
+    if len(existing) != len(records):
+        raise RuntimeError('An attachment is no longer stored locally. Remove it or add it again before retrying.')
+    if not existing:
+        return []
+    return remote_transport.stage_attachments(runner, environment, worktree['task_key'], existing, APP_ROOT)
 
 
 
@@ -1124,11 +1131,6 @@ def execution_blockers(project: Dict[str, Any], task: Optional[Dict[str, Any]] =
     if task:
         backend, profile = effective_execution_backend(project, task)
         if backend == 'coder':
-            if task_attachments(task['id']):
-                # The remote helper receives one base64 request over SSH and has
-                # no channel for file bytes, so a remote run would silently drop
-                # what the user attached. Say so instead of running without it.
-                blockers.append('Attachments are delivered to local runs only. Remove them or run this task locally.')
             if not profile or not profile.get('coder_server_id'):
                 blockers.append('Choose a Coder server for this project before using remote execution.')
             elif profile.get('server_status') != 'authorized':
@@ -1362,6 +1364,12 @@ def task_attachments(task_id: int) -> List[Dict[str, Any]]:
         rows("SELECT * FROM task_attachments WHERE task_id=? ORDER BY id", (task_id,)))
 
 
+def task_attachment_details(task_id: int) -> List[Dict[str, Any]]:
+    """Attachment records for the UI, including locally missing files it can remove."""
+    records = rows("SELECT * FROM task_attachments WHERE task_id=? ORDER BY id", (task_id,))
+    return [dict(item, available=Path(item.get('stored_path') or '').is_file()) for item in records]
+
+
 # A new task carries its first files in the create request itself, so they are
 # stored before the harness can start; a larger set is added from the task page.
 MAX_NEW_TASK_ATTACHMENTS = 10
@@ -1383,14 +1391,14 @@ def task_attachment_or_404(task_id: int, attachment_id: int) -> Dict[str, Any]:
     return record
 
 
-def task_prompt(task: Dict[str, Any], project: Dict[str, Any]) -> str:
+def task_prompt(task: Dict[str, Any], project: Dict[str, Any], attachments: Optional[List[Dict[str, Any]]] = None) -> str:
     session = active_session(task['id'])
     messages = rows("SELECT role,content FROM task_messages WHERE session_id=? ORDER BY id", (session['id'],))
     conversation = "\n\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
     current_progress = json.dumps(session_attempt_summary(session['id']), indent=2)[-12000:]
     handoff = latest_handoff(task['id'])
     handoff_context = json.dumps(handoff, indent=2)[-16000:] if handoff else 'No previous session.'
-    described = attachment_store.describe(task_attachments(task['id']))
+    described = attachment_store.describe(task_attachments(task['id']) if attachments is None else attachments)
     attached = ('\n' + described + '\n') if described else ''
     return f"""You are continuing a task session in the working directory provided to this process.
 
@@ -1587,6 +1595,11 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
             if problem:
                 update_run(run_id, 'stopped', problem)
                 return
+            try:
+                remote_attachments = stage_remote_attachments(runner, environment, remote_worktree, task_id)
+            except RuntimeError as exc:
+                update_run(run_id, 'blocked', str(exc))
+                return
             execute('UPDATE task_sessions SET harness_key=?,model=? WHERE id=?', (harness['key'], harness.get('model'), session['id']))
             attempt_id = execute("""INSERT INTO attempts(task_id,session_id,harness_key,model,selection,status,started_at,worktree_path,branch_name,base_sha,run_id,tool_permissions)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (task_id, session['id'], harness['key'], harness['model'], selection, 'running', now(),
@@ -1597,7 +1610,7 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
             execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at,attempt_id) VALUES(?,?,'system',?,?,?)",
                     (task_id, session['id'], f"{harness['label']} started in persistent Coder runner {runner['workspace_name']}.", now(), attempt_id))
             update_run(run_id, 'running', f"{harness['label']} is working in persistent runner {runner['workspace_name']}.", attempt_id)
-            result, output = run_remote_agent(runner, environment, remote_agent_request(harness, remote_worktree, task, project, permission_mode), file)
+            result, output = run_remote_agent(runner, environment, remote_agent_request(harness, remote_worktree, task, project, permission_mode, remote_attachments), file)
             output += result.get('output') or ''
             decoded_reply, decoded_failure = decode_result(harness['key'], result.get('output') or '')
             reply = result.get('reply') or decoded_reply
@@ -1993,6 +2006,8 @@ class API(SimpleHTTPRequestHandler):
                     raise ValueError("Task not found")
                 selected, selection = choose_harness(task)
                 blockers = execution_blockers(project_or_404(task['project_id']), task)
+                if task_run and task_run.get('status') == 'blocked' and task_run.get('message'):
+                    blockers.append(task_run['message'])
                 if selected:
                     problem = permission_blocker(selected['key'], permission_snapshot(task)[selected['key']])
                     if problem:
@@ -2006,7 +2021,7 @@ class API(SimpleHTTPRequestHandler):
                     "blockers": blockers,
                     "messages": conversation_messages(task_id),
                     "sessions": sessions_for_task(task_id),
-                    "attachments": task_attachments(task_id),
+                    "attachments": task_attachment_details(task_id),
                     "attempts": [present_attempt(a) for a in rows("SELECT * FROM attempts WHERE task_id=? ORDER BY id", (task_id,))]})
                 return
             match = re.match(r"^/api/tasks/(\d+)/attachments/(\d+)$", route)
@@ -2383,6 +2398,9 @@ class API(SimpleHTTPRequestHandler):
                 memory_mode = payload.get('memory_mode', 'inherit')
                 if memory_mode not in ('inherit', 'read_write', 'read_only', 'off'):
                     raise ValueError('Unknown task memory mode')
+                execution_target = payload.get('execution_target', 'project')
+                if execution_target not in ('project', 'local', 'coder'):
+                    raise ValueError('Execution target must be project default, local, or Coder.')
                 # Decode before creating anything: a rejected file should not
                 # leave a half-described task on the board.
                 incoming = payload.get('attachments') or []
@@ -2397,8 +2415,8 @@ class API(SimpleHTTPRequestHandler):
                     task_id = execute("INSERT INTO tasks(project_id,text,task_order,status,created_at) VALUES(?,?,?,'pending',?)",
                         (project_id, task_text.splitlines()[0][:120], order, now()))
                     execute("UPDATE tasks SET board_position=? WHERE id=?", (order, task_id))
-                    execute('UPDATE tasks SET tool_permissions=?,memory_mode=? WHERE id=?',
-                            (permissions, memory_mode, task_id))
+                    execute('UPDATE tasks SET tool_permissions=?,memory_mode=?,execution_target=? WHERE id=?',
+                            (permissions, memory_mode, execution_target, task_id))
                     session_id = execute("INSERT INTO task_sessions(task_id,session_number,status,opened_at) VALUES(?,1,'active',?)", (task_id, now()))
                     message_id = execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,'user',?,?)", (task_id, session_id, task_text, now()))
                 for filename, data in pending:
@@ -2551,12 +2569,7 @@ class API(SimpleHTTPRequestHandler):
                 profile = project_coder_profile(run['project_id'])
                 if not profile or not profile.get('coder_server_id'):
                     raise ValueError('This project no longer has a Coder server configured')
-                provider_id = profile.get('auth_provider_id') or 'github'
-                status = coder_external_auth_status(coder_server_or_404(profile['coder_server_id']), provider_id)
-                if not status['authenticated']:
-                    self.send_json({'ok': False, 'error': f"{status['display_name']} is not connected to this Coder account yet.", **status}, 409)
-                    return
-                claim_run(run['id'], run['status'], 'queued', f"{status['display_name']} connected; provisioning the Coder workspace.")
+                claim_run(run['id'], run['status'], 'queued', 'Retrying repository checkout in the persistent Coder runner.')
                 threading.Thread(target=run_attempt, args=(run['id'], run['project_id'], run['task_id']), daemon=True).start()
                 self.send_json({'ok': True}); return
             match = re.match(r"^/api/runs/([\w-]+)/discard$", route)
@@ -2678,10 +2691,14 @@ class API(SimpleHTTPRequestHandler):
             if not task:
                 raise ValueError("Task not found")
             active = current_run(task["project_id"])
-            if active and active["task_id"] == task_id:
+            worker_statuses = ('running', 'verifying', 'queued', 'rotating', 'committing')
+            if active and active["task_id"] == task_id and active['status'] in worker_statuses:
                 raise ValueError("Finish or close this task's active run before deleting it")
             attachment_store.remove_task(DATA_ROOT, task_id)
             with DB_LOCK, db() as conn:
+                # A remote task checkout is deliberately preserved on the runner,
+                # but its local record must not keep a discarded task alive.
+                conn.execute("DELETE FROM coder_task_worktrees WHERE task_id=?", (task_id,))
                 conn.execute("DELETE FROM task_attachments WHERE task_id=?", (task_id,))
                 conn.execute("DELETE FROM task_messages WHERE task_id=?", (task_id,))
                 conn.execute("DELETE FROM attempts WHERE task_id=?", (task_id,))

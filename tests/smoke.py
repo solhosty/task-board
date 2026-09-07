@@ -68,14 +68,17 @@ def main():
             assert coder['status'] == 'unverified' and not coder['token_configured']
             profile = request(f"/api/projects/{p['id']}/coder-profile", {'coder_server_id': coder['id'], 'setup_profile': 'python', 'default_target': 'coder', 'base_ref': 'main'})['coder_profile']
             assert profile['template_name'] == 'harness-test-coder-example' and profile['repo_url'] is None
+            local_only = request(f"/api/projects/{p['id']}/tasks", {'text': 'Keep this task local', 'execution_target': 'local'})
             board_project = next(item for item in request('/api/bootstrap')['projects'] if item['id'] == p['id'])
             assert board_project['coder_profile']['server_name'] == 'Test Coder'
-            assert all(task['execution_backend'] == 'coder' and task['execution_target_label'] == 'Test Coder' for task in board_project['tasks'])
+            assert next(task for task in board_project['tasks'] if task['id'] == local_only['id'])['execution_backend'] == 'local'
+            assert all(task['execution_backend'] == 'coder' and task['execution_target_label'] == 'Test Coder'
+                       for task in board_project['tasks'] if task['id'] != local_only['id'])
             request(f"/api/tasks/{first['id']}", {'execution_target': 'local'})
             board_project = next(item for item in request('/api/bootstrap')['projects'] if item['id'] == p['id'])
             assert next(task for task in board_project['tasks'] if task['id'] == first['id'])['execution_backend'] == 'local'
             bootstrap = request('/api/bootstrap')
-            assert len(next(x for x in bootstrap['projects'] if x['id'] == p['id'])['tasks']) == 2
+            assert len(next(x for x in bootstrap['projects'] if x['id'] == p['id'])['tasks']) == 3
             assert next(x for x in bootstrap['projects'] if x['id'] == q['id'])['tasks'] == []
             assert (project_folder / 'TASKS.md').read_text(encoding='utf-8') == existing_spec
             try:
@@ -97,12 +100,12 @@ def main():
             updated = request(f"/api/projects/{p['id']}", {'default_mode': 'unattended', 'auto_failover': 0})
             assert updated['default_mode'] == 'unattended' and updated['auto_failover'] == 0
             request(f"/api/tasks/{first['id']}", {'text': 'Renamed account settings'})
-            request(f"/api/projects/{p['id']}/task-order", {'order': [second['id'], first['id']]})
+            request(f"/api/projects/{p['id']}/task-order", {'order': [second['id'], first['id'], local_only['id']]})
             reordered = next(item for item in request('/api/bootstrap')['projects'] if item['id'] == p['id'])['tasks']
-            assert [item['id'] for item in reordered] == [second['id'], first['id']]
+            assert [item['id'] for item in reordered] == [second['id'], first['id'], local_only['id']]
             request(f"/api/tasks/{second['id']}", method='DELETE')
             managed = next(item for item in request('/api/bootstrap')['projects'] if item['id'] == p['id'])['tasks']
-            assert len(managed) == 1 and managed[0]['text'] == 'Renamed account settings'
+            assert len(managed) == 2 and any(item['text'] == 'Renamed account settings' for item in managed)
             print('PASS: project automation defaults plus task rename, ordering, and deletion persist.', flush=True)
             print('PASS: fallback order persists and invalid orders are rejected.', flush=True)
             with patch.object(app, 'eligible_harnesses', return_value=[{'key': 'droid', 'model': 'default'}, {'key': 'codex', 'model': 'default'}]):

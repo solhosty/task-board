@@ -20,11 +20,19 @@ CODEX_BIN = "/home/coder/.codex/packages/standalone/current/bin/codex"
 
 def command_for(request, root):
     key, model, prompt = request["harness"], request.get("model") or "default", request["prompt"]
+    attachments = request.get("attachments") or []
+    paths = [str(item.get("stored_path") or "") for item in attachments]
+    if any(not path.startswith("/home/coder/.harness-runner/attachments/") for path in paths):
+        raise ValueError("Invalid remote attachment path.")
     if key == "codex":
-        return [CODEX_BIN, "exec", "--json", "--approve-for-me", "--skip-git-repo-check", "--cd", str(root)] + ([] if model == "default" else ["--model", model]) + [prompt]
+        images = [str(item["stored_path"]) for item in attachments if item.get("kind") == "image"]
+        flags = [part for image in images for part in ("--image", image)]
+        return [CODEX_BIN, "exec", "--json", "--approve-for-me", "--skip-git-repo-check", "--cd", str(root)] + flags + ([] if model == "default" else ["--model", model]) + [prompt]
     if key == "claude":
         mode = "auto" if request.get("permission_mode") == "auto" else "acceptEdits"
-        return ["/home/coder/.local/bin/claude", "-p", "--permission-mode", mode, "--verbose", "--output-format", "stream-json"] + ([] if model == "default" else ["--model", model]) + [prompt]
+        folders = sorted({str(Path(path).parent) for path in paths})
+        flags = [part for folder in folders for part in ("--add-dir", folder)]
+        return ["/home/coder/.local/bin/claude", "-p", "--permission-mode", mode, "--verbose", "--output-format", "stream-json"] + flags + ([] if model == "default" else ["--model", model]) + [prompt]
     raise ValueError("Unsupported remote harness.")
 
 
