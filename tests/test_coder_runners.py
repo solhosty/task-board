@@ -4,6 +4,7 @@ import base64
 from contextlib import redirect_stdout
 import io
 import json
+import shlex
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,8 @@ from unittest.mock import MagicMock, patch
 
 import app
 from infra.runner import remote_delivery_runner as delivery
+from infra.runner import remote_agent_runner as remote_agent
+from harness_rotation import remote_transport
 
 
 class CoderRunnerTests(unittest.TestCase):
@@ -134,6 +137,45 @@ class CoderRunnerTests(unittest.TestCase):
         request = json.loads(base64.urlsafe_b64decode(encoded.encode()).decode())
         self.assertEqual(request['prompt'], 'quote; $(not-a-command)')
         self.assertNotIn('quote;', command)
+
+    def test_remote_attachments_are_staged_then_referenced_by_codex_and_claude(self):
+        source = Path(self.temp.name) / 'screen.png'
+        source.write_bytes(b'png-bytes')
+        record = {'id': 9, 'filename': 'screen.png', 'media_type': 'image/png', 'kind': 'image',
+                  'byte_size': source.stat().st_size, 'sha256': __import__('hashlib').sha256(source.read_bytes()).hexdigest(),
+                  'stored_path': str(source)}
+        remote = '/home/coder/.harness-runner/attachments/task-a/' + record['sha256'][:12] + '-screen.png'
+        completed = SimpleNamespace(returncode=0, stdout=json.dumps([dict(record, stored_path=remote)]), stderr='')
+        with patch.object(remote_transport.subprocess, 'run', return_value=completed) as transfer:
+            staged = remote_transport.stage_attachments(self.runner, {}, 'task-a', [record], app.APP_ROOT)
+        self.assertEqual(staged[0]['stored_path'], remote)
+        sent = json.loads(transfer.call_args.kwargs['input'])
+        self.assertEqual(sent[0]['sha256'], record['sha256'])
+        remote_command = transfer.call_args.args[0][-1]
+        self.assertEqual(shlex.split(remote_command)[:2], ['python3', '-c'])
+        codex = remote_agent.command_for({'harness': 'codex', 'prompt': 'read it', 'attachments': staged}, Path('/tmp/work'))
+        self.assertEqual(codex[codex.index('--image') + 1], remote)
+        claude = remote_agent.command_for({'harness': 'claude', 'prompt': 'read it', 'attachments': staged}, Path('/tmp/work'))
+        self.assertEqual(claude[claude.index('--add-dir') + 1], str(Path(remote).parent))
+
+    def test_remote_attachment_staging_refuses_a_changed_local_file(self):
+        source = Path(self.temp.name) / 'notes.md'
+        source.write_text('old')
+        record = {'id': 1, 'filename': 'notes.md', 'media_type': 'text/markdown', 'kind': 'file',
+                  'byte_size': 3, 'sha256': '0' * 64, 'stored_path': str(source)}
+        with self.assertRaisesRegex(RuntimeError, 'changed or is missing'):
+            remote_transport.stage_attachments(self.runner, {}, 'task-a', [record], app.APP_ROOT)
+
+    def test_missing_attachment_record_fails_before_remote_execution(self):
+        task, _ = self.task_run()
+        session_id = app.execute("INSERT INTO task_sessions(task_id,session_number,status,opened_at) VALUES(?,1,'active',?)",
+                                 (task['id'], app.now()))
+        app.execute("""INSERT INTO task_attachments(task_id,session_id,filename,media_type,kind,byte_size,sha256,stored_path,created_at)
+                     VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (task['id'], session_id, 'gone.png', 'image/png', 'image', 1, '0' * 64,
+                     str(Path(self.temp.name) / 'gone.png'), app.now()))
+        with self.assertRaisesRegex(RuntimeError, 'no longer stored locally'):
+            app.stage_remote_attachments(self.runner, {}, {'task_key': 'task-a'}, task['id'])
 
     def test_remote_harness_falls_back_to_other_authenticated_cli(self):
         app.execute("UPDATE harnesses SET installed=1,enabled=1 WHERE key IN ('codex','claude')")

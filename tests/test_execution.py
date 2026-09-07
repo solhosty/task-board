@@ -347,6 +347,14 @@ print('Implemented the requested feature.', flush=True)
         self.assertEqual(second['submission']['status'], 'blocked')
         self.assertIn('Another task', second['submission']['message'])
 
+    def test_a_task_waiting_for_user_action_can_be_deleted(self):
+        _, task_id, _ = self.create()
+        self.wait(task_id, 'awaiting_dispatch')
+        request = urllib.request.Request(self.url + f'/api/tasks/{task_id}', method='DELETE')
+        with urllib.request.urlopen(request, timeout=15) as response:
+            self.assertEqual(response.status, 200)
+        self.assertIsNone(app.one('SELECT * FROM tasks WHERE id=?', (task_id,)))
+
     def test_handoff_keeps_interrupted_harness_progress(self):
         self.configure_worker('codex', 'quota')
         project_id, task_id, run_id = self.create(location='local')
