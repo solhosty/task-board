@@ -25,7 +25,7 @@ export default function Memories({notify}:{notify:(message:string)=>void}){
    <button key={item.key} className="memory-harness" onClick={()=>setOpenKey(item.key)}>
     <HarnessMark name={item.key}/>
     <div><b>{item.label}</b><p>{item.summary}</p></div>
-    <span className="memory-counts">{item.status==='disabled'?<span className="badge warn">Turned off</span>:<span className="meta">{item.scopes.reduce((total,scope)=>total+scope.count,0)} saved</span>}<ChevronRight size={16}/></span>
+    <span className="memory-counts">{item.status==='disabled'?<span className="badge warn">Turned off</span>:<span className="meta" title={item.count_hint||undefined}>{item.scopes.reduce((total,scope)=>total+(scope.available?scope.count:0),0)} {item.count_label}</span>}<ChevronRight size={16}/></span>
    </button>)}</div>
  </>;
 }

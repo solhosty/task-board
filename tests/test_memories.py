@@ -77,6 +77,35 @@ class MemoryApiTest(unittest.TestCase):
         self.assertTrue(any(item.get("project_id") == self.project_id for item in claude["scopes"]))
         self.assertEqual(codex["status"], "disabled", "Codex memories ship turned off")
 
+    def test_overview_total_only_counts_lists_you_can_open(self):
+        """The card total is a promise the scope list has to be able to keep."""
+        self.call("/api/memories/claude", "POST", {
+            "scope": self.scope(), "title": "Verify command", "description": "How to test",
+            "type": "project", "body": "Run pytest."})
+        _, payload = self.call("/api/memories")
+        claude = payload["harnesses"][0]
+        project = next(item for item in claude["scopes"] if item.get("project_id"))
+        self.assertEqual(project["count"], 1)
+
+        self.call("/api/memories/claude/global", "POST", {"enabled": True})
+        _, payload = self.call("/api/memories")
+        claude = payload["harnesses"][0]
+        project = next(item for item in claude["scopes"] if item.get("project_id"))
+        self.assertFalse(project["available"], "one global list turns the per-project lists off")
+        self.assertEqual(project["count"], 0,
+                         "an unreachable scope must not inflate the total on the card")
+        self.assertEqual(sum(item["count"] for item in claude["scopes"]), 0,
+                         "the total matches what the global list would show")
+
+    def test_codex_count_is_labelled_as_local_only(self):
+        """Codex remembers more than Aludra writes, so the number says which it is."""
+        _, payload = self.call("/api/memories")
+        claude, codex = payload["harnesses"]
+        self.assertEqual(claude["count_label"], "saved")
+        self.assertIsNone(claude["count_hint"])
+        self.assertEqual(codex["count_label"], "saved here")
+        self.assertIn("not counted here", codex["count_hint"])
+
     def test_claude_project_slug_matches_the_harness_layout(self):
         from harness_rotation import memories
         self.assertEqual(memories.claude_project_slug("/Users/x/Documents/research-harness"),

@@ -410,14 +410,17 @@ def overview(projects: List[Dict[str, Any]]) -> Dict[str, Any]:
         "count": len(_list_entries(global_dir)) if global_dir else 0,
         "path": str(global_dir) if global_dir else None,
     }]
+    per_project = global_dir is None
     for project in projects:
         directory = claude_project_dir(str(project.get("repo_path") or ""))
         claude_scopes.append({
             "key": "project:%s" % project["id"],
             "label": project["name"],
             "project_id": project["id"],
-            "available": global_dir is None,
-            "count": len(_list_entries(directory)),
+            "available": per_project,
+            # A scope nobody can open counts for nothing, so the totals drawn
+            # from these numbers never promise more than a list can show.
+            "count": len(_list_entries(directory)) if per_project else 0,
             "path": str(directory),
         })
 
@@ -447,6 +450,8 @@ def overview(projects: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "label": "Claude Code",
                 "status": "ready",
                 "summary": "One Markdown file per fact, read at the start of every session.",
+                "count_label": "saved",
+                "count_hint": None,
                 "global_enabled": global_dir is not None,
                 "supports_notes": False,
                 "scopes": claude_scopes,
@@ -459,6 +464,14 @@ def overview(projects: List[Dict[str, Any]]) -> Dict[str, Any]:
                     "A user-wide store Aludra extends with its own memory folder."
                     if enabled else
                     "Codex keeps memories off until you turn them on."
+                ),
+                # Codex consolidates its own memory from your sessions, and a
+                # ChatGPT sign-in keeps part of it on OpenAI's servers.  This
+                # count only ever covers the folder Aludra writes.
+                "count_label": "saved here",
+                "count_hint": (
+                    "Only the memories saved through Aludra. Codex also keeps its own "
+                    "memory from your sessions, which is not counted here."
                 ),
                 "global_enabled": True,
                 "supports_notes": enabled,
