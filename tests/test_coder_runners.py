@@ -391,7 +391,7 @@ class CoderRunnerTests(unittest.TestCase):
                 if command[:3] == ['git', 'rev-parse', 'HEAD']:
                     return SimpleNamespace(returncode=0, stdout='b' * 40 + '\n')
                 if 'push' in command:
-                    events.append('push')
+                    events.append(command)
                 return SimpleNamespace(returncode=0, stdout='')
 
             output = io.StringIO()
@@ -400,7 +400,7 @@ class CoderRunnerTests(unittest.TestCase):
                  patch.object(delivery, 'github_json', side_effect=[{'id':123, 'login':'hunter'}, [], {'html_url':'https://github.com/example/repository/pull/7', 'number':7}]), \
                  redirect_stdout(output):
                 delivery.main(encoded)
-            self.assertEqual(events, ['push'])
+            self.assertEqual(events, [['git', 'push', '--force-with-lease', '--set-upstream', 'origin', 'harness/task-a']])
             self.assertIn(delivery.MARKER, output.getvalue())
             self.assertNotIn('credential-not-printed', output.getvalue())
 
@@ -431,7 +431,7 @@ class CoderRunnerTests(unittest.TestCase):
                  redirect_stdout(output):
                 delivery.main(encoded)
             self.assertTrue(any(command[:3] == ['git', 'commit', '--amend'] for command in commands))
-            self.assertTrue(any('push' in command for command in commands))
+            self.assertIn(['git', 'push', '--force-with-lease', '--set-upstream', 'origin', 'harness/task-a'], commands)
 
     def test_retry_remote_delivery_reuses_only_a_failed_delivery_attempt(self):
         task, run_id = self.task_run(status='stopped')
