@@ -127,7 +127,11 @@ def main(encoded):
         raise RuntimeError("The remote worktree could not be inspected before delivery.")
     # Coder injects the workspace's fresh external-auth credential through
     # GIT_ASKPASS. Do not replace it with a cached or desktop credential.
-    run(["git", "push", "--set-upstream", "origin", branch], worktree)
+    # A delivery retry may have amended the task's previous commit (for
+    # example, after the harness resolves a rebase conflict). This is the
+    # task's private branch, so update it only if the remote still matches the
+    # ref we fetched; never overwrite a branch that changed underneath us.
+    run(["git", "push", "--force-with-lease", "--set-upstream", "origin", branch], worktree)
     head = repository.split("/", 1)[0] + ":" + branch
     query = urlencode({"state": "open", "head": head, "base": base, "per_page": "1"})
     existing = github_json("GET", "https://api.github.com/repos/" + repository + "/pulls?" + query, token)
