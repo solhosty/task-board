@@ -12,7 +12,7 @@ import sys
 def main():
     child, terminal = pty.fork()
     if child == 0:
-        os.execv('/home/coder/.local/bin/claude', ['claude'])
+        os.execv('/home/coder/.local/node_modules/.bin/claude', ['claude'])
     while True:
         readable, _, _ = select.select([terminal, sys.stdin.fileno()], [], [])
         if terminal in readable:

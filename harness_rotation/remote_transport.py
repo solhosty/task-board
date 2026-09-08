@@ -138,6 +138,22 @@ def workspace_snapshot(runner: Dict[str, Any], environment: Dict[str, str], work
     return snapshot
 
 
+def transfer_manifest(runner: Dict[str, Any], environment: Dict[str, str], worktree_path: str,
+                      app_root: Path) -> Dict[str, Any]:
+    """Bounded preflight for a later cross-runner copy; never reads credentials."""
+    command = shlex.join(["python3", "-", worktree_path])
+    try:
+        checked = subprocess.run(["coder", "ssh", "--wait", "yes", runner["workspace_name"], "--", command],
+                                 input=payload(app_root, "remote_transfer_manifest.py"), env=environment,
+                                 capture_output=True, text=True, timeout=90)
+        manifest = json.loads(checked.stdout) if not checked.returncode else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        manifest = None
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("available"), bool):
+        return {"available": False, "reason": "Could not prepare the remote transfer manifest."}
+    return manifest
+
+
 def run_agent(runner: Dict[str, Any], environment: Dict[str, str], command: str,
               output_file: Path, app_root: Path, result_marker: str) -> Tuple[Dict[str, Any], str]:
     """Run the bounded remote helper and retain its transcript locally for review."""

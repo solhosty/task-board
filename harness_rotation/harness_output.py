@@ -122,9 +122,21 @@ def log_details(
                 "status": str(part.get("state", {}).get("status", "working")),
             }
     history = read_events(path)
+    # `activity` is optimized for the live JSON stream. Older attempts may
+    # only have a normalized durable transcript, so project that history into
+    # the same timeline shape instead of presenting an empty activity card.
+    if not activity:
+        activity = [
+            {"kind": event.get("kind", "message"), "text": event.get("text", ""),
+             "status": event.get("status", "")}
+            for event in history
+            if event.get("text")
+        ]
     return {
         "log": tail,
-        "activity": activity[-6:],
+        # Keep enough operational history for the task timeline while still
+        # bounding every polling response when a CLI emits verbose events.
+        "activity": activity[-30:],
         "events": history,
         "session_id": session_id,
         "resume_command": (
@@ -133,4 +145,3 @@ def log_details(
             else None
         ),
     }
-

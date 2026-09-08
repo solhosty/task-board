@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   preferred_harness TEXT, preferred_model TEXT, force_gate INTEGER NOT NULL DEFAULT 0,
   degradable INTEGER NOT NULL DEFAULT 0, execution_target TEXT NOT NULL DEFAULT 'project'
   CHECK(execution_target IN ('project','local','coder')),
+  scheduled_for TEXT,
   session_budget_chars INTEGER NOT NULL DEFAULT 24000,
   last_attempt_id INTEGER, created_at TEXT NOT NULL,
   UNIQUE(project_id, task_order)
@@ -116,7 +117,7 @@ CREATE TABLE IF NOT EXISTS coder_runners (
   detected_cpu_count INTEGER, detected_memory_bytes INTEGER, detected_max_tasks INTEGER,
   capacity_checked_at TEXT,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-  UNIQUE(coder_server_id, deployment_url, organization, owner_id)
+  UNIQUE(coder_server_id, deployment_url, organization, owner_id, workspace_id)
 );
 CREATE TABLE IF NOT EXISTS coder_task_worktrees (
   task_id INTEGER PRIMARY KEY REFERENCES tasks(id),
@@ -124,6 +125,22 @@ CREATE TABLE IF NOT EXISTS coder_task_worktrees (
   task_key TEXT NOT NULL UNIQUE, repo_url TEXT NOT NULL,
   worktree_path TEXT, base_sha TEXT, branch_name TEXT,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runner_account_bindings (
+  id INTEGER PRIMARY KEY, runner_id INTEGER NOT NULL REFERENCES coder_runners(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL CHECK(provider IN ('codex','claude')),
+  label TEXT NOT NULL, account_email TEXT, plan_type TEXT,
+  priority INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+  cooldown_until TEXT, last_checked_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE(runner_id), UNIQUE(provider, label)
+);
+CREATE TABLE IF NOT EXISTS remote_workspace_transfers (
+  id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  source_runner_id INTEGER NOT NULL REFERENCES coder_runners(id),
+  destination_runner_id INTEGER NOT NULL REFERENCES coder_runners(id),
+  source_path TEXT NOT NULL, destination_path TEXT, status TEXT NOT NULL
+  CHECK(status IN ('exporting','verifying','complete','needs_review','failed')),
+  manifest_json TEXT, error TEXT, created_at TEXT NOT NULL, completed_at TEXT
 );
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version TEXT PRIMARY KEY, applied_at TEXT NOT NULL
@@ -297,6 +314,56 @@ def _attempt_result_screenshots(connection: sqlite3.Connection) -> None:
         attempt_id INTEGER NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
         filename TEXT NOT NULL, media_type TEXT NOT NULL, byte_size INTEGER NOT NULL,
         stored_path TEXT NOT NULL, created_at TEXT NOT NULL)""")
+def _scheduled_tasks(connection: sqlite3.Connection) -> None:
+    _add_column(connection, "tasks", "scheduled_for", "TEXT")
+
+
+def _account_pool(connection: sqlite3.Connection) -> None:
+    """Account identities are metadata only; provider credentials stay in runners."""
+    connection.execute("""CREATE TABLE IF NOT EXISTS runner_account_bindings (
+      id INTEGER PRIMARY KEY, runner_id INTEGER NOT NULL REFERENCES coder_runners(id) ON DELETE CASCADE,
+      provider TEXT NOT NULL CHECK(provider IN ('codex','claude')), label TEXT NOT NULL,
+      account_email TEXT, plan_type TEXT, priority INTEGER NOT NULL DEFAULT 0,
+      enabled INTEGER NOT NULL DEFAULT 1, cooldown_until TEXT, last_checked_at TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      UNIQUE(runner_id), UNIQUE(provider, label))""")
+    # Old databases used a provider-scoped uniqueness rule. SQLite cannot add
+    # a UNIQUE constraint in place, so the trigger preserves the stricter
+    # runner isolation invariant without rewriting user data.
+    connection.execute("""CREATE TRIGGER IF NOT EXISTS one_account_per_runner
+        BEFORE INSERT ON runner_account_bindings
+        WHEN EXISTS(SELECT 1 FROM runner_account_bindings WHERE runner_id=NEW.runner_id)
+        BEGIN SELECT RAISE(ABORT, 'A runner can host only one account binding.'); END""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS remote_workspace_transfers (
+      id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      source_runner_id INTEGER NOT NULL REFERENCES coder_runners(id),
+      destination_runner_id INTEGER NOT NULL REFERENCES coder_runners(id), source_path TEXT NOT NULL,
+      destination_path TEXT, status TEXT NOT NULL CHECK(status IN ('exporting','verifying','complete','needs_review','failed')),
+      manifest_json TEXT, error TEXT, created_at TEXT NOT NULL, completed_at TEXT)""")
+
+
+def _multiple_coder_runners(connection: sqlite3.Connection) -> None:
+    """Allow one Coder user to own several isolated harness runners."""
+    definition = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='coder_runners'").fetchone()[0]
+    if "UNIQUE(coder_server_id, deployment_url, organization, owner_id)" not in definition:
+        return
+    # PRAGMA foreign_keys cannot change inside a transaction. Commit the
+    # preceding idempotent schema setup first, then do this atomic table swap.
+    connection.commit()
+    connection.execute("PRAGMA foreign_keys=OFF")
+    connection.execute("""CREATE TABLE coder_runners_new (
+      id INTEGER PRIMARY KEY, coder_server_id INTEGER NOT NULL REFERENCES coder_servers(id),
+      deployment_url TEXT NOT NULL, organization TEXT NOT NULL, owner_id TEXT NOT NULL,
+      workspace_id TEXT NOT NULL, workspace_name TEXT NOT NULL, workspace_url TEXT NOT NULL,
+      template_name TEXT NOT NULL, max_tasks INTEGER NOT NULL DEFAULT 1 CHECK(max_tasks BETWEEN 1 AND 8),
+      detected_cpu_count INTEGER, detected_memory_bytes INTEGER, detected_max_tasks INTEGER,
+      capacity_checked_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      UNIQUE(coder_server_id, deployment_url, organization, owner_id, workspace_id))""")
+    connection.execute("INSERT INTO coder_runners_new SELECT * FROM coder_runners")
+    connection.execute("DROP TABLE coder_runners")
+    connection.execute("ALTER TABLE coder_runners_new RENAME TO coder_runners")
+    connection.commit()
+    connection.execute("PRAGMA foreign_keys=ON")
 
 
 MIGRATIONS = (
@@ -313,9 +380,12 @@ MIGRATIONS = (
     Migration("011_aludra_board", _aludra_board),
     Migration("012_task_memory_mode", _task_memory_mode),
     Migration("013_scoped_harness_models", _scoped_harness_models),
+    Migration("019_attempt_result_screenshots", _attempt_result_screenshots),
     Migration("014_task_attachments", _task_attachments),
     Migration("015_scoped_harness_order", _scoped_harness_order),
-    Migration("016_attempt_result_screenshots", _attempt_result_screenshots),
+    Migration("016_scheduled_tasks", _scheduled_tasks),
+    Migration("017_account_pool_transfers", _account_pool),
+    Migration("018_multiple_coder_runners", _multiple_coder_runners),
 )
 
 
