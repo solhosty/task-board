@@ -1,0 +1,4 @@
+.show-more{display:grid;width:100%;gap:2px;margin-top:3px;border:1px dashed #c9d1e6;border-radius:6px;background:#f7f8ff;padding:10px 12px;color:#4154d2;text-align:left;transition:border-color .18s ease,background .18s ease,transform .18s ease}
+.show-more:hover{border-color:#9daaff;background:#eef0ff;transform:translateY(-1px)}
+.show-more span{font-size:12px;font-weight:700}.show-more small{color:#737eaa;font-size:11px}.cards>.taskcard{animation:task-card-enter .24s ease-out both}@keyframes task-card-enter{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:translateY(0)}}
+.mobile-task-list .show-more{margin-top:0}

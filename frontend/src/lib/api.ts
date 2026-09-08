@@ -10,7 +10,7 @@ export async function api<T = any>(path:string, method='GET', body?:unknown):Pro
 export type Run={id:string;status:string;message:string;attempt_id?:number};
 export type PR={id:number;url:string;number:number;state:string;review_state:string};
 export type Task={id:number;project_id:number;text:string;status:string;workflow_stage?:string;board_position:number;run?:Run;session_count:number;harness_history:string[];active_harness?:string;integrity_status:string;pull_requests:PR[];execution_backend:string;execution_target_label:string;harness_models:Record<string,string>;created_at:string;[key:string]:any};
-export type ViewConfig={stages:string[];layout:string;density:string;fields:string[];sort:string};
+export type ViewConfig={stages:string[];layout:string;density:string;fields:string[];sort:string;items_per_lane?:number};
 export type SavedView={id:number;name:string;config:ViewConfig};
 export type Project={id:number;name:string;repo_path:string;tasks:Task[];board_views:SavedView[];coder_profile:any;harness_models:Record<string,ModelChoice>;[key:string]:any};
 export type Harness={key:string;label:string;enabled:number;installed:number;model:string;availability:{code:string;label:string;reason:string};[key:string]:any};

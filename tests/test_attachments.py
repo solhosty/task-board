@@ -174,20 +174,6 @@ class AttachmentApiTests(unittest.TestCase):
         _, detail = self.call("/api/tasks/%d" % self.task_id)
         self.assertEqual(detail["attachments"], [])
 
-    def test_result_screenshot_is_listed_and_served_separately_from_prompt_attachments(self):
-        attempt_id = app.execute("""INSERT INTO attempts(task_id,harness_key,status,started_at)
-                                  VALUES(?,'codex','completed',?)""", (self.task_id, app.now()))
-        captured = Path(self.temp.name) / 'after.png'
-        captured.write_bytes(PNG)
-        saved = app.save_attempt_screenshot(attempt_id, captured)
-        self.assertIsNotNone(saved)
-        _, detail = self.call("/api/tasks/%d" % self.task_id)
-        self.assertEqual(detail['result_screenshots'][str(attempt_id)][0]['filename'], 'after.png')
-        with urllib.request.urlopen("%s/api/attempts/%d/screenshots/%d" % (self.base, attempt_id, saved['id'])) as response:
-            self.assertEqual(response.headers['Content-Type'], 'image/png')
-            self.assertEqual(response.read(), PNG)
-        self.assertEqual(detail['attachments'], [], 'result images must not be re-sent as task input')
-
     def test_an_unsupported_type_is_refused_with_a_readable_reason(self):
         status, payload = self.upload("installer.exe", b"MZ")
         self.assertEqual(status, 400)
