@@ -18,6 +18,7 @@ import './approved-delivery.css';
 import './approved-modal.css';
 import './approved-cta.css';
 import './approved-board-geometry.css';
+import './board-pagination.css';
 import './approved-layout-safety.css';
 import './approved-empty-state.css';
 import './brand-marks.css';
