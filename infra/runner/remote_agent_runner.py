@@ -60,11 +60,26 @@ def capture(command, cwd):
     return result.stdout if result.returncode in (0, 1) else ""
 
 
+def screenshot(path):
+    """Return one bounded PNG from the runner's non-Git result location."""
+    target = Path(path or "").resolve()
+    root = Path("/home/coder/.harness-runner/results").resolve()
+    if root not in target.parents or not target.is_file() or target.stat().st_size > 10 * 1024 * 1024:
+        return ""
+    data = target.read_bytes()
+    return base64.b64encode(data).decode() if data.startswith(b"\x89PNG\r\n\x1a\n") else ""
+
+
 def main(encoded):
     request = json.loads(base64.urlsafe_b64decode(encoded.encode()).decode())
     worktree = Path(request["worktree_path"]).resolve()
     if ROOT not in worktree.parents or not worktree.is_dir():
         raise ValueError("Invalid task worktree.")
+    screenshot_path = Path(request.get("screenshot_path") or "").resolve()
+    screenshot_root = Path("/home/coder/.harness-runner/results").resolve()
+    if screenshot_root not in screenshot_path.parents:
+        raise ValueError("Invalid result screenshot path.")
+    screenshot_path.parent.mkdir(parents=True, exist_ok=True)
     code, output, timed_out = bounded(command_for(request, worktree), worktree, 600)
     verification, verify_code = "", None
     if code == 0:
@@ -80,7 +95,8 @@ def main(encoded):
         reply = reply_path.read_text(encoding="utf-8", errors="replace")[-16000:]
     print(MARKER + json.dumps({"code": code, "output": output[-120000:], "timed_out": timed_out,
                                "verify_code": verify_code, "verification": verification[-12000:],
-                               "diff": diff[-250000:], "reply": reply}, separators=(",", ":")))
+                               "diff": diff[-250000:], "reply": reply,
+                               "screenshot": screenshot(request.get("screenshot_path"))}, separators=(",", ":")))
 
 
 if __name__ == "__main__":
@@ -88,4 +104,4 @@ if __name__ == "__main__":
         main(sys.argv[1])
     except Exception as exc:
         print(MARKER + json.dumps({"code": -1, "output": "", "verify_code": None,
-                                   "verification": "", "diff": "", "reply": "", "error": str(exc)}))
+                                   "verification": "", "diff": "", "reply": "", "screenshot": "", "error": str(exc)}))
