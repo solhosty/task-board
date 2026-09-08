@@ -347,6 +347,20 @@ print('Implemented the requested feature.', flush=True)
         self.assertEqual(second['submission']['status'], 'blocked')
         self.assertIn('Another task', second['submission']['message'])
 
+    def test_message_can_be_queued_while_its_runner_is_working(self):
+        project = self.api('/api/projects', {'name':'Queued instruction', 'repo_path':str(self.repo)})
+        task = self.api(f"/api/projects/{project['id']}/tasks", {'text':'Initial instruction'})
+        app.execute("""INSERT INTO runs(id,project_id,task_id,mode,status,message,created_at,updated_at)
+                       VALUES('working-run',?,?, 'unattended','running','Working',?,?)""",
+                    (project['id'], task['id'], app.now(), app.now()))
+        result = self.api(f"/api/tasks/{task['id']}/messages", {'content':'Also check the empty state.', 'start':True})
+        self.assertTrue(result['queued'])
+        self.assertIsNone(result['submission'])
+        state = self.api(f"/api/tasks/{task['id']}")
+        self.assertEqual(state['run']['id'], 'working-run')
+        self.assertEqual(state['task']['status'], 'pending')
+        self.assertEqual(state['messages'][-1]['content'], 'Also check the empty state.')
+
     def test_a_task_waiting_for_user_action_can_be_deleted(self):
         _, task_id, _ = self.create()
         self.wait(task_id, 'awaiting_dispatch')

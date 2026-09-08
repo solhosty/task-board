@@ -3061,17 +3061,20 @@ class API(SimpleHTTPRequestHandler):
                 if not content:
                     raise ValueError("Write a message first")
                 active = current_run(task['project_id'])
-                if active and active['task_id'] == task_id:
-                    raise ValueError("This task has an active run; wait for it to finish before adding new instructions")
                 session = active_session(task_id)
                 message_id = execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,'user',?,?)", (task_id, session['id'], content, now()))
                 # Attachments are uploaded before the message they belong to;
                 # sending the message is what ties them to a point in the thread.
                 execute("UPDATE task_attachments SET message_id=?,session_id=? WHERE task_id=? AND message_id IS NULL",
                         (message_id, session['id'], task_id))
-                execute("UPDATE tasks SET status='pending' WHERE id=?", (task_id,))
-                submission = request_run(task['project_id'], task_id) if payload.get('start') else None
-                self.send_json({"ok": True, 'submission': submission}, 201)
+                # A CLI harness receives its prompt when its turn begins. Do
+                # not disturb an in-flight attempt or start a concurrent one;
+                # retain the new instruction for its next continuation instead.
+                queued = bool(active and active['task_id'] == task_id)
+                if not queued:
+                    execute("UPDATE tasks SET status='pending' WHERE id=?", (task_id,))
+                submission = request_run(task['project_id'], task_id) if payload.get('start') and not queued else None
+                self.send_json({"ok": True, 'queued': queued, 'submission': submission}, 201)
                 return
             match = re.match(r"^/api/tasks/(\d+)/sessions/rotate$", route)
             if match:
