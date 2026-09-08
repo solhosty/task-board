@@ -2159,6 +2159,12 @@ class API(SimpleHTTPRequestHandler):
                                 "runners": runners,
                                 "account_bindings": rows('SELECT b.*,r.workspace_name FROM runner_account_bindings b JOIN coder_runners r ON r.id=b.runner_id ORDER BY b.provider,b.priority,b.id'), "adapters": adapter_metadata()})
                 return
+            if route == "/api/task-state":
+                # This is deliberately cheaper than bootstrap: it is polled while
+                # work is executing, and must not probe Coder runners every few
+                # seconds just to update a card's status.
+                self.send_json({"projects": [serialize_project(item) for item in rows("SELECT * FROM projects ORDER BY id DESC")]})
+                return
             if route == "/api/harness-order":
                 scope, scope_id = harness_order_scope(
                     parse_qs(urlparse(self.path).query).get("scope", ["global"])[0])
