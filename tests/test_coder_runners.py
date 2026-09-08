@@ -132,10 +132,11 @@ class CoderRunnerTests(unittest.TestCase):
         task = {'text': 'work', 'id': 1, 'preferred_harness': None, 'preferred_model': None}
         worktree = {'worktree_path': '/home/coder/.harness-runner/tasks/task-a', 'base_sha': 'a' * 40, 'branch_name': 'harness/task-a'}
         with patch.object(app, 'task_prompt', return_value='quote; $(not-a-command)'):
-            command = app.remote_agent_request({'key':'codex', 'model':'default'}, worktree, task, {'verify_command':'true'}, 'standard')
+            command = app.remote_agent_request({'key':'codex', 'model':'default'}, worktree, task, {'verify_command':'true'}, 'standard', screenshot_path='/home/coder/.harness-runner/results/task-a/1/after.png')
         encoded = command.split()[-1].strip("'")
         request = json.loads(base64.urlsafe_b64decode(encoded.encode()).decode())
         self.assertEqual(request['prompt'], 'quote; $(not-a-command)')
+        self.assertEqual(request['screenshot_path'], '/home/coder/.harness-runner/results/task-a/1/after.png')
         self.assertNotIn('quote;', command)
 
     def test_remote_attachments_are_staged_then_referenced_by_codex_and_claude(self):

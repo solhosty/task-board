@@ -290,6 +290,15 @@ def _task_attachments(connection: sqlite3.Connection) -> None:
         stored_path TEXT NOT NULL, created_at TEXT NOT NULL)""")
 
 
+def _attempt_result_screenshots(connection: sqlite3.Connection) -> None:
+    """A captured after-state belongs to an attempt, never to its Git tree."""
+    connection.execute("""CREATE TABLE IF NOT EXISTS attempt_result_screenshots (
+        id INTEGER PRIMARY KEY,
+        attempt_id INTEGER NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
+        filename TEXT NOT NULL, media_type TEXT NOT NULL, byte_size INTEGER NOT NULL,
+        stored_path TEXT NOT NULL, created_at TEXT NOT NULL)""")
+
+
 MIGRATIONS = (
     Migration("001_execution_lease_runner", _runner_link),
     Migration("002_runner_capacity", _runner_capacity),
@@ -306,6 +315,7 @@ MIGRATIONS = (
     Migration("013_scoped_harness_models", _scoped_harness_models),
     Migration("014_task_attachments", _task_attachments),
     Migration("015_scoped_harness_order", _scoped_harness_order),
+    Migration("016_attempt_result_screenshots", _attempt_result_screenshots),
 )
 
 

@@ -15,3 +15,10 @@
 .attachment figcaption{flex-direction:column;gap:1px;align-items:flex-start}
 .attempt-list .attachments{margin-top:8px}
 .attempt-list .attachment figcaption{max-width:150px}
+
+/* A final browser capture is deliberately larger than an input attachment: it
+   is the review artifact users need before accepting the implementation. */
+.result-screenshots{display:grid;gap:6px;margin:14px 0 4px}
+.result-screenshots a{display:grid;gap:6px;width:min(100%,760px);color:#5d6878;font-size:11px;text-decoration:none}
+.result-screenshots img{display:block;width:100%;border:1px solid #dce1e9;border-radius:8px;background:#fff;box-shadow:0 1px 3px #0b0d1212}
+.result-screenshots a:hover img{border-color:#8292d9}

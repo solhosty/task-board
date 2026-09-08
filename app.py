@@ -1050,8 +1050,9 @@ def choose_remote_harness(task: Dict[str, Any], runner: Dict[str, Any], environm
 
 
 def remote_agent_request(harness: Dict[str, Any], worktree: Dict[str, Any], task: Dict[str, Any], project: Dict[str, Any], permission_mode: str,
-                         attachments: Optional[List[Dict[str, Any]]] = None) -> str:
-    return remote_transport.agent_request(harness, worktree, task_prompt(task, project, attachments), project, permission_mode, attachments)
+                         attachments: Optional[List[Dict[str, Any]]] = None,
+                         screenshot_path: str = '') -> str:
+    return remote_transport.agent_request(harness, worktree, task_prompt(task, project, attachments, screenshot_path), project, permission_mode, attachments, screenshot_path)
 
 
 def stage_remote_attachments(runner: Dict[str, Any], environment: Dict[str, str], worktree: Dict[str, Any], task_id: int) -> List[Dict[str, Any]]:
@@ -1391,7 +1392,43 @@ def task_attachment_or_404(task_id: int, attachment_id: int) -> Dict[str, Any]:
     return record
 
 
-def task_prompt(task: Dict[str, Any], project: Dict[str, Any], attachments: Optional[List[Dict[str, Any]]] = None) -> str:
+RESULT_SCREENSHOT_MAX_BYTES = 10 * 1024 * 1024
+
+
+def result_screenshot_path(task_id: int, attempt_id: int, remote_task_key: Optional[str] = None) -> Path:
+    """The one non-Git PNG location advertised to a UI-capable harness."""
+    if remote_task_key:
+        return Path('/home/coder/.harness-runner/results') / remote_task_key / str(attempt_id) / 'after.png'
+    return DATA_ROOT / 'results' / ('task-%d' % task_id) / str(attempt_id) / 'after.png'
+
+
+def save_attempt_screenshot(attempt_id: int, path: Path, encoded: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Persist a captured after-state only when it is a bounded PNG artifact."""
+    try:
+        data = attachment_store.decode(encoded) if encoded else path.read_bytes()
+    except (OSError, ValueError):
+        return None
+    if not data or len(data) > RESULT_SCREENSHOT_MAX_BYTES or not data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return None
+    attempt = one('SELECT task_id FROM attempts WHERE id=?', (attempt_id,))
+    if not attempt:
+        return None
+    target = result_screenshot_path(attempt['task_id'], attempt_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    execute('DELETE FROM attempt_result_screenshots WHERE attempt_id=?', (attempt_id,))
+    screenshot_id = execute("""INSERT INTO attempt_result_screenshots(attempt_id,filename,media_type,byte_size,stored_path,created_at)
+        VALUES(?,?,?,?,?,?)""", (attempt_id, 'after.png', 'image/png', len(data), str(target), now()))
+    return one('SELECT * FROM attempt_result_screenshots WHERE id=?', (screenshot_id,))
+
+
+def attempt_screenshots(attempt_id: int) -> List[Dict[str, Any]]:
+    return [dict(item, available=Path(item['stored_path']).is_file()) for item in
+            rows('SELECT * FROM attempt_result_screenshots WHERE attempt_id=? ORDER BY id', (attempt_id,))]
+
+
+def task_prompt(task: Dict[str, Any], project: Dict[str, Any], attachments: Optional[List[Dict[str, Any]]] = None,
+                screenshot_path: str = '') -> str:
     session = active_session(task['id'])
     messages = rows("SELECT role,content FROM task_messages WHERE session_id=? ORDER BY id", (session['id'],))
     conversation = "\n\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
@@ -1414,7 +1451,7 @@ Previous sealed-session handoff (may be incomplete; verify against the code):
 Current-session harness progress (may be incomplete; verify against the code):
 {current_progress or 'No harness attempts in this session.'}
 
-Read the existing code and current diff before editing. Another harness may have worked on this same session. Preserve all existing uncommitted and untracked work. Work only inside this project folder. Do not commit, stash, reset, clean, or push. Keep changes focused and run relevant tests. Before meaningful tool batches, send a short user-visible progress update explaining what you are checking or changing; do not reveal private chain-of-thought. Finish with a concise summary of changes and tests run. If permissions prevent completing the task, clearly report that rather than claiming success."""
+Read the existing code and current diff before editing. Another harness may have worked on this same session. Preserve all existing uncommitted and untracked work. Work only inside this project folder. Do not commit, stash, reset, clean, or push. Keep changes focused and run relevant tests. Before meaningful tool batches, send a short user-visible progress update explaining what you are checking or changing; do not reveal private chain-of-thought. For a user-facing UI task, use browser tooling to capture the finished route at 1440x900 and save one PNG to {screenshot_path or 'the result-screenshot path supplied by the runner'}. This path is outside the project and will be displayed in the completion chat; do not add it to Git. If the UI cannot be run or captured, do not fabricate an image; explain that in your final response. Finish with a concise summary of changes and tests run. If permissions prevent completing the task, clearly report that rather than claiming success."""
 
 
 def log_file(attempt_id: int) -> Path:
@@ -1610,8 +1647,12 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
             execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at,attempt_id) VALUES(?,?,'system',?,?,?)",
                     (task_id, session['id'], f"{harness['label']} started in persistent Coder runner {runner['workspace_name']}.", now(), attempt_id))
             update_run(run_id, 'running', f"{harness['label']} is working in persistent runner {runner['workspace_name']}.", attempt_id)
-            result, output = run_remote_agent(runner, environment, remote_agent_request(harness, remote_worktree, task, project, permission_mode, remote_attachments), file)
+            remote_screenshot = result_screenshot_path(task_id, attempt_id, remote_worktree.get('task_key') or ('task-%d' % task_id))
+            result, output = run_remote_agent(runner, environment, remote_agent_request(
+                harness, remote_worktree, task, project, permission_mode, remote_attachments, str(remote_screenshot)), file)
             output += result.get('output') or ''
+            if result.get('screenshot'):
+                save_attempt_screenshot(attempt_id, remote_screenshot, result['screenshot'])
             decoded_reply, decoded_failure = decode_result(harness['key'], result.get('output') or '')
             reply = result.get('reply') or decoded_reply
             failure = result.get('error') or decoded_failure
@@ -1711,7 +1752,9 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
         execute("UPDATE attempts SET log_path=? WHERE id=?", (str(file), attempt_id))
         update_run(run_id, "running", f"{harness['label']} · {harness['model']} is working in {worktree}. Waiting for CLI output…", attempt_id)
         run = one('SELECT * FROM runs WHERE id=?', (run_id,))
-        command = configured_command(harness, worktree, task_prompt(task, project), permission_mode,
+        local_screenshot = result_screenshot_path(task_id, attempt_id)
+        local_screenshot.parent.mkdir(parents=True, exist_ok=True)
+        command = configured_command(harness, worktree, task_prompt(task, project, screenshot_path=str(local_screenshot)), permission_mode,
                                      task.get('memory_mode'), task_attachments(task_id))
         reply_file = file.with_suffix('.reply.txt')
         if command[0] == 'codex':
@@ -1724,6 +1767,8 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
         if failure:
             code = code or 1
             output += '\n' + failure
+        if code == 0:
+            save_attempt_screenshot(attempt_id, local_screenshot)
         execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,?,?,?)",
                 (task_id, session['id'], "system", f"{harness['label']} attempt #{attempt_id} ended with exit code {code}. See its attempt log for output.", now()))
         if code == 0:
@@ -2022,7 +2067,23 @@ class API(SimpleHTTPRequestHandler):
                     "messages": conversation_messages(task_id),
                     "sessions": sessions_for_task(task_id),
                     "attachments": task_attachment_details(task_id),
+                    "result_screenshots": {item['id']: attempt_screenshots(item['id']) for item in rows("SELECT id FROM attempts WHERE task_id=?", (task_id,))},
                     "attempts": [present_attempt(a) for a in rows("SELECT * FROM attempts WHERE task_id=? ORDER BY id", (task_id,))]})
+                return
+            match = re.match(r"^/api/attempts/(\d+)/screenshots/(\d+)$", route)
+            if match:
+                record = one('SELECT * FROM attempt_result_screenshots WHERE id=? AND attempt_id=?',
+                             (int(match.group(2)), int(match.group(1))))
+                path = Path((record or {}).get('stored_path') or '')
+                if not record or not path.is_file():
+                    raise ValueError('That result screenshot is no longer stored on this machine.')
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/png')
+                self.send_header('Content-Length', str(path.stat().st_size))
+                self.send_header('Content-Disposition', 'inline; filename="after.png"')
+                self.end_headers()
+                with path.open('rb') as handle:
+                    shutil.copyfileobj(handle, self.wfile)
                 return
             match = re.match(r"^/api/tasks/(\d+)/attachments/(\d+)$", route)
             if match:
