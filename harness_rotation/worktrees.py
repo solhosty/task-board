@@ -160,11 +160,11 @@ def commit_and_merge(project: Dict[str, Any], task: Dict[str, Any], attempt: Dic
 
 
 def rebase_onto_current_project(project: Dict[str, Any], attempt: Dict[str, Any], git: Git) -> Tuple[bool, str, str]:
-    """Rebase an isolated task branch onto the project's current checked-out commit.
+    """Rebase one isolated task branch without touching the project checkout.
 
-    This intentionally operates only in the task worktree.  A conflict is left
-    in place for a harness (or person) to resolve; the project checkout and the
-    task's original branch are never reset or overwritten.
+    A conflict deliberately remains in that task's worktree for its chat to
+    resolve. This is safe for sibling task worktrees because it only reads the
+    shared project HEAD.
     """
     repo, worktree = Path(project["repo_path"]), Path(attempt["worktree_path"])
     if repo.resolve() == worktree.resolve():

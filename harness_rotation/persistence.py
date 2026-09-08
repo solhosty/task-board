@@ -307,13 +307,6 @@ def _task_attachments(connection: sqlite3.Connection) -> None:
         stored_path TEXT NOT NULL, created_at TEXT NOT NULL)""")
 
 
-def _attempt_result_screenshots(connection: sqlite3.Connection) -> None:
-    """A captured after-state belongs to an attempt, never to its Git tree."""
-    connection.execute("""CREATE TABLE IF NOT EXISTS attempt_result_screenshots (
-        id INTEGER PRIMARY KEY,
-        attempt_id INTEGER NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
-        filename TEXT NOT NULL, media_type TEXT NOT NULL, byte_size INTEGER NOT NULL,
-        stored_path TEXT NOT NULL, created_at TEXT NOT NULL)""")
 def _scheduled_tasks(connection: sqlite3.Connection) -> None:
     _add_column(connection, "tasks", "scheduled_for", "TEXT")
 
@@ -380,7 +373,6 @@ MIGRATIONS = (
     Migration("011_aludra_board", _aludra_board),
     Migration("012_task_memory_mode", _task_memory_mode),
     Migration("013_scoped_harness_models", _scoped_harness_models),
-    Migration("019_attempt_result_screenshots", _attempt_result_screenshots),
     Migration("014_task_attachments", _task_attachments),
     Migration("015_scoped_harness_order", _scoped_harness_order),
     Migration("016_scheduled_tasks", _scheduled_tasks),

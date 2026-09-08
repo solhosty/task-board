@@ -23,7 +23,7 @@ def payload(app_root: Path, name: str) -> str:
 
 def agent_request(harness: Dict[str, Any], worktree: Dict[str, Any], prompt: str,
                   project: Dict[str, Any], permission_mode: str,
-                  attachments: List[Dict[str, Any]] = None, screenshot_path: str = "") -> str:
+                  attachments: List[Dict[str, Any]] = None) -> str:
     request = {
         "harness": harness["key"], "model": harness.get("model") or "default",
         "prompt": prompt, "permission_mode": permission_mode,
@@ -31,7 +31,6 @@ def agent_request(harness: Dict[str, Any], worktree: Dict[str, Any], prompt: str
         "verify_command": project.get("verify_command") or "",
         "reply_path": worktree["worktree_path"] + "/.harness-last-message",
         "attachments": attachments or [],
-        "screenshot_path": screenshot_path,
     }
     encoded = base64.urlsafe_b64encode(json.dumps(request, separators=(",", ":")).encode()).decode()
     return shlex.join(["python3", "-", encoded])

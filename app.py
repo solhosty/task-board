@@ -48,7 +48,6 @@ from harness_rotation.harness_output import (
 from harness_rotation import attachments as attachment_store
 from harness_rotation import memories as memory_store
 from harness_rotation import remote_transport
-from harness_rotation.account_pool import next_binding
 from harness_rotation import worktrees
 from harness_rotation.sessions import SessionService
 from harness_rotation.coder_config import (
@@ -1067,7 +1066,7 @@ def send_remote_claude_login_input(server_id: int, workspace_id: str, value: str
     return remote_claude_login_flow(server_id, workspace_id) or {'status': 'pending'}
 
 
-def reserve_runner_worktree(run_id, task, runner, repo_url, allow_runner_change=False):
+def reserve_runner_worktree(run_id, task, runner, repo_url):
     """Snapshot task ownership and enforce the measured process-slot upper bound."""
     with DB_LOCK, db() as conn:
         conn.execute('BEGIN IMMEDIATE')
@@ -1077,11 +1076,8 @@ def reserve_runner_worktree(run_id, task, runner, repo_url, allow_runner_change=
         if occupied >= runner_capacity(runner):
             raise ValueError('Runner capacity is occupied. Existing tasks are preserved; retry after a slot is free.')
         saved = conn.execute('SELECT * FROM coder_task_worktrees WHERE task_id=?', (task['id'],)).fetchone()
-        if saved and (saved['runner_id'] != runner['id'] or saved['repo_url'] != repo_url) and not allow_runner_change:
+        if saved and (saved['runner_id'] != runner['id'] or saved['repo_url'] != repo_url):
             raise ValueError('This task belongs to another runner or repository. Its work was preserved; create a new task or migrate explicitly.')
-        if saved and saved['runner_id'] != runner['id'] and allow_runner_change:
-            conn.execute('UPDATE coder_task_worktrees SET runner_id=?,updated_at=? WHERE task_id=?',
-                         (runner['id'], now(), task['id']))
         if not saved:
             conn.execute('''INSERT INTO coder_task_worktrees(task_id,runner_id,task_key,repo_url,created_at,updated_at)
                 VALUES(?,?,?,?,?,?)''', (task['id'], runner['id'], 'task-' + uuid.uuid4().hex, repo_url, now(), now()))
@@ -1091,59 +1087,7 @@ def reserve_runner_worktree(run_id, task, runner, repo_url, allow_runner_change=
     return one('SELECT * FROM coder_task_worktrees WHERE task_id=?', (task['id'],))
 
 
-def runner_environment(server: Dict[str, Any]) -> Dict[str, str]:
-    token = read_coder_token(server)
-    if not token:
-        raise ValueError('The Coder token is unavailable from Keychain.')
-    return dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=token,
-                CODER_ORGANIZATION=server['organization'])
-
-
-def pool_runner_for_task(task: Dict[str, Any], server: Dict[str, Any],
-                         excluded_runner_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
-    """Select an eligible account runner using the configured provider order.
-
-    A provider can have several isolated runner logins.  Its cooldown belongs
-    to that binding, so one exhausted Codex account never suppresses another.
-    """
-    order, _ = resolve_harness_order(task)
-    bindings = [item for item in runner_account_bindings(server['id'])
-                if excluded_runner_id is None or item['runner_id'] != excluded_runner_id]
-    return next_binding(bindings, order)
-
-
-def pool_runner_for_failover(task: Dict[str, Any], server: Dict[str, Any], excluded_runner_id: int) -> Optional[Dict[str, Any]]:
-    """Compatibility name for selecting the next account after exhaustion."""
-    return pool_runner_for_task(task, server, excluded_runner_id)
-
-
-def transfer_remote_worktree(source: Dict[str, Any], destination: Dict[str, Any], environment: Dict[str, str],
-                             source_path: str, destination_path: str) -> None:
-    """Copy a task tree between private runners without copying credentials.
-
-    The destination has already checked out the same base revision.  Streaming
-    a tar archive excludes Git metadata and keeps tracked, untracked, and
-    generated work together; either workspace remains intact on failure.
-    """
-    export = ['coder', 'ssh', '--wait', 'yes', source['workspace_name'], '--',
-              'tar', '-C', source_path, '--exclude=.git', '-czf', '-', '.']
-    receive = ['coder', 'ssh', '--wait', 'yes', destination['workspace_name'], '--',
-               'tar', '-C', destination_path, '-xzf', '-']
-    try:
-        sender = subprocess.Popen(export, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        receiver = subprocess.Popen(receive, env=environment, stdin=sender.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        assert sender.stdout
-        sender.stdout.close()
-        _, receive_error = receiver.communicate(timeout=300)
-        _, send_error = sender.communicate(timeout=300)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError('Could not transfer the preserved remote worktree to the next account.') from exc
-    if sender.returncode or receiver.returncode:
-        raise RuntimeError('Could not transfer the preserved remote worktree to the next account. The original runner was left unchanged.')
-
-
-def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[str, Any],
-                              failover_from_attempt: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[str, Any]) -> Dict[str, Any]:
     profile = project_coder_profile(project['id'])
     if not profile or not profile.get('coder_server_id'):
         raise ValueError('This project has no Coder environment configured.')
@@ -1154,37 +1098,8 @@ def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[s
         AND workspace_name IS NOT NULL AND runner_id IS NULL LIMIT 1""", (task['id'],))
     if legacy:
         raise ValueError('This task has a legacy task workspace. It was preserved; create a new task or explicitly migrate its work to a persistent runner.')
-    saved = one('SELECT * FROM coder_task_worktrees WHERE task_id=?', (task['id'],))
-    source_worktree_path = saved.get('worktree_path') if saved else None
-    environment = runner_environment(server)
-    source_runner = one('SELECT * FROM coder_runners WHERE id=?', (saved['runner_id'],)) if saved else None
-    source_binding = one('SELECT * FROM runner_account_bindings WHERE runner_id=? AND enabled=1',
-                         (source_runner['id'],)) if source_runner else None
-    source_is_cooling_down = bool(source_binding and source_binding.get('cooldown_until') and
-                                  datetime.fromisoformat(source_binding['cooldown_until']) > datetime.now(timezone.utc))
-    destination_binding = None
-    # A run can pause before creating an attempt (for example, after a server
-    # restart).  Its bound account cooldown is still a failover signal; do not
-    # pin it back to the exhausted runner merely because attempt_id is null.
-    if source_runner and (failover_from_attempt or source_is_cooling_down):
-        destination_binding = pool_runner_for_task(task, server, source_runner['id'])
-    # Older tasks were attached to the pre-pool default runner.  They must not
-    # bypass a user's account pool merely because their worktree predates it.
-    # A checked-out worktree is safely copied below before the first attempt.
-    elif not source_runner or not source_binding:
-        destination_binding = pool_runner_for_task(task, server,
-                                                   source_runner['id'] if source_runner else None)
-    if destination_binding:
-        runner = one('SELECT * FROM coder_runners WHERE id=?', (destination_binding['runner_id'],))
-        if not runner:
-            raise ValueError('The next account runner is no longer available.')
-        saved = reserve_runner_worktree(run_id, task, runner, repo_url, allow_runner_change=True)
-    elif source_runner:
-        runner = source_runner
-        saved = reserve_runner_worktree(run_id, task, runner, repo_url)
-    else:
-        runner, environment = ensure_coder_runner(server, profile)
-        saved = reserve_runner_worktree(run_id, task, runner, repo_url)
+    runner, environment = ensure_coder_runner(server, profile)
+    saved = reserve_runner_worktree(run_id, task, runner, repo_url)
     request = {'repo_url': repo_url, 'base_ref': profile.get('base_ref') or 'main', 'task_key': saved['task_key']}
     command = shlex.join(['python3', '-', json.dumps(request)])
     checked = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--', command],
@@ -1199,16 +1114,6 @@ def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[s
         raise RuntimeError('Runner returned an unexpected worktree or Git revision.')
     execute('''UPDATE coder_task_worktrees SET worktree_path=?,base_sha=?,branch_name=?,updated_at=? WHERE task_id=?''',
             (result['worktree_path'], result['base_sha'], result['branch_name'], now(), task['id']))
-    if destination_binding and source_runner and source_worktree_path:
-        transfer_id = execute('''INSERT INTO remote_workspace_transfers(task_id,source_runner_id,destination_runner_id,source_path,destination_path,status,created_at)
-            VALUES(?,?,?,?,?,?,?)''', (task['id'], source_runner['id'], runner['id'], source_worktree_path, result['worktree_path'], 'exporting', now()))
-        try:
-            transfer_remote_worktree(source_runner, runner, environment, source_worktree_path, result['worktree_path'])
-            execute("UPDATE remote_workspace_transfers SET status='complete',completed_at=? WHERE id=?", (now(), transfer_id))
-        except Exception as exc:
-            execute("UPDATE remote_workspace_transfers SET status='failed',error=?,completed_at=? WHERE id=?", (str(exc), now(), transfer_id))
-            execute('UPDATE coder_task_worktrees SET runner_id=?,updated_at=? WHERE task_id=?', (source_runner['id'], now(), task['id']))
-            raise
     execute("UPDATE execution_leases SET state='ready',worktree_path=?,base_sha=?,updated_at=? WHERE run_id=?",
             (result['worktree_path'], result['base_sha'], now(), run_id))
     return {'runner': runner, 'environment': environment,
@@ -1226,10 +1131,9 @@ def remote_transfer_manifest(runner: Dict[str, Any], environment: Dict[str, str]
 
 def runner_account_bindings(coder_server_id: int) -> List[Dict[str, Any]]:
     """Public account metadata for routing; credentials remain only in runner homes."""
-    return rows('''SELECT b.*, r.workspace_name, r.workspace_id, r.workspace_url, r.template_name,
-                          r.detected_max_tasks, r.coder_server_id FROM runner_account_bindings b
+    return rows('''SELECT b.*, r.workspace_name, r.detected_max_tasks FROM runner_account_bindings b
                    JOIN coder_runners r ON r.id=b.runner_id WHERE r.coder_server_id=?
-                   ORDER BY b.priority,b.id''', (coder_server_id,))
+                   ORDER BY b.provider,b.priority,b.id''', (coder_server_id,))
 
 
 def unassigned_runner_connections() -> List[Dict[str, Any]]:
@@ -1265,13 +1169,13 @@ def saved_remote_workspace_snapshot(project: Dict[str, Any], task: Dict[str, Any
         return {'available': False, 'reason': 'The remote task worktree is unavailable.'}
     try:
         server = coder_server_or_404(profile['coder_server_id'])
-        runner = one('SELECT * FROM coder_runners WHERE id=? AND coder_server_id=?',
-                     (saved['runner_id'], server['id']))
-        environment = runner_environment(server)
+        token, _, runner = coder_runner_context(server)
     except (ValueError, HTTPError, URLError, TimeoutError, OSError):
         return {'available': False, 'reason': 'Could not access the saved Coder runner.'}
-    if not runner:
-        return {'available': False, 'reason': 'The saved Coder runner is no longer available.'}
+    if not runner or runner['id'] != saved['runner_id']:
+        return {'available': False, 'reason': 'The saved Coder runner no longer matches this task.'}
+    environment = dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=token,
+                       CODER_ORGANIZATION=server['organization'])
     return remote_workspace_snapshot(runner, environment, saved['worktree_path'])
 
 
@@ -1279,12 +1183,9 @@ def choose_remote_harness(task: Dict[str, Any], runner: Dict[str, Any], environm
                           excluded_keys: Tuple[str, ...] = (), locked_key: Optional[str] = None) -> Tuple[Optional[Dict[str, Any]], str]:
     """Choose only CLIs installed and signed in inside this runner, never locally."""
     configured = {item['key']: item for item in rows("SELECT * FROM harnesses WHERE enabled=1 AND key IN ('codex','claude')")}
-    binding = one('SELECT * FROM runner_account_bindings WHERE runner_id=? AND enabled=1', (runner['id'],))
     order = ([locked_key] if locked_key else [])
     order += ([task['preferred_harness']] if task.get('preferred_harness') else [])
     order += [key for key in ('codex', 'claude') if key not in order]
-    if binding:
-        order = [key for key in order if key == binding['provider']]
     statuses = {}
     cooling_down = []
     moment = datetime.now(timezone.utc)
@@ -1294,10 +1195,7 @@ def choose_remote_harness(task: Dict[str, Any], runner: Dict[str, Any], environm
         harness = configured.get(key)
         if not harness:
             continue
-        # Pool accounts are isolated credentials.  Their binding cooldown is
-        # authoritative; the legacy provider-wide cooldown applies only to
-        # unbound runners for backward compatibility.
-        cooldown_until = binding.get('cooldown_until') if binding and binding.get('provider') == key else (None if binding else harness.get('cooldown_until'))
+        cooldown_until = harness.get('cooldown_until')
         if cooldown_until and datetime.fromisoformat(cooldown_until) > moment:
             cooling_down.append(cooldown_until)
             continue
@@ -1315,9 +1213,8 @@ def choose_remote_harness(task: Dict[str, Any], runner: Dict[str, Any], environm
 
 
 def remote_agent_request(harness: Dict[str, Any], worktree: Dict[str, Any], task: Dict[str, Any], project: Dict[str, Any], permission_mode: str,
-                         attachments: Optional[List[Dict[str, Any]]] = None,
-                         screenshot_path: str = '') -> str:
-    return remote_transport.agent_request(harness, worktree, task_prompt(task, project, attachments, screenshot_path), project, permission_mode, attachments, screenshot_path)
+                         attachments: Optional[List[Dict[str, Any]]] = None) -> str:
+    return remote_transport.agent_request(harness, worktree, task_prompt(task, project, attachments), project, permission_mode, attachments)
 
 
 def stage_remote_attachments(runner: Dict[str, Any], environment: Dict[str, str], worktree: Dict[str, Any], task_id: int) -> List[Dict[str, Any]]:
@@ -1700,43 +1597,7 @@ def task_attachment_or_404(task_id: int, attachment_id: int) -> Dict[str, Any]:
     return record
 
 
-RESULT_SCREENSHOT_MAX_BYTES = 10 * 1024 * 1024
-
-
-def result_screenshot_path(task_id: int, attempt_id: int, remote_task_key: Optional[str] = None) -> Path:
-    """The one non-Git PNG location advertised to a UI-capable harness."""
-    if remote_task_key:
-        return Path('/home/coder/.harness-runner/results') / remote_task_key / str(attempt_id) / 'after.png'
-    return DATA_ROOT / 'results' / ('task-%d' % task_id) / str(attempt_id) / 'after.png'
-
-
-def save_attempt_screenshot(attempt_id: int, path: Path, encoded: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Persist a captured after-state only when it is a bounded PNG artifact."""
-    try:
-        data = attachment_store.decode(encoded) if encoded else path.read_bytes()
-    except (OSError, ValueError):
-        return None
-    if not data or len(data) > RESULT_SCREENSHOT_MAX_BYTES or not data.startswith(b'\x89PNG\r\n\x1a\n'):
-        return None
-    attempt = one('SELECT task_id FROM attempts WHERE id=?', (attempt_id,))
-    if not attempt:
-        return None
-    target = result_screenshot_path(attempt['task_id'], attempt_id)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(data)
-    execute('DELETE FROM attempt_result_screenshots WHERE attempt_id=?', (attempt_id,))
-    screenshot_id = execute("""INSERT INTO attempt_result_screenshots(attempt_id,filename,media_type,byte_size,stored_path,created_at)
-        VALUES(?,?,?,?,?,?)""", (attempt_id, 'after.png', 'image/png', len(data), str(target), now()))
-    return one('SELECT * FROM attempt_result_screenshots WHERE id=?', (screenshot_id,))
-
-
-def attempt_screenshots(attempt_id: int) -> List[Dict[str, Any]]:
-    return [dict(item, available=Path(item['stored_path']).is_file()) for item in
-            rows('SELECT * FROM attempt_result_screenshots WHERE attempt_id=? ORDER BY id', (attempt_id,))]
-
-
-def task_prompt(task: Dict[str, Any], project: Dict[str, Any], attachments: Optional[List[Dict[str, Any]]] = None,
-                screenshot_path: str = '') -> str:
+def task_prompt(task: Dict[str, Any], project: Dict[str, Any], attachments: Optional[List[Dict[str, Any]]] = None) -> str:
     session = active_session(task['id'])
     messages = rows("SELECT role,content FROM task_messages WHERE session_id=? ORDER BY id", (session['id'],))
     conversation = "\n\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
@@ -1759,7 +1620,7 @@ Previous sealed-session handoff (may be incomplete; verify against the code):
 Current-session harness progress (may be incomplete; verify against the code):
 {current_progress or 'No harness attempts in this session.'}
 
-Read the existing code and current diff before editing. Another harness may have worked on this same session. Preserve all existing uncommitted and untracked work. Work only inside this project folder. Do not commit, stash, reset, clean, or push. Keep changes focused and run relevant tests. Before meaningful tool batches, send a short user-visible progress update explaining what you are checking or changing; do not reveal private chain-of-thought. For a user-facing UI task, use browser tooling to capture the finished route at 1440x900 and save one PNG to {screenshot_path or 'the result-screenshot path supplied by the runner'}. This path is outside the project and will be displayed in the completion chat; do not add it to Git. If the UI cannot be run or captured, do not fabricate an image; explain that in your final response. Finish with a concise summary of changes and tests run. If permissions prevent completing the task, clearly report that rather than claiming success."""
+Read the existing code and current diff before editing. Another harness may have worked on this same session. Preserve all existing uncommitted and untracked work. Work only inside this project folder. Do not commit, stash, reset, clean, or push. Keep changes focused and run relevant tests. Before meaningful tool batches, send a short user-visible progress update explaining what you are checking or changing; do not reveal private chain-of-thought. Finish with a concise summary of changes and tests run. If permissions prevent completing the task, clearly report that rather than claiming success."""
 
 
 def log_file(attempt_id: int) -> Path:
@@ -1913,12 +1774,7 @@ def commit_and_merge(project: Dict[str, Any], task: Dict[str, Any], attempt: Dic
 
 
 def delivery_state(project: Dict[str, Any], run: Optional[Dict[str, Any]], attempt: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """A small, evidence-backed delivery state for an isolated local task.
-
-    This is deliberately not a task dependency graph.  It compares this task's
-    saved Git base with the current project checkout and reports file overlap as
-    a hint only when both sides can be read locally.
-    """
+    """Describe whether an isolated task branch needs a safe base update."""
     if not run or not attempt or not attempt.get('branch_name') or not attempt.get('base_sha'):
         return None
     repo, worktree = Path(project['repo_path']), Path(attempt['worktree_path'])
@@ -1938,8 +1794,10 @@ def delivery_state(project: Dict[str, Any], run: Optional[Dict[str, Any]], attem
 
 
 def update_isolated_delivery(run_id: str) -> None:
-    """Apply the current project base to a preserved worktree, then re-verify."""
-    with RUN_LOCK:
+    """Update and re-verify one task worktree; never alter another task's tree."""
+    # Rebase metadata is scoped by Git worktree and each run has its own row.
+    # Do not serialize independent task conflict resolutions behind local runs.
+    with nullcontext():
         run = one('SELECT * FROM runs WHERE id=?', (run_id,))
         if not run:
             return
@@ -1953,17 +1811,14 @@ def update_isolated_delivery(run_id: str) -> None:
                 execute("UPDATE attempts SET status='delivery_conflict',base_sha=?,error=? WHERE id=?", (base_sha, detail or 'Git found a conflict.', attempt['id']))
                 update_run(run_id, 'stopped', 'Update needs help. Git found a conflict; the task worktree is preserved.', attempt['id'])
                 return
-            verify = subprocess.run(project['verify_command'].strip() or 'true', cwd=attempt['worktree_path'], shell=True,
-                                    text=True, capture_output=True, timeout=600)
+            verify = subprocess.run(project['verify_command'].strip() or 'true', cwd=attempt['worktree_path'], shell=True, text=True, capture_output=True, timeout=600)
             output = (verify.stdout + verify.stderr)[-12000:]
             if verify.returncode:
-                execute("UPDATE attempts SET status='verify_failed',base_sha=?,verify_output=?,error=? WHERE id=?",
-                        (base_sha, output, f'Verify command exited with code {verify.returncode}', attempt['id']))
+                execute("UPDATE attempts SET status='verify_failed',base_sha=?,verify_output=?,error=? WHERE id=?", (base_sha, output, f'Verify command exited with code {verify.returncode}', attempt['id']))
                 update_run(run_id, 'stopped', 'Branch updated, but verification failed. The task worktree is preserved.', attempt['id'])
                 return
             diff = git(['diff', base_sha, 'HEAD', '--'], Path(attempt['worktree_path']), check=False).stdout
-            execute("UPDATE attempts SET status='verified',base_sha=?,verify_output=?,diff_output=?,error=NULL WHERE id=?",
-                    (base_sha, output, diff[-250000:], attempt['id']))
+            execute("UPDATE attempts SET status='verified',base_sha=?,verify_output=?,diff_output=?,error=NULL WHERE id=?", (base_sha, output, diff[-250000:], attempt['id']))
             update_run(run_id, 'awaiting_commit', 'Branch updated and verification passed. Review and approve delivery.', attempt['id'])
         except Exception as exc:
             update_run(run_id, 'stopped', 'Could not update this task branch safely: ' + str(exc), attempt['id'])
@@ -1986,8 +1841,7 @@ def continue_delivery_conflict(run_id: str) -> None:
     if not run or not attempt or attempt.get('status') != 'delivery_conflict' or run.get('status') != 'stopped':
         raise ValueError('This run is not waiting for a delivery-conflict resolution.')
     session = active_session(run['task_id'])
-    execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,'user',?,?)",
-            (run['task_id'], session['id'], 'Resolve the active Git rebase conflict in this task worktree. Preserve both intended changes, finish the rebase, then run the project verification command.', now()))
+    execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,'user',?,?)", (run['task_id'], session['id'], 'Resolve the active Git rebase conflict in this task worktree. Preserve both intended changes, finish the rebase, then run the project verification command.', now()))
     claim_run(run_id, 'stopped', 'queued', 'Continuing this task with the saved Git conflict and latest-base context.')
     threading.Thread(target=run_attempt, args=(run_id, run['project_id'], run['task_id'], attempt['id']), daemon=True).start()
 
@@ -2018,8 +1872,7 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
         backend, _ = effective_execution_backend(project, task)
         if backend == 'coder':
             session = active_session(task_id)
-            prior = one('SELECT * FROM attempts WHERE id=? AND task_id=?', (resume_attempt_id, task_id)) if resume_attempt_id else None
-            prepared = provision_coder_execution(run_id, project, task, prior)
+            prepared = provision_coder_execution(run_id, project, task)
             runner, environment, remote_worktree = prepared['runner'], prepared['environment'], prepared['worktree']
             snapshot = remote_workspace_snapshot(runner, environment, remote_worktree['worktree_path'])
             if not resume_attempt_id and not permission_retry and task.get('session_budget_chars', 0) and session_message_chars(session['id']) >= int(task['session_budget_chars']):
@@ -2029,19 +1882,15 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
                 if not reconciled:
                     update_run(run_id, 'stopped', 'State needs review. ' + detail)
                     return
-            # A resumed Coder attempt may now be on another isolated account
-            # of the same provider, so do not exclude by provider name.
-            excluded = ()
+            prior = one('SELECT * FROM attempts WHERE id=? AND task_id=?', (resume_attempt_id, task_id)) if resume_attempt_id else None
+            excluded = (prior['harness_key'],) if prior and prior.get('harness_key') in ('codex', 'claude') else ()
             harness, selection = choose_remote_harness(task, runner, environment, excluded,
                 session.get('harness_key') if not resume_attempt_id else None)
             if not harness:
-                waiting = rows('''SELECT b.cooldown_until,b.label FROM runner_account_bindings b
-                                  JOIN coder_runners r ON r.id=b.runner_id
-                                  WHERE b.enabled=1 AND r.coder_server_id=? AND b.cooldown_until IS NOT NULL
-                                  ORDER BY b.cooldown_until LIMIT 1''', (runner['coder_server_id'],))
-                message = 'No eligible account in the Coder pool is currently available. The remote worktree is preserved.'
+                waiting = rows("SELECT cooldown_until FROM harnesses WHERE enabled=1 AND cooldown_until IS NOT NULL ORDER BY cooldown_until LIMIT 1")
+                message = 'All authenticated harnesses in this persistent Coder runner have reached their usage limits. The remote worktree is preserved.'
                 if waiting:
-                    message += f" Next account cooldown ({waiting[0]['label']}) expires {waiting[0]['cooldown_until']}."
+                    message += ' Next cooldown expires ' + waiting[0]['cooldown_until'] + '.'
                 update_run(run_id, 'paused_cooldown', message)
                 return
             permissions = json.loads(one('SELECT * FROM runs WHERE id=?', (run_id,))['permissions_json'] or '{}')
@@ -2065,12 +1914,8 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
             execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at,attempt_id) VALUES(?,?,'system',?,?,?)",
                     (task_id, session['id'], f"{harness['label']} started in persistent Coder runner {runner['workspace_name']}.", now(), attempt_id))
             update_run(run_id, 'running', f"{harness['label']} is working in persistent runner {runner['workspace_name']}.", attempt_id)
-            remote_screenshot = result_screenshot_path(task_id, attempt_id, remote_worktree.get('task_key') or ('task-%d' % task_id))
-            result, output = run_remote_agent(runner, environment, remote_agent_request(
-                harness, remote_worktree, task, project, permission_mode, remote_attachments, str(remote_screenshot)), file)
+            result, output = run_remote_agent(runner, environment, remote_agent_request(harness, remote_worktree, task, project, permission_mode, remote_attachments), file)
             output += result.get('output') or ''
-            if result.get('screenshot'):
-                save_attempt_screenshot(attempt_id, remote_screenshot, result['screenshot'])
             decoded_reply, decoded_failure = decode_result(harness['key'], result.get('output') or '')
             reply = result.get('reply') or decoded_reply
             failure = result.get('error') or decoded_failure
@@ -2086,12 +1931,10 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
                 seconds = int(reset[1]) * {'day': 86400, 'hour': 3600, 'minute': 60}[reset[2].lower()] if reset else 4 * 3600
                 until = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(timespec='seconds')
                 execute("UPDATE harnesses SET cooldown_until=?,updated_at=? WHERE id=?", (until, now(), harness['id']))
-                execute("UPDATE runner_account_bindings SET cooldown_until=?,updated_at=? WHERE runner_id=? AND provider=?",
-                        (until, now(), runner['id'], harness['key']))
                 if effective_mode(project, task) == 'supervised' or task['force_gate'] or not project.get('auto_failover', 1):
                     update_run(run_id, 'awaiting_resume', f'{harness["label"]} reached its limit (retry after {until}). The remote worktree is preserved; resume on the next authenticated CLI.', attempt_id)
                 else:
-                    update_run(run_id, 'rotating', f'{harness["label"]} reached its limit (retry after {until}). Continuing on the next eligible account; the remote worktree will be preserved or transferred safely.', attempt_id)
+                    update_run(run_id, 'rotating', f'{harness["label"]} reached its limit (retry after {until}). Continuing in the same remote worktree on the next authenticated CLI.', attempt_id)
                     threading.Thread(target=run_attempt, args=(run_id, project_id, task_id, attempt_id), daemon=True).start()
                 return
             verification = result.get('verification') or ''
@@ -2172,9 +2015,7 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
         execute("UPDATE attempts SET log_path=? WHERE id=?", (str(file), attempt_id))
         update_run(run_id, "running", f"{harness['label']} · {harness['model']} is working in {worktree}. Waiting for CLI output…", attempt_id)
         run = one('SELECT * FROM runs WHERE id=?', (run_id,))
-        local_screenshot = result_screenshot_path(task_id, attempt_id)
-        local_screenshot.parent.mkdir(parents=True, exist_ok=True)
-        command = configured_command(harness, worktree, task_prompt(task, project, screenshot_path=str(local_screenshot)), permission_mode,
+        command = configured_command(harness, worktree, task_prompt(task, project), permission_mode,
                                      task.get('memory_mode'), task_attachments(task_id))
         reply_file = file.with_suffix('.reply.txt')
         if command[0] == 'codex':
@@ -2187,8 +2028,6 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
         if failure:
             code = code or 1
             output += '\n' + failure
-        if code == 0:
-            save_attempt_screenshot(attempt_id, local_screenshot)
         execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,?,?,?)",
                 (task_id, session['id'], "system", f"{harness['label']} attempt #{attempt_id} ended with exit code {code}. See its attempt log for output.", now()))
         if code == 0:
@@ -2532,23 +2371,7 @@ class API(SimpleHTTPRequestHandler):
                     "messages": conversation_messages(task_id),
                     "sessions": sessions_for_task(task_id),
                     "attachments": task_attachment_details(task_id),
-                    "result_screenshots": {item['id']: attempt_screenshots(item['id']) for item in rows("SELECT id FROM attempts WHERE task_id=?", (task_id,))},
                     "attempts": [present_attempt(a) for a in rows("SELECT * FROM attempts WHERE task_id=? ORDER BY id", (task_id,))]})
-                return
-            match = re.match(r"^/api/attempts/(\d+)/screenshots/(\d+)$", route)
-            if match:
-                record = one('SELECT * FROM attempt_result_screenshots WHERE id=? AND attempt_id=?',
-                             (int(match.group(2)), int(match.group(1))))
-                path = Path((record or {}).get('stored_path') or '')
-                if not record or not path.is_file():
-                    raise ValueError('That result screenshot is no longer stored on this machine.')
-                self.send_response(200)
-                self.send_header('Content-Type', 'image/png')
-                self.send_header('Content-Length', str(path.stat().st_size))
-                self.send_header('Content-Disposition', 'inline; filename="after.png"')
-                self.end_headers()
-                with path.open('rb') as handle:
-                    shutil.copyfileobj(handle, self.wfile)
                 return
             match = re.match(r"^/api/tasks/(\d+)/attachments/(\d+)$", route)
             if match:
