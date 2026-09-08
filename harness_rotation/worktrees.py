@@ -70,6 +70,31 @@ def worktree_diff(attempt: Dict[str, Any], git: Git) -> str:
     return diff
 
 
+def _numstat_path(raw: str) -> str:
+    """Resolve numstat's rename display (`old => new` or `dir/{old => new}`) to the current path."""
+    match = re.match(r"^(.*)\{(.*) => (.*)\}(.*)$", raw)
+    if match:
+        prefix, _old, new, suffix = match.groups()
+        return f"{prefix}{new}{suffix}"
+    if " => " in raw:
+        return raw.split(" => ")[-1].strip()
+    return raw
+
+
+def _numstat_counts(raw: str) -> Dict[str, Tuple[Optional[int], Optional[int]]]:
+    stats: Dict[str, Tuple[Optional[int], Optional[int]]] = {}
+    for line in raw.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        added_raw, removed_raw, path = parts
+        # Binary files report counts as "-", since line counts don't apply.
+        added = None if added_raw == "-" else int(added_raw)
+        removed = None if removed_raw == "-" else int(removed_raw)
+        stats[_numstat_path(path)] = (added, removed)
+    return stats
+
+
 def changed_files(attempt: Dict[str, Any], git: Git) -> List[Dict[str, Any]]:
     """Every file this attempt added or changed in its worktree.
 
@@ -92,12 +117,21 @@ def changed_files(attempt: Dict[str, Any], git: Git) -> List[Dict[str, Any]]:
         if path:
             listed.append({"path": path, "status": _CHANGE_NAMES.get(code[:1], "changed")})
         index += step
-    for path in filter(None, git(["ls-files", "--others", "--exclude-standard", "-z"], root).stdout.split("\0")):
+    untracked = [path for path in git(["ls-files", "--others", "--exclude-standard", "-z"], root).stdout.split("\0") if path]
+    for path in untracked:
         listed.append({"path": path, "status": "added"})
+    # Line-count stats give the file list the same "+N -M" signal a diff view
+    # shows; untracked files never appear in a `git diff <base>` so they need
+    # their own numstat against an empty file.
+    stats = _numstat_counts(git(["diff", "--numstat", attempt["base_sha"], "--"], root, check=False).stdout)
+    for path in untracked:
+        result = git(["diff", "--no-index", "--numstat", "--", "/dev/null", path], root, check=False).stdout
+        stats.update(_numstat_counts(result))
     for item in listed:
         file = root / item["path"]
         item["exists"] = file.is_file()
         item["byte_size"] = file.stat().st_size if item["exists"] else 0
+        item["added"], item["removed"] = stats.get(item["path"], (None, None))
     return sorted(listed, key=lambda item: item["path"])
 
 
