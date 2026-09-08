@@ -247,6 +247,32 @@ class CoderRunnerTests(unittest.TestCase):
         self.assertIsNone(selected)
         self.assertEqual(selection, 'remote cooldown')
 
+    def test_bound_second_codex_account_ignores_first_accounts_global_cooldown(self):
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(timespec='seconds')
+        app.execute("UPDATE harnesses SET installed=1,enabled=1,cooldown_until=? WHERE key='codex'", (future,))
+        app.execute('''INSERT INTO runner_account_bindings(runner_id,provider,label,priority,created_at,updated_at)
+                       VALUES(?,'codex','codex-two',1,?,?)''', (self.runner['id'], app.now(), app.now()))
+        with patch.object(app, 'remote_codex_account', return_value={'installed':True, 'authenticated':True}):
+            selected, selection = app.choose_remote_harness({'preferred_harness':'codex', 'preferred_model':None}, self.runner, {})
+        self.assertEqual(selected['key'], 'codex')
+        self.assertEqual(selection, 'remote preferred')
+
+    def test_pool_failover_selects_second_account_of_same_provider(self):
+        second = app.save_coder_runner(self.server, self.owner, dict(self.workspace, id='workspace-two', name='second-runner'))
+        app.execute('''INSERT INTO runner_account_bindings(runner_id,provider,label,priority,created_at,updated_at)
+                       VALUES(?,'codex','codex-one',0,?,?)''', (self.runner['id'], app.now(), app.now()))
+        app.execute('''INSERT INTO runner_account_bindings(runner_id,provider,label,priority,created_at,updated_at)
+                       VALUES(?,'codex','codex-two',1,?,?)''', (second['id'], app.now(), app.now()))
+        selected = app.pool_runner_for_failover({'project_id':self.project}, self.server, self.runner['id'])
+        self.assertEqual(selected['runner_id'], second['id'])
+
+    def test_pool_routes_a_new_or_legacy_unbound_task_to_an_account(self):
+        second = app.save_coder_runner(self.server, self.owner, dict(self.workspace, id='workspace-two', name='second-runner'))
+        app.execute('''INSERT INTO runner_account_bindings(runner_id,provider,label,priority,created_at,updated_at)
+                       VALUES(?,'codex','codex-two',0,?,?)''', (second['id'], app.now(), app.now()))
+        selected = app.pool_runner_for_task({'project_id':self.project}, self.server)
+        self.assertEqual(selected['runner_id'], second['id'])
+
     def test_remote_all_quota_cooldowns_pause_without_starting_another_attempt(self):
         task, run_id = self.task_run()
         future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(timespec='seconds')
@@ -258,7 +284,7 @@ class CoderRunnerTests(unittest.TestCase):
             app._run_attempt(run_id, self.project, task['id'])
         run = app.one('SELECT * FROM runs WHERE id=?', (run_id,))
         self.assertEqual(run['status'], 'paused_cooldown')
-        self.assertIn('All authenticated harnesses', run['message'])
+        self.assertIn('No eligible account in the Coder pool', run['message'])
         self.assertEqual(app.rows('SELECT * FROM attempts WHERE run_id=?', (run_id,)), [])
 
     def test_remote_quota_preserves_worktree_and_queues_handoff(self):
@@ -281,7 +307,7 @@ class CoderRunnerTests(unittest.TestCase):
         self.assertEqual(attempt['status'], 'quota')
         self.assertEqual(attempt['worktree_path'], worktree['worktree_path'])
         self.assertEqual(run['status'], 'rotating')
-        self.assertIn('same remote worktree', run['message'])
+        self.assertIn('next eligible account', run['message'])
         self.assertIsNotNone(app.one("SELECT cooldown_until FROM harnesses WHERE key='codex'")['cooldown_until'])
         thread.return_value.start.assert_called_once_with()
 

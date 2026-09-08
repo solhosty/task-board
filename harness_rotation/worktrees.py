@@ -157,3 +157,21 @@ def commit_and_merge(project: Dict[str, Any], task: Dict[str, Any], attempt: Dic
         raise RuntimeError("Main repository changed during this run; worktree kept. " + merged.stderr.strip())
     mark_task_complete(repo, task, git)
     return head, git(["diff", "--stat", attempt["base_sha"], "HEAD"], repo).stdout.strip(), git(["diff", attempt["base_sha"], "HEAD", "--"], repo).stdout
+
+
+def rebase_onto_current_project(project: Dict[str, Any], attempt: Dict[str, Any], git: Git) -> Tuple[bool, str, str]:
+    """Rebase an isolated task branch onto the project's current checked-out commit.
+
+    This intentionally operates only in the task worktree.  A conflict is left
+    in place for a harness (or person) to resolve; the project checkout and the
+    task's original branch are never reset or overwritten.
+    """
+    repo, worktree = Path(project["repo_path"]), Path(attempt["worktree_path"])
+    if repo.resolve() == worktree.resolve():
+        raise RuntimeError('Local project-folder tasks do not have an isolated branch to update.')
+    target = git(["rev-parse", "HEAD"], repo).stdout.strip()
+    if not target or target == attempt.get("base_sha"):
+        return True, target, ''
+    result = git(["rebase", "--onto", target, str(attempt["base_sha"])], worktree, check=False)
+    detail = (result.stderr or result.stdout).strip()
+    return result.returncode == 0, target, detail[-4000:]
