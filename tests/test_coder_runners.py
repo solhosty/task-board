@@ -53,6 +53,31 @@ class CoderRunnerTests(unittest.TestCase):
         self.assertEqual(migrated['workspace_id'], 'different')
         self.assertEqual(migrated['workspace_name'], 'fresh-runner')
 
+    def test_superseded_paused_run_does_not_block_conversation(self):
+        task, run_id = self.task_run(status='paused_cooldown')
+        app.execute("INSERT INTO runs(id,project_id,task_id,mode,status,created_at,updated_at) VALUES('newer',?,?,'supervised','stopped',?,?)",
+                    (self.project, task['id'], app.now(), app.now()))
+        self.assertEqual(app.active_runs(self.project), [])
+
+    def test_capacity_error_waits_instead_of_stopping(self):
+        task, run_id = self.task_run()
+        with patch.object(app, '_run_attempt', side_effect=ValueError('Runner capacity is occupied. Existing tasks are preserved; retry after a slot is free.')):
+            app.run_attempt(run_id, self.project, task['id'])
+        self.assertEqual(app.one('SELECT status FROM runs WHERE id=?', (run_id,))['status'], 'awaiting_capacity')
+
+    def test_remote_admission_does_not_consult_local_cli_availability(self):
+        profile = {'coder_server_id':1, 'server_status':'authorized'}
+        with patch.object(app, 'effective_execution_backend', return_value=('coder', profile)), \
+             patch.object(app, 'eligible_harnesses', side_effect=AssertionError('Local CLI readiness is irrelevant')):
+            self.assertEqual(app.execution_blockers({'id':self.project, 'repo_path':'/missing-local-copy'}, {'id':1}), [])
+
+    def test_old_capacity_error_is_recovered_without_model_execution(self):
+        task, run_id = self.task_run(status='stopped')
+        app.update_run(run_id, 'stopped', 'Execution stopped: Runner capacity is occupied. Existing tasks are preserved; retry after a slot is free.')
+        with patch.object(app, 'dispatch_capacity_waiters'):
+            app.recover_capacity_waiters()
+        self.assertEqual(app.one('SELECT status FROM runs WHERE id=?', (run_id,))['status'], 'awaiting_capacity')
+
     def test_rejects_other_owner_organization_and_shared_workspace(self):
         for fields in [{'owner_id':'other'}, {'organization_name':'other','organization_id':'other'}, {'shared_with':[{'name':'someone'}]}]:
             with self.assertRaises(ValueError):
@@ -246,6 +271,54 @@ class CoderRunnerTests(unittest.TestCase):
         self.assertIsNone(selected)
         self.assertEqual(selection, 'remote cooldown')
 
+    def test_healthy_bound_account_overrides_other_accounts_global_cooldown(self):
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        app.execute("UPDATE harnesses SET enabled=1,cooldown_until=? WHERE key='codex'", (future,))
+        app.execute('''INSERT INTO runner_account_bindings(runner_id,provider,label,created_at,updated_at)
+                       VALUES(?,'codex','healthy',?,?)''', (self.runner['id'], app.now(), app.now()))
+        with patch.object(app, 'remote_codex_account', return_value={'installed':True, 'authenticated':True}):
+            selected, _ = app.choose_remote_harness({}, self.runner, {}, allowed_keys=('codex',))
+        self.assertEqual(selected['key'], 'codex')
+
+    def test_provider_failure_does_not_exclude_other_accounts_in_pool(self):
+        app.execute('''INSERT INTO runner_account_bindings(runner_id,provider,label,created_at,updated_at)
+                       VALUES(?,'codex','healthy',?,?)''', (self.runner['id'], app.now(), app.now()))
+        with patch.object(app, 'read_coder_token', return_value='test-token'):
+            runner, _, binding = app.pool_runner_for_task(self.server, {'preferred_harness':'codex'}, ('codex',))
+        self.assertEqual(runner['id'], self.runner['id'])
+        self.assertEqual(binding['provider'], 'codex')
+
+    def test_existing_task_stays_on_its_assigned_runner_until_confirmed_quota(self):
+        other = app.save_coder_runner(self.server, self.owner, dict(self.workspace, id='other-runner', name='other-runner'))
+        task, _ = self.task_run()
+        app.execute('''INSERT INTO runner_account_bindings(runner_id,provider,label,priority,created_at,updated_at)
+                       VALUES(?,'codex','first',0,?,?)''', (self.runner['id'], app.now(), app.now()))
+        app.execute('''INSERT INTO runner_account_bindings(runner_id,provider,label,priority,created_at,updated_at)
+                       VALUES(?,'codex','second',1,?,?)''', (other['id'], app.now(), app.now()))
+        app.execute('''INSERT INTO coder_task_worktrees(task_id,runner_id,task_key,repo_url,created_at,updated_at)
+                       VALUES(?,?,?,'https://example.com/repo',?,?)''', (task['id'], other['id'], 'task-' + 'a' * 32, app.now(), app.now()))
+        with patch.object(app, 'read_coder_token', return_value='secret'), \
+             patch.object(app, 'remote_codex_account', return_value={'installed':True,'authenticated':True}), \
+             patch.object(app, 'refresh_runner_capacity', side_effect=lambda runner, *_args, **_kwargs: runner):
+            runner, _, binding = app.pool_runner_for_task(self.server, task)
+        self.assertEqual((runner['id'], binding['label']), (other['id'], 'second'))
+
+    def test_live_authenticated_check_clears_only_legacy_cooldown(self):
+        stale = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        binding_id = app.execute('''INSERT INTO runner_account_bindings(runner_id,provider,label,cooldown_until,created_at,updated_at)
+                                  VALUES(?,'codex','stale',?,?,?)''', (self.runner['id'], stale, app.now(), app.now()))
+        with patch.object(app, 'read_coder_token', return_value='secret'), \
+             patch.object(app, 'remote_codex_account', return_value={'installed':True,'authenticated':True,'email':'a@example.test'}), \
+             patch.object(app, 'refresh_runner_capacity', side_effect=lambda runner, *_args, **_kwargs: runner):
+            app.refresh_runner_account_bindings(self.server, force=True)
+        self.assertIsNone(app.one('SELECT cooldown_until FROM runner_account_bindings WHERE id=?', (binding_id,))['cooldown_until'])
+        app.execute("UPDATE runner_account_bindings SET cooldown_until=?,cooldown_reason='quota' WHERE id=?", (stale, binding_id))
+        with patch.object(app, 'read_coder_token', return_value='secret'), \
+             patch.object(app, 'remote_codex_account', return_value={'installed':True,'authenticated':True}), \
+             patch.object(app, 'refresh_runner_capacity', side_effect=lambda runner, *_args, **_kwargs: runner):
+            app.refresh_runner_account_bindings(self.server, force=True)
+        self.assertEqual(app.one('SELECT cooldown_until FROM runner_account_bindings WHERE id=?', (binding_id,))['cooldown_until'], stale)
+
     def test_remote_all_quota_cooldowns_pause_without_starting_another_attempt(self):
         task, run_id = self.task_run()
         future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(timespec='seconds')
@@ -257,7 +330,7 @@ class CoderRunnerTests(unittest.TestCase):
             app._run_attempt(run_id, self.project, task['id'])
         run = app.one('SELECT * FROM runs WHERE id=?', (run_id,))
         self.assertEqual(run['status'], 'paused_cooldown')
-        self.assertIn('All authenticated harnesses', run['message'])
+        self.assertIn('resume automatically', run['message'])
         self.assertEqual(app.rows('SELECT * FROM attempts WHERE run_id=?', (run_id,)), [])
 
     def test_remote_quota_preserves_worktree_and_queues_handoff(self):
@@ -286,6 +359,12 @@ class CoderRunnerTests(unittest.TestCase):
 
     def test_detected_runner_capacity_allows_parallel_remote_dispatch(self):
         app.execute("UPDATE coder_runners SET detected_max_tasks=2 WHERE id=?", (self.runner['id'],))
+        other = app.save_coder_runner(self.server, self.owner, dict(self.workspace, id='other-capacity', name='other-capacity'))
+        app.execute("UPDATE coder_runners SET detected_max_tasks=2 WHERE id=?", (other['id'],))
+        app.execute('''INSERT INTO runner_account_bindings(runner_id,provider,label,priority,created_at,updated_at)
+                       VALUES(?,'codex','first',0,?,?)''', (self.runner['id'], app.now(), app.now()))
+        app.execute('''INSERT INTO runner_account_bindings(runner_id,provider,label,priority,created_at,updated_at)
+                       VALUES(?,'codex','second',1,?,?)''', (other['id'], app.now(), app.now()))
         app.execute("UPDATE projects SET default_mode='unattended' WHERE id=?", (self.project,))
         app.execute("""INSERT INTO project_coder_profiles(project_id,coder_server_id,repo_url,base_ref,template_name,enabled,default_target,created_at,updated_at)
             VALUES(?,1,'https://github.com/example/repository.git','main','base',1,'coder',?,?)""",
@@ -296,16 +375,31 @@ class CoderRunnerTests(unittest.TestCase):
         harness = app.one("SELECT * FROM harnesses WHERE key='codex'")
         with patch.object(app, 'execution_blockers', return_value=[]), \
              patch.object(app, 'choose_harness', return_value=(harness, 'rotation')), \
+             patch.object(app, 'read_coder_token', return_value='secret'), \
+             patch.object(app, 'remote_codex_account', return_value={'installed':True, 'authenticated':True}), \
              patch.object(app.threading, 'Thread') as thread:
             first_run = app.request_run(self.project, first)
             second_run = app.request_run(self.project, second)
             third_run = app.request_run(self.project, third)
             self.assertEqual((first_run['status'], second_run['status'], third_run['status']), ('queued', 'queued', 'awaiting_capacity'))
-            self.assertIn('Waiting for the next slot', third_run['message'])
+            self.assertIn('Waiting for its next slot', third_run['message'])
+            self.assertEqual(app.one('SELECT runner_id FROM execution_leases WHERE run_id=?', (first_run['run_id'],))['runner_id'], self.runner['id'])
+            self.assertEqual(app.one('SELECT runner_id FROM execution_leases WHERE run_id=?', (second_run['run_id'],))['runner_id'], self.runner['id'])
+            self.assertEqual(app.one('SELECT runner_id FROM execution_leases WHERE run_id=?', (third_run['run_id'],))['runner_id'], self.runner['id'])
             self.assertEqual(thread.return_value.start.call_count, 2)
             app.update_run(first_run['run_id'], 'complete', 'done')
             self.assertEqual(app.one('SELECT status FROM runs WHERE id=?', (third_run['run_id'],))['status'], 'queued')
             self.assertEqual(thread.return_value.start.call_count, 3)
+
+    def test_quota_probe_rechecks_the_first_account_after_a_manual_usage_reset(self):
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        app.execute('''INSERT INTO runner_account_bindings(runner_id,provider,label,priority,cooldown_until,cooldown_reason,created_at,updated_at)
+                       VALUES(?,'codex','first',0,?,'quota',?,?)''',
+                    (self.runner['id'], future, app.now(), app.now()))
+        with patch.object(app, 'read_coder_token', return_value='secret'), \
+             patch.object(app, 'remote_codex_account', return_value={'installed':True, 'authenticated':True}):
+            runner, _, binding = app.pool_runner_for_task(self.server, {'preferred_harness':'codex'}, allow_quota_probe=True)
+        self.assertEqual((runner['id'], binding['label']), (self.runner['id'], 'first'))
 
     def test_reviewed_remote_attempt_commits_pushes_and_links_pr(self):
         task, run_id = self.task_run()
@@ -406,6 +500,33 @@ class CoderRunnerTests(unittest.TestCase):
             self.assertTrue(any(command[:3] == ['git', 'commit', '--amend'] for command in commands))
             self.assertIn(['git', 'push', '--force-with-lease', '--set-upstream', 'origin', 'harness/task-a'], commands)
 
+    def test_remote_delivery_rebases_behind_its_existing_remote_branch_before_push(self):
+        with tempfile.TemporaryDirectory(prefix='harness-delivery-') as directory:
+            root, worktree = Path(directory).resolve(), Path(directory).resolve() / 'task-delivery'
+            worktree.mkdir()
+            request = {'worktree_path':str(worktree), 'branch_name':'harness/task-a', 'base_sha':'a' * 40,
+                       'repo_url':'https://github.com/example/repository.git', 'base_ref':'main',
+                       'auth_provider_id':'github', 'title':'deliver a safe change'}
+            commands = []
+            def fake_run(command, cwd, check=True, env=None):
+                commands.append(command)
+                if command[:3] == ['git', 'diff', '--cached']:
+                    return SimpleNamespace(returncode=0, stdout='')
+                if command[:3] == ['git', 'rev-parse', 'HEAD']:
+                    return SimpleNamespace(returncode=0, stdout='b' * 40 + '\n')
+                if command[:3] == ['git', 'rev-parse', '--verify']:
+                    return SimpleNamespace(returncode=0, stdout='c' * 40 + '\n')
+                if command[:3] == ['git', 'merge-base', '--is-ancestor']:
+                    return SimpleNamespace(returncode=1, stdout='')
+                return SimpleNamespace(returncode=0, stdout='')
+            with patch.object(delivery, 'ROOT', root), patch.object(delivery, 'run', side_effect=fake_run), \
+                 patch.object(delivery, 'github_token', return_value='token'), \
+                 patch.object(delivery, 'github_json', side_effect=[{'id':123, 'login':'hunter'}, [], {'html_url':'https://github.com/example/repository/pull/7', 'number':7}]), \
+                 redirect_stdout(io.StringIO()):
+                delivery.main(base64.urlsafe_b64encode(json.dumps(request).encode()).decode())
+            self.assertIn(['git', 'fetch', 'origin', 'harness/task-a'], commands)
+            self.assertIn(['git', 'rebase', 'origin/harness/task-a'], commands)
+
     def test_retry_remote_delivery_reuses_only_a_failed_delivery_attempt(self):
         task, run_id = self.task_run(status='stopped')
         attempt_id = app.execute("""INSERT INTO attempts(task_id,status,started_at,worktree_path,run_id)
@@ -415,6 +536,42 @@ class CoderRunnerTests(unittest.TestCase):
             app.retry_remote_delivery(run_id)
         self.assertEqual(app.one('SELECT * FROM runs WHERE id=?', (run_id,))['status'], 'committing')
         thread.assert_called_once_with(target=app.finish_commit, args=(run_id, self.project, task['id'], attempt_id), daemon=True)
+        thread.return_value.start.assert_called_once_with()
+
+    def test_delivery_recovery_is_available_for_any_saved_merge_failure(self):
+        task, run_id = self.task_run(status='stopped')
+        attempt_id = app.execute("""INSERT INTO attempts(task_id,status,started_at,worktree_path,run_id,error)
+            VALUES(?,'merge_failed',?,?,?,?)""", (task['id'], app.now(), '/preserved/task', run_id, 'Main repository changed during this run.'))
+        app.execute('UPDATE runs SET attempt_id=? WHERE id=?', (attempt_id, run_id))
+        run = app.one('SELECT * FROM runs WHERE id=?', (run_id,))
+        attempt = app.one('SELECT * FROM attempts WHERE id=?', (attempt_id,))
+        self.assertEqual(app.delivery_recovery(run, attempt), {
+            'title': 'Delivery needs attention', 'detail': 'Main repository changed during this run.'})
+
+    def test_recoverable_delivery_is_not_hidden_by_a_later_stopped_run(self):
+        task, delivery_run = self.task_run(status='stopped')
+        attempt_id = app.execute("""INSERT INTO attempts(task_id,status,started_at,worktree_path,run_id,error)
+            VALUES(?,'merge_failed',?,?,?,?)""", (task['id'], app.now(), '/preserved/task', delivery_run, 'Push was rejected.'))
+        app.execute('UPDATE runs SET attempt_id=? WHERE id=?', (attempt_id, delivery_run))
+        later = 'later-run'
+        app.execute("INSERT INTO runs(id,project_id,task_id,mode,status,created_at,updated_at) VALUES(?,?,?,'supervised','stopped',?,?)",
+                    (later, self.project, task['id'], app.now(), app.now()))
+        recovery = app.recoverable_delivery_for_task(task['id'])
+        self.assertEqual(recovery['run_id'], delivery_run)
+        self.assertEqual(recovery['detail'], 'Push was rejected.')
+
+    def test_continue_delivery_recovery_reuses_the_preserved_attempt_with_git_context(self):
+        task, run_id = self.task_run(status='stopped')
+        attempt_id = app.execute("""INSERT INTO attempts(task_id,status,started_at,worktree_path,run_id,error)
+            VALUES(?,'merge_failed',?,?,?,?)""", (task['id'], app.now(), '/preserved/task', run_id, 'Main repository changed during this run.'))
+        app.execute('UPDATE runs SET attempt_id=? WHERE id=?', (attempt_id, run_id))
+        with patch.object(app.threading, 'Thread') as thread:
+            app.continue_delivery_recovery(run_id)
+        self.assertEqual(app.one('SELECT * FROM runs WHERE id=?', (run_id,))['status'], 'queued')
+        message = app.one("SELECT content FROM task_messages WHERE task_id=? ORDER BY id DESC LIMIT 1", (task['id'],))['content']
+        self.assertIn('Main repository changed during this run.', message)
+        self.assertIn('Do not commit, push, reset', message)
+        thread.assert_called_once_with(target=app.run_attempt, args=(run_id, self.project, task['id'], attempt_id), daemon=True)
         thread.return_value.start.assert_called_once_with()
 
     def test_claude_login_input_is_forwarded_only_to_active_memory_bridge(self):
