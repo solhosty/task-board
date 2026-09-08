@@ -8,6 +8,7 @@ import re
 import shlex
 import subprocess
 import threading
+import time
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
@@ -165,8 +166,14 @@ class RemoteClaudeLogin:
             raise RuntimeError("The Claude login session closed. Start it again.")
         if not isinstance(value, str) or not value or len(value) > 8192 or "\x00" in value:
             raise ValueError("Enter a valid Claude login response.")
-        # Claude's full-screen terminal confirms text on CR, not transport LF.
-        self._write(value + "\r")
+        # Claude Code's current remote-SSH OAuth widget drops a pasted buffer.
+        # The dashboard receives one pasted value, but the bridge replays it as
+        # ordinary keystrokes and then submits the line. This keeps the callback
+        # inside the runner while avoiding the upstream terminal-widget bug.
+        for character in value:
+            self._write(character)
+            time.sleep(0.012)
+        self._write("\r")
 
     def accept_default(self) -> None:
         """Confirm a native terminal menu's currently selected option."""
@@ -183,6 +190,10 @@ class RemoteClaudeLogin:
         """Extract only Claude's browser continuation URL from wrapped PTY output."""
         with self.lock:
             screen = self.screen
+        # Claude's PTY output includes OSC-8 hyperlink metadata around the URL.
+        # Strip terminal control sequences before parsing or opening it in a browser.
+        screen = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", screen)
+        screen = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", screen)
         for start in [match.start() for match in re.finditer(r"https://", screen)]:
             candidate = re.split(r"\n\s*\n", screen[start:], maxsplit=1)[0]
             candidate = re.split(
@@ -199,4 +210,3 @@ class RemoteClaudeLogin:
     def close(self) -> None:
         if self.process.poll() is None:
             self.process.terminate()
-

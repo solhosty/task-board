@@ -2,13 +2,14 @@ import tempfile
 import unittest
 import base64
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 import io
 import json
 import shlex
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import app
 from infra.runner import remote_delivery_runner as delivery
@@ -48,9 +49,7 @@ class CoderRunnerTests(unittest.TestCase):
         self.assertEqual(again['id'], self.runner['id'])
         self.assertIsNone(again['detected_max_tasks'])
         self.assertEqual(again['workspace_url'], 'http://localhost:3000/@owner/private-runner')
-        with self.assertRaisesRegex(ValueError, 'migration'):
-            app.save_coder_runner(self.server, self.owner, dict(self.workspace, id='different'))
-        migrated = app.save_coder_runner(self.server, self.owner, dict(self.workspace, id='different', name='fresh-runner'), allow_migration=True)
+        migrated = app.save_coder_runner(self.server, self.owner, dict(self.workspace, id='different', name='fresh-runner'))
         self.assertEqual(migrated['workspace_id'], 'different')
         self.assertEqual(migrated['workspace_name'], 'fresh-runner')
 
@@ -82,6 +81,42 @@ class CoderRunnerTests(unittest.TestCase):
         self.assertEqual(environment['CODER_SESSION_TOKEN'], 'secret')
         run.assert_not_called()
 
+    def test_legacy_agent_template_fallback_runner_remains_usable(self):
+        legacy_workspace = dict(self.workspace, template_name='harness-hunter-local-rese-3f023b')
+        profile = {'template_name': 'agent-template'}
+        with patch.object(app, 'coder_runner_context', return_value=('secret', self.owner, self.runner)), \
+             patch.object(app, 'coder_json', return_value=legacy_workspace), \
+             patch.object(app, 'refresh_runner_capacity', return_value=self.runner), \
+             patch.object(app.subprocess, 'run') as run:
+            runner, _ = app.ensure_coder_runner(self.server, profile)
+        self.assertEqual(runner['id'], self.runner['id'])
+        run.assert_not_called()
+
+    def test_unrelated_runner_template_still_requires_migration(self):
+        incompatible_workspace = dict(self.workspace, template_name='unreviewed-template')
+        with patch.object(app, 'coder_runner_context', return_value=('secret', self.owner, self.runner)), \
+             patch.object(app, 'coder_json', return_value=incompatible_workspace):
+            with self.assertRaisesRegex(ValueError, 'different template'):
+                app.ensure_coder_runner(self.server, {'template_name': 'agent-template'})
+
+    def test_template_compatibility_allows_only_the_recorded_legacy_fallback(self):
+        self.assertEqual(app.compatible_runner_template({'template_name': 'agent-template'}, 'agent-template'), True)
+        self.assertEqual(app.compatible_runner_template({'template_name': 'agent-template'}, 'harness-hunter-local-rese-3f023b'), True)
+        self.assertEqual(app.compatible_runner_template({'template_name': 'agent-template'}, 'unreviewed-template'), False)
+
+    def test_runner_migration_uses_the_project_template_not_legacy_fallback(self):
+        created = SimpleNamespace(returncode=0, stdout='', stderr='')
+        new_workspace = dict(self.workspace, id='new-workspace', name='new-runner', template_name='agent-template')
+        new_runner = dict(self.runner, id=99, workspace_id='new-workspace', workspace_name='new-runner', template_name='agent-template')
+        with patch.object(app, 'coder_runner_context', return_value=('secret', self.owner, self.runner)), \
+             patch.object(app.subprocess, 'run', return_value=created) as run, \
+             patch.object(app, 'coder_json', return_value=new_workspace), \
+             patch.object(app, 'save_coder_runner', return_value=new_runner), \
+             patch.object(app, 'refresh_runner_capacity', return_value=new_runner):
+            result = app.migrate_coder_runner(self.server, {'template_name': 'agent-template'})
+        self.assertEqual(result['runner'], new_runner)
+        self.assertEqual(run.call_args.args[0][run.call_args.args[0].index('--template') + 1], 'agent-template')
+
     def test_runner_capacity_is_measured_inside_the_workspace(self):
         measured = {'cpu_count': 4, 'memory_bytes': 8 * 1024 ** 3,
                     'memory_per_task_bytes': 2 * 1024 ** 3, 'max_tasks': 4}
@@ -109,6 +144,24 @@ class CoderRunnerTests(unittest.TestCase):
         app.reserve_runner_worktree(run_id, task, self.runner, 'https://example.com/repo')
         with self.assertRaisesRegex(ValueError, 'preserved'):
             app.reserve_runner_worktree(run_id, task, self.runner, 'https://example.com/other')
+
+    def test_account_binding_is_runner_scoped_and_never_stores_a_token(self):
+        binding = app.execute('''INSERT INTO runner_account_bindings(
+            runner_id,provider,label,account_email,plan_type,priority,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?)''', (self.runner['id'], 'codex', 'codex-one',
+            'one@example.test', 'pro', 0, app.now(), app.now()))
+        saved = app.runner_account_bindings(1)
+        self.assertEqual(saved[0]['id'], binding)
+        self.assertEqual(saved[0]['workspace_name'], self.runner['workspace_name'])
+        self.assertNotIn('token', saved[0])
+
+    def test_runner_cannot_host_two_provider_accounts(self):
+        values = (self.runner['id'], 'codex', 'first', 0, app.now(), app.now())
+        app.execute('''INSERT INTO runner_account_bindings(runner_id,provider,label,priority,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?)''', values)
+        with self.assertRaises(Exception):
+            app.execute('''INSERT INTO runner_account_bindings(runner_id,provider,label,priority,created_at,updated_at)
+                           VALUES(?,?,?,?,?,?)''', (self.runner['id'], 'claude', 'second', 1, app.now(), app.now()))
 
     def test_legacy_task_workspace_is_not_silently_abandoned(self):
         task, run_id = self.task_run()
@@ -185,6 +238,27 @@ class CoderRunnerTests(unittest.TestCase):
         self.assertEqual(selected['key'], 'claude')
         self.assertEqual(selection, 'remote fallback')
         claude.assert_called_once_with(self.runner, {})
+
+    def test_remote_harness_skips_quota_cooldowns(self):
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(timespec='seconds')
+        app.execute("UPDATE harnesses SET installed=1,enabled=1,cooldown_until=? WHERE key IN ('codex','claude')", (future,))
+        selected, selection = app.choose_remote_harness({'preferred_harness':'codex', 'preferred_model':None}, self.runner, {})
+        self.assertIsNone(selected)
+        self.assertEqual(selection, 'remote cooldown')
+
+    def test_remote_all_quota_cooldowns_pause_without_starting_another_attempt(self):
+        task, run_id = self.task_run()
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(timespec='seconds')
+        app.execute("UPDATE harnesses SET installed=1,enabled=1,cooldown_until=? WHERE key IN ('codex','claude')", (future,))
+        worktree = {'worktree_path':'/home/coder/.harness-runner/tasks/task-preserved',
+                    'branch_name':'harness/task-preserved', 'base_sha':'a' * 40}
+        with patch.object(app, 'effective_execution_backend', return_value=('coder', {})), \
+             patch.object(app, 'provision_coder_execution', return_value={'runner':self.runner, 'environment':{}, 'worktree':worktree}):
+            app._run_attempt(run_id, self.project, task['id'])
+        run = app.one('SELECT * FROM runs WHERE id=?', (run_id,))
+        self.assertEqual(run['status'], 'paused_cooldown')
+        self.assertIn('All authenticated harnesses', run['message'])
+        self.assertEqual(app.rows('SELECT * FROM attempts WHERE run_id=?', (run_id,)), [])
 
     def test_remote_quota_preserves_worktree_and_queues_handoff(self):
         task, run_id = self.task_run()
@@ -353,14 +427,15 @@ class CoderRunnerTests(unittest.TestCase):
         self.assertEqual(result['screen'], 'waiting for code')
         app.MODEL_AUTH_FLOWS.pop(key, None)
 
-    def test_claude_login_input_uses_terminal_enter(self):
+    def test_claude_login_input_replays_characters_then_terminal_enter(self):
         bridge = object.__new__(app.RemoteClaudeLogin)
         bridge.process = MagicMock()
         bridge.process.poll.return_value = None
         bridge.process.stdin = MagicMock()
         bridge.send('one-time-code')
-        bridge.process.stdin.write.assert_called_once_with(b'one-time-code\r')
-        bridge.process.stdin.flush.assert_called_once_with()
+        expected = [call(character.encode()) for character in 'one-time-code'] + [call(b'\r')]
+        self.assertEqual(bridge.process.stdin.write.call_args_list, expected)
+        self.assertEqual(bridge.process.stdin.flush.call_count, len(expected))
 
     def test_claude_login_screen_removes_terminal_control_sequences(self):
         bridge = object.__new__(app.RemoteClaudeLogin)
@@ -370,6 +445,14 @@ class CoderRunnerTests(unittest.TestCase):
 
     def test_claude_theme_matcher_handles_terminal_redraw_without_spaces(self):
         self.assertIsNotNone(app.re.search(r'choose\s*the\s*text\s*style|choosethetextstyle', 'Choosethetextstylethatlooksbest', app.re.I))
+
+    def test_claude_login_watcher_marks_successful_terminal_session_complete(self):
+        bridge = MagicMock()
+        bridge.snapshot.return_value = 'Logged in as person@example.com\nLogin successful.'
+        flow = {'status': 'pending', 'provider': 'claude', 'message': 'waiting', 'bridge': bridge, 'started_at': app.time.time()}
+        app.watch_remote_claude_login((self.server['id'], self.runner['workspace_id'], 'claude'), flow)
+        self.assertEqual(flow['status'], 'complete')
+        bridge.close.assert_called_once_with()
 
     def test_claude_onboarding_bridge_selects_default_theme(self):
         bridge = MagicMock()
