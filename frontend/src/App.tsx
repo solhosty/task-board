@@ -4,7 +4,7 @@ import {Plus,FolderKanban,Activity,Brain,PlugZap,Settings,Menu,RefreshCw,CheckCi
 import {DndContext,closestCenter,PointerSensor,KeyboardSensor,useSensor,useSensors,type DragEndEvent} from '@dnd-kit/core';
 import {SortableContext,useSortable,sortableKeyboardCoordinates,verticalListSortingStrategy,arrayMove} from '@dnd-kit/sortable';
 import {CSS} from '@dnd-kit/utilities';
-import {api,queryClient,type HarnessOrderState,type Bootstrap,type TaskState,type Project,type Harness,type AdapterInfo,type ModelChoice,label,modelName,attention} from './lib/api';
+import {api,queryClient,type HarnessOrderState,type Bootstrap,type Project,type Harness,type AdapterInfo,type ModelChoice,label,modelName,attention} from './lib/api';
 import {attachmentName,readBase64,readableSize} from './lib/files';
 import {Button} from './components/ui/button';
 import {Modal,Field,Input,Textarea,Select,Checkbox,Empty} from './components/ui/controls';
@@ -16,18 +16,12 @@ import AccountPoolConnections from './components/AccountPoolConnections';
 type Page='board'|'activity'|'memories'|'connections'|'settings';
 
 export default function App(){
- const bootstrap=useQuery({queryKey:['bootstrap'],queryFn:()=>api<Bootstrap>('/api/bootstrap')});
- // Unlike bootstrap, this endpoint does no runner or configuration probes. Keep
- // it live so transitions which originate outside the browser (a scheduler,
- // worker, or released remote-runner slot) are never missed.
- const taskState=useQuery({queryKey:['task-state'],queryFn:()=>api<TaskState>('/api/task-state'),refetchInterval:2500,refetchIntervalInBackground:true});
- const data=bootstrap.data?{...bootstrap.data,projects:taskState.data?.projects||bootstrap.data.projects}:undefined;
- const {error,isLoading,refetch}=bootstrap;
+ const {data,error,isLoading,refetch}=useQuery({queryKey:['bootstrap'],queryFn:()=>api<Bootstrap>('/api/bootstrap')});
  const [page,setPage]=useState<Page>('board'),[projectId,setProjectId]=useState<number>(),[taskId,setTaskId]=useState<number>(),[newTask,setNewTask]=useState(false),[toast,setToast]=useState(''),[mobileOpen,setMobileOpen]=useState(false);
  const project=data?.projects.find(item=>item.id===(projectId??data?.projects[0]?.id));
  useEffect(()=>{if(!projectId&&data?.projects[0])setProjectId(data.projects[0].id)},[data,projectId]);
  const notify=(message:string)=>{setToast(message);window.setTimeout(()=>setToast(''),3000)};
- const refresh=()=>{void queryClient.invalidateQueries({queryKey:['bootstrap']});void taskState.refetch();void refetch()};
+ const refresh=()=>{queryClient.invalidateQueries({queryKey:['bootstrap']});refetch()};
  if(isLoading)return <div className="app-loading"><Brand markOnly/>Opening Aludra…</div>;
  if(error||!data)return <div className="app-loading"><AlertTriangle/><p>{(error as Error)?.message||'Unable to load Aludra.'}</p><Button onClick={()=>refetch()}>Try again</Button></div>;
  if(taskId&&project)return <TaskWorkspace project={project} taskId={taskId} onBack={()=>setTaskId(undefined)} onDeleted={()=>{setTaskId(undefined);refresh()}} refresh={refresh} notify={notify}/>;
