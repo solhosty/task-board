@@ -2802,18 +2802,21 @@ class API(SimpleHTTPRequestHandler):
                 content = str(payload.get("content", "")).strip()
                 if not content:
                     raise ValueError("Write a message first")
-                active = current_run(task['project_id'])
-                if active and active['task_id'] == task_id:
-                    raise ValueError("This task has an active run; wait for it to finish before adding new instructions")
+                # A running harness re-reads every message in its session at the
+                # start of its next attempt (see task_prompt), so a message sent
+                # while active is not lost: it queues for that next checkpoint
+                # (resume, retry, or the next attempt) rather than being rejected.
+                already_running = any(r['task_id'] == task_id for r in active_runs(task['project_id']))
                 session = active_session(task_id)
                 message_id = execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,'user',?,?)", (task_id, session['id'], content, now()))
                 # Attachments are uploaded before the message they belong to;
                 # sending the message is what ties them to a point in the thread.
                 execute("UPDATE task_attachments SET message_id=?,session_id=? WHERE task_id=? AND message_id IS NULL",
                         (message_id, session['id'], task_id))
-                execute("UPDATE tasks SET status='pending' WHERE id=?", (task_id,))
-                submission = request_run(task['project_id'], task_id) if payload.get('start') else None
-                self.send_json({"ok": True, 'submission': submission}, 201)
+                if not already_running:
+                    execute("UPDATE tasks SET status='pending' WHERE id=?", (task_id,))
+                submission = request_run(task['project_id'], task_id) if payload.get('start') and not already_running else None
+                self.send_json({"ok": True, 'submission': submission, 'queued': already_running}, 201)
                 return
             match = re.match(r"^/api/tasks/(\d+)/sessions/rotate$", route)
             if match:

@@ -355,6 +355,20 @@ print('Implemented the requested feature.', flush=True)
             self.assertEqual(response.status, 200)
         self.assertIsNone(app.one('SELECT * FROM tasks WHERE id=?', (task_id,)))
 
+    def test_a_message_sent_while_a_run_is_active_queues_for_the_next_attempt(self):
+        project_id, task_id, run_id = self.create()
+        self.wait(task_id, 'awaiting_dispatch')
+        sent = self.api(f'/api/tasks/{task_id}/messages', {'content': 'One more thing before you start.', 'start': True})
+        self.assertTrue(sent['queued'])
+        self.assertIsNone(sent['submission'])
+        state = self.api(f'/api/tasks/{task_id}')
+        self.assertEqual(state['run']['status'], 'awaiting_dispatch')
+        self.assertTrue(any(m['content'] == 'One more thing before you start.' for m in state['messages']))
+        self.api(f'/api/runs/{run_id}/approve-dispatch', {})
+        state = self.wait(task_id, 'awaiting_commit')
+        prompt = app.task_prompt(state['task'], app.project_or_404(project_id))
+        self.assertIn('One more thing before you start.', prompt)
+
     def test_handoff_keeps_interrupted_harness_progress(self):
         self.configure_worker('codex', 'quota')
         project_id, task_id, run_id = self.create(location='local')
