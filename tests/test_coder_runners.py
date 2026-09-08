@@ -145,6 +145,16 @@ class CoderRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'preserved'):
             app.reserve_runner_worktree(run_id, task, self.runner, 'https://example.com/other')
 
+    def test_worktree_repoints_to_a_new_runner_for_the_same_repository(self):
+        task, run_id = self.task_run()
+        saved = app.reserve_runner_worktree(run_id, task, self.runner, 'https://example.com/repo')
+        other_workspace = dict(self.workspace, id='other-workspace', name='other-runner')
+        other_runner = app.save_coder_runner(self.server, self.owner, other_workspace)
+        self.assertNotEqual(other_runner['id'], self.runner['id'])
+        repointed = app.reserve_runner_worktree(run_id, task, other_runner, 'https://example.com/repo')
+        self.assertEqual(repointed['task_key'], saved['task_key'])
+        self.assertEqual(repointed['runner_id'], other_runner['id'])
+
     def test_account_binding_is_runner_scoped_and_never_stores_a_token(self):
         binding = app.execute('''INSERT INTO runner_account_bindings(
             runner_id,provider,label,account_email,plan_type,priority,created_at,updated_at)

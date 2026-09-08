@@ -1076,11 +1076,20 @@ def reserve_runner_worktree(run_id, task, runner, repo_url):
         if occupied >= runner_capacity(runner):
             raise ValueError('Runner capacity is occupied. Existing tasks are preserved; retry after a slot is free.')
         saved = conn.execute('SELECT * FROM coder_task_worktrees WHERE task_id=?', (task['id'],)).fetchone()
-        if saved and (saved['runner_id'] != runner['id'] or saved['repo_url'] != repo_url):
-            raise ValueError('This task belongs to another runner or repository. Its work was preserved; create a new task or migrate explicitly.')
+        if saved and saved['repo_url'] != repo_url:
+            raise ValueError('This task belongs to another repository. Its work was preserved; create a new task to switch repositories.')
         if not saved:
             conn.execute('''INSERT INTO coder_task_worktrees(task_id,runner_id,task_key,repo_url,created_at,updated_at)
                 VALUES(?,?,?,?,?,?)''', (task['id'], runner['id'], 'task-' + uuid.uuid4().hex, repo_url, now(), now()))
+        elif saved['runner_id'] != runner['id']:
+            # The project's canonical runner can change underneath a task (a new
+            # Coder token owner, an organization edit, a runner recreated after
+            # deletion) without the repository changing. Re-point the binding
+            # at the current runner instead of failing forever: the old
+            # runner's worktree is untouched on its own workspace, and a fresh
+            # checkout on the new runner is safe since the repo is the same.
+            conn.execute('UPDATE coder_task_worktrees SET runner_id=?,updated_at=? WHERE task_id=?',
+                         (runner['id'], now(), task['id']))
         conn.execute('''UPDATE execution_leases SET state='provisioning',runner_id=?,workspace_id=?,
             workspace_name=?,workspace_url=?,template_name=?,updated_at=? WHERE run_id=?''',
             (runner['id'], runner['workspace_id'], runner['workspace_name'], runner['workspace_url'], runner['template_name'], now(), run_id))
