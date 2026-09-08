@@ -1,1 +1,21 @@
-.empty{align-content:center;justify-items:center;gap:6px}.empty h3{margin:0}.empty p{max-width:46ch}.focus .empty,.savedviews .empty,.list .empty{grid-column:1/-1;min-height:230px;border:1px dashed #dde2ec;border-radius:8px;background:#fbfcfe;padding:32px 20px}
+.empty {
+  align-content: center;
+  justify-items: center;
+  gap: 6px;
+}
+.empty h3 {
+  margin: 0;
+}
+.empty p {
+  max-width: 46ch;
+}
+.focus .empty,
+.savedviews .empty,
+.list .empty {
+  grid-column: 1/-1;
+  min-height: 230px;
+  border: 1px dashed #dde2ec;
+  border-radius: 8px;
+  background: #fbfcfe;
+  padding: 32px 20px;
+}

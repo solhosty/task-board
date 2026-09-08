@@ -25,7 +25,7 @@ The GitHub repository is `solhosty/alpha-01`, branch `main`.
   it; the user normally serves this checkout at `http://127.0.0.1:4173/`.
 - Live validation on September 4: both Claude Code and Codex completed isolated
   one-file tasks in the persistent runner, returned their diffs, passed `git
-  diff --check`, and stopped at **Needs review**. Harness also recognizes
+diff --check`, and stopped at **Needs review**. Harness also recognizes
   structured Codex item errors as failures even if the CLI exits zero.
 
 ## What a Coder task does now

@@ -4,6 +4,9 @@ __pycache__/
 .DS_Store
 
 
+# Node dependencies (never committed; restore with `npm ci`)
+node_modules/
+
 # Node dependencies (never committed; restore with `npm --prefix frontend ci`)
 frontend/node_modules/
 

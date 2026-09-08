@@ -1,6 +1,23 @@
-.mobile-task-list{display:none}
-@media(max-width:600px){
-  .board,.list{display:none!important}
-  .mobile-task-list{display:grid;gap:8px}
-  .mobile-task-list .taskcard{display:grid;gap:10px;min-height:0;border:1px solid var(--line);border-radius:5px;background:#fff;padding:13px;text-align:left}
+.mobile-task-list {
+  display: none;
+}
+@media (max-width: 600px) {
+  .board,
+  .list {
+    display: none !important;
+  }
+  .mobile-task-list {
+    display: grid;
+    gap: 8px;
+  }
+  .mobile-task-list .taskcard {
+    display: grid;
+    gap: 10px;
+    min-height: 0;
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    background: #fff;
+    padding: 13px;
+    text-align: left;
+  }
 }
