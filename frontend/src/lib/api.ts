@@ -1,7 +1,8 @@
 import { QueryClient } from '@tanstack/react-query';
 export const queryClient = new QueryClient({defaultOptions:{queries:{retry:1,refetchOnWindowFocus:true}}});
 export async function api<T = any>(path:string, method='GET', body?:unknown):Promise<T> {
- const response=await fetch(path,{method,headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});
+ const controller=new AbortController(); const timeout=window.setTimeout(()=>controller.abort(),120000);
+ let response:Response; try { response=await fetch(path,{method,headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:controller.signal}); } catch(error) { if((error as Error).name==='AbortError') throw new Error(`The request to ${path} timed out while the runner was provisioning.`); throw new Error(`Cannot reach the local backend for ${path}. Start the Python server and reload.`); } finally { window.clearTimeout(timeout); }
  const contentType=response.headers.get('content-type')||'';
  if(!contentType.includes('application/json')) throw new Error(`The server returned ${contentType||'an unexpected response'} for ${path}. Start the Python server and reload.`);
  const data=await response.json(); if(!response.ok) throw new Error(data.error||`Request failed (${response.status})`); return data;
@@ -15,7 +16,7 @@ export type Project={id:number;name:string;repo_path:string;tasks:Task[];board_v
 export type Harness={key:string;label:string;enabled:number;installed:number;model:string;availability:{code:string;label:string;reason:string};[key:string]:any};
 export type ModelChoice={model:string;source:string};
 export type AdapterInfo={models:string[];model_source:string;runnable:boolean};
-export type Bootstrap={api_version:number;projects:Project[];harnesses:Harness[];coder_servers:any[];adapters:Record<string,AdapterInfo>};
+export type Bootstrap={api_version:number;projects:Project[];harnesses:Harness[];coder_servers:any[];runners:any[];account_bindings:any[];adapters:Record<string,AdapterInfo>};
 export function modelName(id:string){return id==='default'?'Harness default':id;}
 export const stages:Record<string,string>={planned:'Planned',running:'Running',review:'Needs review',done:'Done'};
 export function stageOf(task:Task):string {if(task.workflow_stage)return task.workflow_stage; if(task.status==='completed'||task.run?.status==='complete')return 'done';if(['awaiting_review','awaiting_commit'].includes(task.run?.status||''))return 'review';if(['running','queued','verifying','rotating','committing','awaiting_dispatch','awaiting_capacity','awaiting_resume','paused_cooldown','awaiting_external_auth'].includes(task.run?.status||''))return 'running';return 'planned';}

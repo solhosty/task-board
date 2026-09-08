@@ -113,6 +113,12 @@ CHILDREN = set()
 REMOTE_RESULT_MARKER = '__HARNESS_REMOTE_RESULT__'
 REMOTE_DELIVERY_MARKER = '__HARNESS_REMOTE_DELIVERY_RESULT__'
 RUNNER_CAPACITY_REFRESH_SECONDS = 60
+# A short-lived fallback was used while the original template was failing to
+# build locally.  Existing private runners must remain usable, but new runner
+# creation must honor the template selected by the project.
+LEGACY_RUNNER_TEMPLATE_ALIASES = {
+    'agent-template': {'harness-hunter-local-rese-3f023b'},
+}
 
 QUOTA_PATTERNS = [
     re.compile(pattern, re.I)
@@ -127,6 +133,8 @@ AUTH_FLOWS = {}
 AUTH_FLOW_LOCK = threading.RLock()
 MODEL_AUTH_FLOWS = {}
 MODEL_AUTH_LOCK = threading.RLock()
+RUNNER_PROVISION_JOBS = {}
+RUNNER_PROVISION_LOCK = threading.RLock()
 
 
 def now() -> str:
@@ -223,6 +231,15 @@ def project_coder_profile(project_id: int) -> Optional[Dict[str, Any]]:
 def coder_profile_for_server(server_id: int) -> Dict[str, Any]:
     profile = one('SELECT * FROM project_coder_profiles WHERE coder_server_id=? AND enabled=1 ORDER BY project_id LIMIT 1', (server_id,))
     if not profile:
+        # Account-pool management is server-scoped. If an existing runner is
+        # already registered, reuse its template so adding another account
+        # does not require an unrelated project-settings detour.
+        runner = one('SELECT template_name FROM coder_runners WHERE coder_server_id=? AND template_name IS NOT NULL AND template_name != ? ORDER BY id LIMIT 1', (server_id, ''))
+        if runner and runner.get('template_name'):
+            return {'coder_server_id': server_id, 'template_name': runner['template_name']}
+        project = one('SELECT name FROM projects ORDER BY id LIMIT 1')
+        if project:
+            return {'coder_server_id': server_id, 'template_name': coder_template_name(server.get('name') or 'coder', project['name'])}
         raise ValueError('Enable this Coder server for a project before connecting a model.')
     return profile
 
@@ -592,7 +609,7 @@ def coder_runner_context(server: Dict[str, Any]):
         raise ValueError('The registered Coder organization could not be resolved uniquely.')
     owner['_runner_organization_id'] = matches[0]['id']
     runner = one('''SELECT * FROM coder_runners WHERE coder_server_id=? AND deployment_url=?
-        AND organization=? AND owner_id=?''',
+        AND organization=? AND owner_id=? ORDER BY id LIMIT 1''',
         (server['id'], server['base_url'], server['organization'], owner['id']))
     return token, owner, runner
 
@@ -613,26 +630,18 @@ def save_coder_runner(server, owner, workspace, allow_migration=False):
     validate_runner_workspace(server, owner, workspace)
     with CODER_RUNNER_LOCK:
         existing = one('''SELECT * FROM coder_runners WHERE coder_server_id=? AND deployment_url=?
-            AND organization=? AND owner_id=?''',
-            (server['id'], server['base_url'], server['organization'], owner['id']))
-        if existing and existing['workspace_id'] != workspace['id']:
-            if not allow_migration:
-                raise ValueError('This account already has a runner. Moving its tasks and logins requires an explicit migration.')
-            workspace_url = server['base_url'].rstrip('/') + '/@' + quote(owner['username'], safe='') + '/' + quote(workspace['name'], safe='')
-            execute('''UPDATE coder_runners SET workspace_id=?,workspace_name=?,workspace_url=?,template_name=?,
-                detected_cpu_count=NULL,detected_memory_bytes=NULL,detected_max_tasks=NULL,capacity_checked_at=NULL,updated_at=? WHERE id=?''',
-                    (workspace['id'], workspace['name'], workspace_url, workspace.get('template_name') or '', now(), existing['id']))
-            return one('SELECT * FROM coder_runners WHERE id=?', (existing['id'],))
+            AND organization=? AND owner_id=? AND workspace_id=?''',
+            (server['id'], server['base_url'], server['organization'], owner['id'], workspace['id']))
         workspace_url = server['base_url'].rstrip('/') + '/@' + quote(owner['username'], safe='') + '/' + quote(workspace['name'], safe='')
         execute('''INSERT INTO coder_runners(coder_server_id,deployment_url,organization,owner_id,
             workspace_id,workspace_name,workspace_url,template_name,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(coder_server_id,deployment_url,organization,owner_id)
+            VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(coder_server_id,deployment_url,organization,owner_id,workspace_id)
             DO UPDATE SET workspace_name=excluded.workspace_name,workspace_url=excluded.workspace_url,
             template_name=excluded.template_name,updated_at=excluded.updated_at''',
             (server['id'], server['base_url'], server['organization'], owner['id'], workspace['id'],
              workspace['name'], workspace_url, workspace.get('template_name') or '', now(), now()))
-        return one('SELECT * FROM coder_runners WHERE coder_server_id=? AND deployment_url=? AND organization=? AND owner_id=?',
-                   (server['id'], server['base_url'], server['organization'], owner['id']))
+        return one('SELECT * FROM coder_runners WHERE coder_server_id=? AND deployment_url=? AND organization=? AND owner_id=? AND workspace_id=?',
+                   (server['id'], server['base_url'], server['organization'], owner['id'], workspace['id']))
 
 
 def runner_capacity(runner: Dict[str, Any]) -> int:
@@ -681,6 +690,15 @@ def refresh_saved_runner_capacity(server: Dict[str, Any]) -> Optional[Dict[str, 
     return refresh_runner_capacity(runner, environment)
 
 
+def compatible_runner_template(profile: Dict[str, Any], workspace_template: Any) -> bool:
+    """Allow an explicitly recorded legacy fallback, never an arbitrary template."""
+    expected = str(profile.get('template_name') or '').strip()
+    actual = str(workspace_template or '').strip()
+    if not expected or not actual or actual == expected:
+        return True
+    return actual in LEGACY_RUNNER_TEMPLATE_ALIASES.get(expected, set())
+
+
 def ensure_coder_runner(server, profile):
     with CODER_RUNNER_LOCK:
         token, owner, runner = coder_runner_context(server)
@@ -691,7 +709,7 @@ def ensure_coder_runner(server, profile):
             validate_runner_workspace(server, owner, workspace)
             if workspace['id'] != runner['workspace_id']:
                 raise ValueError('The saved runner no longer matches Coder. Recovery is required.')
-            if profile.get('template_name') and workspace.get('template_name') and workspace['template_name'] != profile['template_name']:
+            if not compatible_runner_template(profile, workspace.get('template_name')):
                 raise ValueError('The saved runner uses a different template. Use runner migration; the old workspace will be preserved.')
             # Keep the same workspace ID through renames; never replace a missing runner.
             runner = save_coder_runner(server, owner, workspace)
@@ -735,6 +753,80 @@ def migrate_coder_runner(server: Dict[str, Any], profile: Dict[str, Any]) -> Dic
                 'previous_workspace_name': previous['workspace_name'] if previous else None}
 
 
+def create_isolated_coder_runner(server: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
+    """Provision an additional private runner; never repoints an existing one."""
+    with CODER_RUNNER_LOCK:
+        token, owner, _ = coder_runner_context(server)
+        template = str(profile.get('template_name') or '')
+        if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,127}', template):
+            raise ValueError('Choose a valid Coder template before creating an isolated runner.')
+        marker = json.dumps([server['base_url'], server['organization'], owner['id'], template, uuid.uuid4().hex])
+        name = 'harness-runner-' + hashlib.sha256(marker.encode()).hexdigest()[:12]
+        # Let the authenticated Coder CLI resolve its actual default
+        # organization. Older saved server records may contain a stale
+        # placeholder such as "default" even when Coder's organization is
+        # named differently.
+        organization = server.get('organization') or 'coder'
+        if organization == 'default':
+            organization = 'coder'
+        environment = dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=token,
+                           CODER_ORGANIZATION=organization)
+        owner_name = str(owner.get('username') or owner.get('name') or '').strip()
+        workspace_arg = f'{owner_name}/{name}' if owner_name else name
+        created = subprocess.run(['coder', 'create', workspace_arg, '--template', template, '--stop-after', '8h', '--use-parameter-defaults', '--yes'], env=environment, capture_output=True, text=True, timeout=120)
+        if created.returncode:
+            # Coder CLI can return EOF while the asynchronous build has
+            # already created the workspace. Reconcile by querying it before
+            # reporting failure, avoiding duplicate runners on retry.
+            try:
+                workspace = coder_json(server['base_url'], '/api/v2/users/me/workspace/' + quote(name, safe=''), token)
+            except Exception:
+                workspace = None
+            if workspace and workspace.get('id'):
+                runner = save_coder_runner(server, owner, workspace)
+                return {'runner': refresh_runner_capacity(runner, environment, force=True)}
+            detail = (created.stderr or created.stdout or '').strip().splitlines()
+            reason = detail[-1][:300] if detail else 'unknown Coder error'
+            raise RuntimeError(f'Coder could not create the isolated runner: {reason}. Existing runners were not changed.')
+        workspace = coder_json(server['base_url'], '/api/v2/users/me/workspace/' + quote(name, safe=''), token)
+        runner = save_coder_runner(server, owner, workspace)
+        runner = refresh_runner_capacity(runner, environment, force=True)
+        # The fallback template is intentionally minimal; install model CLIs
+        # on the isolated runner before exposing the authentication step.
+        subprocess.run(['coder', 'ssh', '--wait', 'yes', workspace_arg, '--', 'sh', '-lc',
+                        'if [ ! -x ~/.codex/packages/standalone/current/bin/codex ]; then curl -fsSL https://chatgpt.com/codex/install.sh | sh; fi'],
+                       env=environment, capture_output=True, text=True, timeout=180)
+        return {'runner': runner}
+
+
+def start_runner_provisioning(server: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
+    """Start runner creation without holding the dashboard request open."""
+    job_id = uuid.uuid4().hex
+    job = {'id': job_id, 'status': 'provisioning', 'message': 'Creating the private Coder runner…', 'started_at': now()}
+    with RUNNER_PROVISION_LOCK:
+        RUNNER_PROVISION_JOBS[job_id] = job
+
+    def provision() -> None:
+        try:
+            result = create_isolated_coder_runner(server, profile)
+            with RUNNER_PROVISION_LOCK:
+                job.update(status='ready', message='Runner is ready for provider sign-in.', runner=result['runner'], completed_at=now())
+        except Exception as exc:
+            with RUNNER_PROVISION_LOCK:
+                job.update(status='failed', message=str(exc), completed_at=now())
+
+    threading.Thread(target=provision, daemon=True).start()
+    return {'job': {k: v for k, v in job.items() if k != 'runner'}}
+
+
+def runner_provisioning_job(job_id: str) -> Dict[str, Any]:
+    with RUNNER_PROVISION_LOCK:
+        job = RUNNER_PROVISION_JOBS.get(job_id)
+        if not job:
+            raise ValueError('Runner setup session was not found. Refresh Connections to see any runner that finished creating.')
+        return dict(job)
+
+
 def remote_codex_account(runner: Dict[str, Any], environment: Dict[str, str], refresh: bool = False) -> Dict[str, Any]:
     """Read only the public account shape; never return an access token."""
     installed = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--',
@@ -758,13 +850,14 @@ def remote_codex_account(runner: Dict[str, Any], environment: Dict[str, str], re
 
 def remote_claude_account(runner: Dict[str, Any], environment: Dict[str, str]) -> Dict[str, Any]:
     """Ask Claude Code for its native status without reading its credentials."""
+    claude_path = '/home/coder/.local/node_modules/.bin/claude'
     present = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--',
-                              'ls', '-l', '/home/coder/.local/bin/claude'], env=environment,
+                              'test', '-x', claude_path], env=environment,
                               capture_output=True, text=True, timeout=45)
-    if present.returncode or 'claude' not in present.stdout:
+    if present.returncode:
         return {'installed': False, 'authenticated': False, 'detail': 'Claude Code is not installed in this runner.'}
     checked = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--',
-                              '/home/coder/.local/bin/claude', 'auth', 'status', '--json'], env=environment,
+                              claude_path, 'auth', 'status', '--json'], env=environment,
                              capture_output=True, text=True, timeout=45)
     try:
         payload = json.loads(checked.stdout)
@@ -792,11 +885,25 @@ def model_auth_status(server: Dict[str, Any], profile: Dict[str, Any]) -> Dict[s
                        'workspace_url': runner['workspace_url']}, 'providers': {'codex': codex, 'claude': claude}}
 
 
-def start_remote_codex_login(server: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
-    runner, environment = ensure_coder_runner(server, profile)
+def start_remote_codex_login(server: Dict[str, Any], profile: Dict[str, Any], runner: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if runner is None:
+        runner, environment = ensure_coder_runner(server, profile)
+    else:
+        environment = dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=read_coder_token(server), CODER_ORGANIZATION=server['organization'])
     probe = remote_codex_account(runner, environment)
     if not probe.get('installed'):
-        raise ValueError(probe.get('detail') or 'Codex is not installed in this runner.')
+        # Existing runners may predate the account pool and use a minimal
+        # template. Bring them up to date in-place before starting login.
+        target = runner['workspace_name']
+        install = subprocess.run(['coder', 'ssh', '--wait', 'yes', target, '--',
+                                  'curl', '-fsSL', 'https://chatgpt.com/codex/install.sh', '-o', '/tmp/codex-install.sh'],
+                                 env=environment, capture_output=True, text=True, timeout=60)
+        if install.returncode == 0:
+            install = subprocess.run(['coder', 'ssh', '--wait', 'yes', target, '--', 'sh', '/tmp/codex-install.sh'],
+                                     env=environment, capture_output=True, text=True, timeout=180)
+        probe = remote_codex_account(runner, environment)
+        if not probe.get('installed'):
+            raise ValueError(probe.get('detail') or 'Codex could not be installed in this runner.')
     if probe.get('authenticated'):
         return {'status': 'complete', 'provider': 'codex', 'message': 'Codex is already connected in this persistent runner.'}
     key = (server['id'], runner['workspace_id'], 'codex')
@@ -852,11 +959,19 @@ def remote_codex_login_flow(server_id: int, workspace_id: str) -> Optional[Dict[
         return {k: v for k, v in flow.items() if k != 'bridge'} if flow else None
 
 
-def start_remote_claude_login(server: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
-    runner, environment = ensure_coder_runner(server, profile)
+def start_remote_claude_login(server: Dict[str, Any], profile: Dict[str, Any], runner: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if runner is None:
+        runner, environment = ensure_coder_runner(server, profile)
+    else:
+        environment = dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=read_coder_token(server), CODER_ORGANIZATION=server['organization'])
     probe = remote_claude_account(runner, environment)
     if not probe.get('installed'):
-        raise ValueError(probe.get('detail') or 'Claude Code is not installed in this runner.')
+        install = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--',
+                                  'npm', 'install', '--prefix', '/home/coder/.local', '@anthropic-ai/claude-code'],
+                                 env=environment, capture_output=True, text=True, timeout=180)
+        probe = remote_claude_account(runner, environment)
+        if not probe.get('installed'):
+            raise ValueError(probe.get('detail') or 'Claude Code could not be installed in this runner.')
     if probe.get('authenticated'):
         return {'status': 'complete', 'provider': 'claude', 'message': 'Claude Code is already connected in this persistent runner.'}
     key = (server['id'], runner['workspace_id'], 'claude')
@@ -910,6 +1025,12 @@ def watch_remote_claude_login(key, flow) -> None:
     bridge: RemoteClaudeLogin = flow['bridge']
     try:
         while time.time() - flow['started_at'] < 15 * 60:
+            screen = bridge.snapshot().lower()
+            if 'login successful' in screen or 'logged in as' in screen:
+                with MODEL_AUTH_LOCK:
+                    if flow['status'] == 'pending':
+                        flow.update(status='complete', message='Claude Code is connected in this isolated runner.')
+                return
             if bridge.process.poll() is not None:
                 with MODEL_AUTH_LOCK:
                     if flow['status'] == 'pending':
@@ -1003,6 +1124,40 @@ def remote_workspace_snapshot(runner: Dict[str, Any], environment: Dict[str, str
     return remote_transport.workspace_snapshot(runner, environment, worktree_path, APP_ROOT)
 
 
+def remote_transfer_manifest(runner: Dict[str, Any], environment: Dict[str, str], worktree_path: str) -> Dict[str, Any]:
+    """Read the bounded cross-runner transfer preflight without changing either runner."""
+    return remote_transport.transfer_manifest(runner, environment, worktree_path, APP_ROOT)
+
+
+def runner_account_bindings(coder_server_id: int) -> List[Dict[str, Any]]:
+    """Public account metadata for routing; credentials remain only in runner homes."""
+    return rows('''SELECT b.*, r.workspace_name, r.detected_max_tasks FROM runner_account_bindings b
+                   JOIN coder_runners r ON r.id=b.runner_id WHERE r.coder_server_id=?
+                   ORDER BY b.provider,b.priority,b.id''', (coder_server_id,))
+
+
+def unassigned_runner_connections() -> List[Dict[str, Any]]:
+    """Discover signed-in provider logins that have not been admitted to the pool."""
+    result = []
+    runners = rows('''SELECT r.*,s.base_url,s.organization FROM coder_runners r
+                      JOIN coder_servers s ON s.id=r.coder_server_id ORDER BY r.id''')
+    assigned = {item['runner_id'] for item in rows('SELECT runner_id FROM runner_account_bindings')}
+    for runner in runners:
+        try:
+            server = one('SELECT * FROM coder_servers WHERE id=?', (runner['coder_server_id'],))
+            token = read_coder_token(server)
+            environment = dict(os.environ, CODER_URL=runner['base_url'], CODER_SESSION_TOKEN=token, CODER_ORGANIZATION=runner['organization'])
+            for provider, probe in (('codex', remote_codex_account), ('claude', remote_claude_account)):
+                if runner['id'] in assigned:
+                    continue
+                status = probe(runner, environment)
+                if status.get('installed') and status.get('authenticated'):
+                    result.append({'runner_id': runner['id'], 'workspace_name': runner['workspace_name'], 'provider': provider, 'email': status.get('email'), 'plan_type': status.get('plan_type')})
+        except Exception:
+            continue
+    return result
+
+
 
 
 
@@ -1025,18 +1180,24 @@ def saved_remote_workspace_snapshot(project: Dict[str, Any], task: Dict[str, Any
 
 
 def choose_remote_harness(task: Dict[str, Any], runner: Dict[str, Any], environment: Dict[str, str],
-                          excluded_keys: Tuple[str, ...] = (), locked_key: Optional[str] = None) -> Tuple[Dict[str, Any], str]:
+                          excluded_keys: Tuple[str, ...] = (), locked_key: Optional[str] = None) -> Tuple[Optional[Dict[str, Any]], str]:
     """Choose only CLIs installed and signed in inside this runner, never locally."""
     configured = {item['key']: item for item in rows("SELECT * FROM harnesses WHERE enabled=1 AND key IN ('codex','claude')")}
     order = ([locked_key] if locked_key else [])
     order += ([task['preferred_harness']] if task.get('preferred_harness') else [])
     order += [key for key in ('codex', 'claude') if key not in order]
     statuses = {}
+    cooling_down = []
+    moment = datetime.now(timezone.utc)
     for key in order:
         if key in excluded_keys:
             continue
         harness = configured.get(key)
         if not harness:
+            continue
+        cooldown_until = harness.get('cooldown_until')
+        if cooldown_until and datetime.fromisoformat(cooldown_until) > moment:
+            cooling_down.append(cooldown_until)
             continue
         status = remote_codex_account(runner, environment) if key == 'codex' else remote_claude_account(runner, environment)
         statuses[key] = status
@@ -1045,6 +1206,8 @@ def choose_remote_harness(task: Dict[str, Any], runner: Dict[str, Any], environm
             if locked_key == key:
                 return selected, 'remote session continuity'
             return selected, 'remote preferred' if task.get('preferred_harness') == key else 'remote fallback'
+    if cooling_down:
+        return None, 'remote cooldown'
     details = '; '.join(f"{key}: {value.get('detail') or ('not connected' if not value.get('authenticated') else 'unavailable')}" for key, value in statuses.items())
     raise ValueError('No supported authenticated harness is available in this persistent runner. Connect Codex or Claude Code in Coder first.' + (f' ({details})' if details else ''))
 
@@ -1142,6 +1305,25 @@ def execution_blockers(project: Dict[str, Any], task: Optional[Dict[str, Any]] =
     return blockers
 
 
+def parse_scheduled_for(value: Any) -> Optional[str]:
+    """Accept an ISO timestamp and persist it as a UTC instant."""
+    if value in (None, ''):
+        return None
+    if not isinstance(value, str):
+        raise ValueError('Scheduled time must be an ISO date and time.')
+    try:
+        moment = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        raise ValueError('Scheduled time must be an ISO date and time.')
+    if moment.tzinfo is None:
+        # The browser supplies a local datetime-local value. This dashboard is
+        # local too, so interpret it in the server's configured local timezone.
+        moment = moment.astimezone()
+    if moment <= datetime.now(timezone.utc):
+        raise ValueError('Scheduled time must be in the future.')
+    return moment.astimezone(timezone.utc).isoformat(timespec='seconds')
+
+
 def request_run(project_id: int, task_id: Optional[int] = None) -> Dict[str, Any]:
     # Do this outside the scheduler lock: Coder SSH may take a moment, and an
     # existing runner is enough to measure without provisioning anything.
@@ -1167,6 +1349,11 @@ def request_run(project_id: int, task_id: Optional[int] = None) -> Dict[str, Any
                    (project_id, int(task_id)) if task_id else (project_id,))
         if not task:
             raise ValueError('No pending task to run')
+        # An explicit Execute is allowed before the appointed time; either way,
+        # consuming the schedule prevents a later duplicate dispatch.
+        if task.get('scheduled_for'):
+            execute('UPDATE tasks SET scheduled_for=NULL WHERE id=?', (task['id'],))
+            task['scheduled_for'] = None
         mode = effective_mode(project, task)
         blockers = execution_blockers(project, task)
         backend, profile = effective_execution_backend(project, task)
@@ -1195,6 +1382,25 @@ def request_run(project_id: int, task_id: Optional[int] = None) -> Dict[str, Any
     if status == 'queued':
         threading.Thread(target=run_attempt, args=(run_id, project_id, task['id']), daemon=True).start()
     return {'run_id': run_id, 'status': status, 'message': message}
+
+
+def dispatch_scheduled_tasks() -> int:
+    """Start due planned tasks. Called by the server loop and directly in tests."""
+    due = rows("SELECT id,project_id FROM tasks WHERE status='pending' AND scheduled_for IS NOT NULL AND scheduled_for<=? ORDER BY scheduled_for,id", (now(),))
+    started = 0
+    for task in due:
+        try:
+            request_run(task['project_id'], task['id'])
+            started += 1
+        except (ValueError, RuntimeError):
+            # Keep temporarily blocked work visible for a person to handle.
+            continue
+    return started
+
+
+def scheduled_task_loop(stop: threading.Event) -> None:
+    while not stop.wait(15):
+        dispatch_scheduled_tasks()
 
 
 def update_run(run_id: str, status: str, message: str, attempt_id: Optional[int] = None) -> None:
@@ -1533,6 +1739,24 @@ def attempt_files(attempt: Dict[str, Any]) -> Dict[str, Any]:
     return {'files': files, 'available': True, 'worktree': str(root)}
 
 
+def live_attempt_files(attempt: Dict[str, Any]) -> Dict[str, Any]:
+    """List current attempt files, including a read-only Coder workspace."""
+    lease = execution_lease(attempt.get('run_id') or '')
+    if not lease or lease.get('backend') != 'coder':
+        return attempt_files(attempt)
+    task = one('SELECT * FROM tasks WHERE id=?', (attempt['task_id'],))
+    if not task:
+        return {'files': [], 'available': False, 'reason': 'This attempt’s task is no longer available.'}
+    snapshot = saved_remote_workspace_snapshot(project_or_404(task['project_id']), task)
+    if not snapshot.get('available'):
+        return {'files': [], 'available': False,
+                'reason': snapshot.get('reason') or 'Could not inspect the remote working folder.'}
+    return {'files': [{'path': path, 'status': 'changed', 'exists': False,
+                       'kind': 'file', 'media_type': 'text/plain', 'byte_size': 0}
+                      for path in snapshot.get('changed_files', [])],
+            'available': True, 'worktree': attempt.get('worktree_path'), 'remote': True}
+
+
 def cleanup_worktree(repo: Path, worktree: Path) -> None:
     worktrees.cleanup_worktree(repo, worktree, git)
 
@@ -1589,6 +1813,13 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
             excluded = (prior['harness_key'],) if prior and prior.get('harness_key') in ('codex', 'claude') else ()
             harness, selection = choose_remote_harness(task, runner, environment, excluded,
                 session.get('harness_key') if not resume_attempt_id else None)
+            if not harness:
+                waiting = rows("SELECT cooldown_until FROM harnesses WHERE enabled=1 AND cooldown_until IS NOT NULL ORDER BY cooldown_until LIMIT 1")
+                message = 'All authenticated harnesses in this persistent Coder runner have reached their usage limits. The remote worktree is preserved.'
+                if waiting:
+                    message += ' Next cooldown expires ' + waiting[0]['cooldown_until'] + '.'
+                update_run(run_id, 'paused_cooldown', message)
+                return
             permissions = json.loads(one('SELECT * FROM runs WHERE id=?', (run_id,))['permissions_json'] or '{}')
             permission_mode = permissions.get(harness['key'], 'standard')
             problem = permission_blocker(harness['key'], permission_mode)
@@ -1913,8 +2144,20 @@ class API(SimpleHTTPRequestHandler):
                 harnesses = rows('SELECT * FROM harnesses ORDER BY chain_position')
                 for harness in harnesses:
                     harness['availability'] = harness_availability(harness)
-                self.send_json({"api_version": 9, "projects": [serialize_project(item) for item in rows("SELECT * FROM projects ORDER BY id DESC")], "harnesses": harnesses,
-                                "coder_servers": [public_coder_server(item) for item in rows('SELECT * FROM coder_servers ORDER BY name')], "adapters": adapter_metadata()})
+                runners = rows('SELECT id,workspace_name,coder_server_id FROM coder_runners ORDER BY id')
+                for runner in runners:
+                    runner['available'] = False
+                    try:
+                        server = coder_server_or_404(runner['coder_server_id'])
+                        token = read_coder_token(server)
+                        coder_json(server['base_url'], '/api/v2/users/me/workspace/' + quote(runner['workspace_name'], safe=''), token)
+                        runner['available'] = True
+                    except Exception:
+                        pass
+                self.send_json({"api_version": 10, "projects": [serialize_project(item) for item in rows("SELECT * FROM projects ORDER BY id DESC")], "harnesses": harnesses,
+                                "coder_servers": [public_coder_server(item) for item in rows('SELECT * FROM coder_servers ORDER BY name')],
+                                "runners": runners,
+                                "account_bindings": rows('SELECT b.*,r.workspace_name FROM runner_account_bindings b JOIN coder_runners r ON r.id=b.runner_id ORDER BY b.provider,b.priority,b.id'), "adapters": adapter_metadata()})
                 return
             if route == "/api/harness-order":
                 scope, scope_id = harness_order_scope(
@@ -1931,6 +2174,31 @@ class API(SimpleHTTPRequestHandler):
                     inherited = global_harness_order()
                 self.send_json({"order": own or inherited, "source": scope if own else "inherited",
                                 "inherited": inherited, "overridden": bool(own)})
+                return
+            if route == '/api/account-connections':
+                self.send_json({'connections': unassigned_runner_connections()})
+                return
+            match = re.fullmatch(r'^/api/coder-runners/(\d+)/model-auth/claude/flow$', route)
+            if match:
+                runner = one('SELECT * FROM coder_runners WHERE id=?', (int(match.group(1)),))
+                if not runner:
+                    raise ValueError('Runner not found.')
+                flow = remote_claude_login_flow(runner['coder_server_id'], runner['workspace_id'])
+                self.send_json({'flow': flow})
+                return
+            match = re.fullmatch(r'/api/runner-provisioning/([a-f0-9]{32})', route)
+            if match:
+                self.send_json({'job': runner_provisioning_job(match.group(1))})
+                return
+            match = re.match(r'^/api/coder-runners/(\d+)/model-auth/(codex|claude)$', route)
+            if match:
+                runner = one('SELECT * FROM coder_runners WHERE id=?', (int(match.group(1)),))
+                if not runner:
+                    raise ValueError('Runner not found.')
+                server = coder_server_or_404(runner['coder_server_id'])
+                environment = dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=read_coder_token(server), CODER_ORGANIZATION=server['organization'])
+                status = remote_codex_account(runner, environment, refresh=True) if match.group(2) == 'codex' else remote_claude_account(runner, environment)
+                self.send_json({'runner_id': runner['id'], 'provider': match.group(2), 'status': status})
                 return
             if route == "/api/memories":
                 self.send_json(memory_store.overview(rows("SELECT * FROM projects ORDER BY id DESC")))
@@ -2060,7 +2328,7 @@ class API(SimpleHTTPRequestHandler):
                 attempt = one("SELECT * FROM attempts WHERE id=?", (int(match.group(1)),))
                 if not attempt:
                     raise ValueError("Attempt not found")
-                listing = attempt_files(attempt)
+                listing = live_attempt_files(attempt)
                 wanted = parse_qs(urlparse(self.path).query).get('path', [None])[0]
                 if wanted is None:
                     self.send_json(listing)
@@ -2168,6 +2436,37 @@ class API(SimpleHTTPRequestHandler):
                     for position, item in enumerate(items):
                         conn.execute('UPDATE tasks SET workflow_stage=?,board_position=? WHERE id=? AND project_id=?', (item['workflow_stage'], position, item['id'], project_id))
                 self.send_json({'ok': True}); return
+            if route == '/api/account-bindings':
+                provider = str(payload.get('provider') or '')
+                label = str(payload.get('label') or '').strip()
+                runner_id = int(payload.get('runner_id') or 0)
+                if provider not in ('codex', 'claude') or not label or len(label) > 80:
+                    raise ValueError('Choose a provider and a short account label.')
+                runner = one('''SELECT r.*,s.base_url,s.organization FROM coder_runners r
+                                JOIN coder_servers s ON s.id=r.coder_server_id WHERE r.id=?''', (runner_id,))
+                if not runner: raise ValueError('Choose an existing isolated runner.')
+                if one('SELECT id FROM runner_account_bindings WHERE runner_id=?', (runner_id,)):
+                    raise ValueError('This runner is already assigned to an account. Use a different isolated runner.')
+                try:
+                    token = read_coder_token(one('SELECT * FROM coder_servers WHERE id=?', (runner['coder_server_id'],)))
+                    environment = dict(os.environ, CODER_URL=runner['base_url'], CODER_SESSION_TOKEN=token,
+                                       CODER_ORGANIZATION=runner['organization'])
+                    status = remote_codex_account(runner, environment) if provider == 'codex' else remote_claude_account(runner, environment)
+                except Exception as exc:
+                    raise ValueError('Could not verify this runner connection. Connect the provider in the runner, then try again.') from exc
+                if not status.get('installed') or not status.get('authenticated'):
+                    raise ValueError('This runner is not signed in to %s yet.' % provider.title())
+                binding_id = execute('''INSERT INTO runner_account_bindings(runner_id,provider,label,priority,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?)''', (runner_id, provider, label, int(payload.get('priority') or 0), now(), now()))
+                self.send_json({'binding': one('SELECT * FROM runner_account_bindings WHERE id=?', (binding_id,))}); return
+            if route == '/api/account-bindings/order':
+                ids = payload.get('ids')
+                existing = rows('SELECT id FROM runner_account_bindings ORDER BY id')
+                if not isinstance(ids, list) or {int(x) for x in ids} != {item['id'] for item in existing}:
+                    raise ValueError('Account order must include every account exactly once.')
+                for position, binding_id in enumerate(ids):
+                    execute('UPDATE runner_account_bindings SET priority=?,updated_at=? WHERE id=?', (position, now(), int(binding_id)))
+                self.send_json({'ok': True}); return
             match = re.match(r'^/api/coder-servers/(\d+)/runner$', route)
             if match:
                 server = coder_server_or_404(int(match.group(1)))
@@ -2190,10 +2489,36 @@ class API(SimpleHTTPRequestHandler):
                     raise ValueError('Choose this Coder server for the project before migrating its runner.')
                 self.send_json(migrate_coder_runner(server, profile))
                 return
+            match = re.match(r'^/api/coder-servers/(\d+)/runners/create$', route)
+            if match:
+                server = coder_server_or_404(int(match.group(1)))
+                profile = coder_profile_for_server(server['id'])
+                self.send_json(start_runner_provisioning(server, profile), 202)
+                return
             match = re.match(r'^/api/coder-servers/(\d+)/model-auth/codex/connect$', route)
             if match:
                 server = coder_server_or_404(int(match.group(1)))
                 self.send_json(start_remote_codex_login(server, coder_profile_for_server(server['id'])))
+                return
+            match = re.match(r'^/api/coder-runners/(\d+)/model-auth/(codex|claude)/connect$', route)
+            if match:
+                runner = one('SELECT * FROM coder_runners WHERE id=?', (int(match.group(1)),))
+                if not runner:
+                    raise ValueError('Runner not found.')
+                server = coder_server_or_404(runner['coder_server_id'])
+                profile = coder_profile_for_server(server['id'])
+                flow = start_remote_codex_login(server, profile, runner) if match.group(2) == 'codex' else start_remote_claude_login(server, profile, runner)
+                self.send_json(flow)
+                return
+            match = re.fullmatch(r'^/api/coder-runners/(\d+)/model-auth/claude/input$', route)
+            if match:
+                runner = one('SELECT * FROM coder_runners WHERE id=?', (int(match.group(1)),))
+                if not runner:
+                    raise ValueError('Runner not found.')
+                value = str(payload.get('input') or '').strip()
+                if not value:
+                    raise ValueError('Paste the code from Claude to continue.')
+                self.send_json(send_remote_claude_login_input(runner['coder_server_id'], runner['workspace_id'], value))
                 return
             match = re.match(r'^/api/coder-servers/(\d+)/model-auth/claude/connect$', route)
             if match:
@@ -2401,6 +2726,9 @@ class API(SimpleHTTPRequestHandler):
                 execution_target = payload.get('execution_target', 'project')
                 if execution_target not in ('project', 'local', 'coder'):
                     raise ValueError('Execution target must be project default, local, or Coder.')
+                scheduled_for = parse_scheduled_for(payload.get('scheduled_for'))
+                if scheduled_for and payload.get('start'):
+                    raise ValueError('A scheduled task must wait for its scheduled time.')
                 # Decode before creating anything: a rejected file should not
                 # leave a half-described task on the board.
                 incoming = payload.get('attachments') or []
@@ -2412,8 +2740,8 @@ class API(SimpleHTTPRequestHandler):
                     attachment_store.classify(filename)
                 with DB_LOCK:
                     order = one("SELECT COALESCE(MAX(task_order),-1)+1 AS n FROM tasks WHERE project_id=?", (project_id,))["n"]
-                    task_id = execute("INSERT INTO tasks(project_id,text,task_order,status,created_at) VALUES(?,?,?,'pending',?)",
-                        (project_id, task_text.splitlines()[0][:120], order, now()))
+                    task_id = execute("INSERT INTO tasks(project_id,text,task_order,status,scheduled_for,created_at) VALUES(?,?,?,'pending',?,?)",
+                        (project_id, task_text.splitlines()[0][:120], order, scheduled_for, now()))
                     execute("UPDATE tasks SET board_position=? WHERE id=?", (order, task_id))
                     execute('UPDATE tasks SET tool_permissions=?,memory_mode=?,execution_target=? WHERE id=?',
                             (permissions, memory_mode, execution_target, task_id))
@@ -2610,6 +2938,8 @@ class API(SimpleHTTPRequestHandler):
                 if not task:
                     raise ValueError("Task not found")
                 fields = {name: payload[name] for name in ("text", "mode_override", "preferred_harness", "preferred_model", "force_gate", "degradable", "tool_permissions", "memory_mode", "execution_target", "session_budget_chars") if name in payload}
+                if 'scheduled_for' in payload:
+                    fields['scheduled_for'] = parse_scheduled_for(payload['scheduled_for'])
                 if 'tool_permissions' in fields and fields['tool_permissions'] not in ('inherit','standard','auto','ask'):
                     raise ValueError('Unknown task permission mode')
                 if 'memory_mode' in fields and fields['memory_mode'] not in ('inherit', 'read_write', 'read_only', 'off'):
@@ -2668,6 +2998,34 @@ class API(SimpleHTTPRequestHandler):
                 if scope == "global":
                     raise ValueError("The global order is the root; it has nothing to inherit")
                 clear_harness_order(scope, scope_id)
+                self.send_json({"ok": True})
+                return
+            match = re.fullmatch(r"/api/account-bindings/(\d+)", route)
+            if match:
+                binding_id = int(match.group(1))
+                if not one("SELECT id FROM runner_account_bindings WHERE id=?", (binding_id,)):
+                    raise ValueError("Connection not found")
+                execute("DELETE FROM runner_account_bindings WHERE id=?", (binding_id,))
+                self.send_json({"ok": True})
+                return
+            match = re.fullmatch(r"/api/coder-runners/(\d+)", route)
+            if match:
+                runner_id = int(match.group(1))
+                if not one("SELECT id FROM coder_runners WHERE id=?", (runner_id,)):
+                    raise ValueError("Runner not found")
+                remove_connection = parse_qs(urlparse(self.path).query).get("remove_connection", ["0"])[0] == "1"
+                if one("SELECT id FROM runner_account_bindings WHERE runner_id=?", (runner_id,)) and not remove_connection:
+                    raise ValueError("Remove the pool connection before removing its runner record")
+                # These are local bookkeeping rows for a runner that no longer
+                # exists remotely. Preserve tasks and remote workspaces, but
+                # remove references that would otherwise prevent cleanup.
+                with DB_LOCK, db() as conn:
+                    if remove_connection:
+                        conn.execute("DELETE FROM runner_account_bindings WHERE runner_id=?", (runner_id,))
+                    conn.execute("DELETE FROM coder_task_worktrees WHERE runner_id=?", (runner_id,))
+                    conn.execute("DELETE FROM remote_workspace_transfers WHERE source_runner_id=? OR destination_runner_id=?", (runner_id, runner_id))
+                    conn.execute("UPDATE execution_leases SET runner_id=NULL,workspace_id=NULL,workspace_name=NULL,workspace_url=NULL,template_name=NULL WHERE runner_id=?", (runner_id,))
+                    conn.execute("DELETE FROM coder_runners WHERE id=?", (runner_id,))
                 self.send_json({"ok": True})
                 return
             match = re.fullmatch(r"/api/memories/(\w+)/([a-z0-9-]+)", route)
@@ -2751,6 +3109,10 @@ def main() -> None:
     execute("UPDATE attempts SET status='interrupted',ended_at=? WHERE status='running'", (now(),))
     scan_harnesses()
     recover_capacity_waiters()
+    dispatch_scheduled_tasks()
+    scheduler_stop = threading.Event()
+    scheduler = threading.Thread(target=scheduled_task_loop, args=(scheduler_stop,), daemon=True)
+    scheduler.start()
     os.chdir(STATIC_ROOT)
     server = create_server(args.port)
     print(f"Harness Rotation is running at http://{HOST}:{server.server_port}", flush=True)
@@ -2759,6 +3121,7 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
+        scheduler_stop.set()
         for process in list(CHILDREN):
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)

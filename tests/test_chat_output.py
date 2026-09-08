@@ -36,7 +36,7 @@ class ChatOutputTests(unittest.TestCase):
             result = app.log_details({'log_path':str(file),'harness_key':'codex'})
             self.assertEqual(result['resume_command'], 'codex resume '+session)
             self.assertLessEqual(len(result['log']),30000)
-            self.assertLessEqual(len(result['activity']),6)
+            self.assertLessEqual(len(result['activity']),30)
             self.assertTrue(all(a['text']=='cat src/main.rs' for a in result['activity']))
 
     def test_legacy_session_header(self):
@@ -46,6 +46,13 @@ class ChatOutputTests(unittest.TestCase):
             result=app.log_details({'log_path':str(file),'harness_key':'codex'})
             self.assertTrue(result['resume_command'])
             self.assertEqual(result['activity'],[])
+
+    def test_legacy_transcript_is_presented_as_activity(self):
+        with tempfile.TemporaryDirectory(prefix='rotation-chat-test-') as directory:
+            file = Path(directory)/'output.log'
+            file.write_text('OpenAI Codex v0.149.0\nuser\nDo the work\ncodex\nI found the problem.\nexec\n')
+            result = app.log_details({'log_path':str(file),'harness_key':'codex'})
+            self.assertEqual(result['activity'], [{'kind':'message','text':'I found the problem.','status':''}])
 
     def test_shared_activity_format_for_each_harness(self):
         events = {
