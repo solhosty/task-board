@@ -3000,6 +3000,15 @@ class API(SimpleHTTPRequestHandler):
                 clear_harness_order(scope, scope_id)
                 self.send_json({"ok": True})
                 return
+            match = re.fullmatch(r"/api/projects/(\d+)/board-views/(\d+)", route)
+            if match:
+                project_id, view_id = map(int, match.groups())
+                project_or_404(project_id)
+                if not one("SELECT id FROM board_views WHERE id=? AND project_id=?", (view_id, project_id)):
+                    raise ValueError("View not found")
+                execute("DELETE FROM board_views WHERE id=? AND project_id=?", (view_id, project_id))
+                self.send_json({"ok": True})
+                return
             match = re.fullmatch(r"/api/account-bindings/(\d+)", route)
             if match:
                 binding_id = int(match.group(1))
