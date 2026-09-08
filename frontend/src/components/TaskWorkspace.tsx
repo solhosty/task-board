@@ -4,7 +4,7 @@ import {Paperclip,Send,ExternalLink,RotateCcw,GitPullRequest,Terminal,ShieldChec
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import '../live-activity.css';
-import {api,type Project,type Task,label,stageOf} from '@/lib/api';
+import {api,type Project,type Task,label,stageOf,taskRefreshInterval} from '@/lib/api';
 import {attachmentName,readBase64,readableSize,type Attachment} from '@/lib/files';
 import {Button} from './ui/button';
 import {Modal,Tabs,Textarea,Empty,Field,Select} from './ui/controls';
@@ -21,7 +21,7 @@ function LiveActivity({attempt,active}:{attempt:any;active:boolean}){
  return <section className="live-activity" aria-live="polite"><div className="live-activity-heading"><span><Activity size={15}/>{active?'Live harness activity':'Harness activity'}</span><small>{active?'Refreshing':'Latest attempt'}</small></div>{activity.length>0&&<div className="live-events">{activity.map((item,index)=><div className="live-event" key={`${item.kind}-${item.text}-${index}`}>{item.kind==='edit'?<FilePenLine size={14}/>:item.kind==='command'||item.kind==='tool'?<Wrench size={14}/>:<Activity size={14}/>}<span>{item.text}</span>{item.status&&<small>{label(item.status)}</small>}</div>)}</div>}{changes&&!changes.available?<p className="muted">{changes.reason}</p>:files.length>0?<div className="live-files"><div><FolderCode size={14}/>Working tree changes{changes?.remote?' in Coder':''}</div>{files.map(file=><span key={file.path}><b>{label(file.status)}</b>{file.path}</span>)}</div>:<p className="muted">{active?'No file changes reported yet.':'No file-change record was retained for this attempt.'}</p>}</section>
 }
 export default function TaskWorkspace({project,taskId,onBack,onDeleted,refresh,notify}:{project:Project;taskId:number;onBack:()=>void;onDeleted:()=>void;refresh:()=>void;notify:(s:string)=>void}){
- const {data:detail,error,isLoading,refetch}=useQuery({queryKey:['task',taskId],queryFn:()=>api<Detail>(`/api/tasks/${taskId}`),refetchInterval:q=>['running','verifying','rotating','committing'].includes(q.state.data?.run?.status||'')?2500:false});
+ const {data:detail,error,isLoading,refetch}=useQuery({queryKey:['task',taskId],queryFn:()=>api<Detail>(`/api/tasks/${taskId}`),refetchInterval:q=>taskRefreshInterval(q.state.data?.task?{run:q.state.data.run,scheduled_for:q.state.data.task.scheduled_for}:undefined),refetchIntervalInBackground:true});
  const [inspector,setInspector]=useState('overview'),[message,setMessage]=useState(''),[session,setSession]=useState<any>(),[settings,setSettings]=useState(false),[uploading,setUploading]=useState(false),[authMessage,setAuthMessage]=useState('');
  const fileInput=useRef<HTMLInputElement>(null);
  if(isLoading)return <main className="task-workspace"><div className="loading">Loading task…</div></main>;
