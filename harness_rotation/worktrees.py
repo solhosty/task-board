@@ -10,6 +10,7 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from . import pr_copy
 
 Git = Callable[..., subprocess.CompletedProcess]
 
@@ -182,7 +183,8 @@ def commit_and_merge(project: Dict[str, Any], task: Dict[str, Any], attempt: Dic
     git(["add", "-A"], worktree)
     status = git(["status", "--porcelain"], worktree).stdout.strip()
     if status:
-        result = git(["commit", "-m", "harness: " + task["text"][:68]], worktree, check=False)
+        title, _ = pr_copy.title_and_body(task["text"], attempt.get("pr_title"), attempt.get("pr_summary"))
+        result = git(["commit", "-m", "harness: " + title], worktree, check=False)
         if result.returncode:
             raise RuntimeError(result.stderr.strip() or "Could not commit worktree changes")
     head = git(["rev-parse", "HEAD"], worktree).stdout.strip()

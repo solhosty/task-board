@@ -9,6 +9,8 @@ import shlex
 import subprocess
 from typing import Any, Dict, List, Tuple
 
+from . import pr_copy
+
 # Helper programs that execute *inside* the Coder runner rather than here. They
 # are sent over SSH as stdin, so they must stay stdlib-only and must never
 # import from this package. `infra/runner/` is their one canonical location.
@@ -83,12 +85,14 @@ def stage_attachments(runner: Dict[str, Any], environment: Dict[str, str], task_
     return staged
 
 
-def delivery_request(worktree: Dict[str, Any], task: Dict[str, Any], profile: Dict[str, Any]) -> str:
+def delivery_request(worktree: Dict[str, Any], task: Dict[str, Any], profile: Dict[str, Any],
+                     attempt: Dict[str, Any] = None) -> str:
+    title, body = pr_copy.title_and_body(task["text"], (attempt or {}).get("pr_title"), (attempt or {}).get("pr_summary"))
     request = {
         "worktree_path": worktree["worktree_path"], "branch_name": worktree["branch_name"],
         "base_sha": worktree["base_sha"], "repo_url": profile["repo_url"],
         "base_ref": profile["base_ref"],
-        "auth_provider_id": profile.get("auth_provider_id") or "github", "title": task["text"],
+        "auth_provider_id": profile.get("auth_provider_id") or "github", "title": title, "body": body,
     }
     encoded = base64.urlsafe_b64encode(json.dumps(request, separators=(",", ":")).encode()).decode()
     return shlex.join(["python3", "-", encoded])

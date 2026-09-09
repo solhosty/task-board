@@ -364,6 +364,16 @@ def _binding_cooldown_reason(connection: sqlite3.Connection) -> None:
     _add_column(connection, "runner_account_bindings", "cooldown_reason", "TEXT")
 
 
+def _attempt_pr_summary(connection: sqlite3.Connection) -> None:
+    """The harness's own PR_TITLE/PR_SUMMARY footer, parsed from its final reply.
+
+    Used in place of the raw task text for commit messages and PR titles so
+    they read like a human wrote them instead of a truncated task description.
+    """
+    _add_column(connection, "attempts", "pr_title", "TEXT")
+    _add_column(connection, "attempts", "pr_summary", "TEXT")
+
+
 MIGRATIONS = (
     Migration("001_execution_lease_runner", _runner_link),
     Migration("002_runner_capacity", _runner_capacity),
@@ -384,6 +394,7 @@ MIGRATIONS = (
     Migration("017_account_pool_transfers", _account_pool),
     Migration("018_multiple_coder_runners", _multiple_coder_runners),
     Migration("019_binding_cooldown_reason", _binding_cooldown_reason),
+    Migration("020_attempt_pr_summary", _attempt_pr_summary),
 )
 
 
