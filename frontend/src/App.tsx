@@ -166,7 +166,17 @@ export default function App() {
           />
         </nav>
         <div className="rail-projects">
-          <span className="rail-label">Projects</span>
+          <div className="rail-label-row">
+            <span className="rail-label">Projects</span>
+            <button
+              className="rail-label-add"
+              aria-label="Add project"
+              title="Add project"
+              onClick={() => setNewProject(true)}
+            >
+              <Plus size={13} />
+            </button>
+          </div>
           {data.projects.map((item) => (
             <button
               key={item.id}
@@ -180,10 +190,6 @@ export default function App() {
               <small>{item.tasks.length}</small>
             </button>
           ))}
-          <button className="project-select add-project" onClick={() => setNewProject(true)}>
-            <FolderPlus size={15} />
-            <span>Add project</span>
-          </button>
         </div>
         <nav className="setup-nav">
           <span className="rail-label">Setup</span>
@@ -255,7 +261,20 @@ export default function App() {
             />
           </nav>
           <div className="rail-projects">
-            <span className="rail-label">Projects</span>
+            <div className="rail-label-row">
+              <span className="rail-label">Projects</span>
+              <button
+                className="rail-label-add"
+                aria-label="Add project"
+                title="Add project"
+                onClick={() => {
+                  setMobileOpen(false);
+                  setNewProject(true);
+                }}
+              >
+                <Plus size={13} />
+              </button>
+            </div>
             {data.projects.map((item) => (
               <button
                 key={item.id}
@@ -270,16 +289,6 @@ export default function App() {
                 <small>{item.tasks.length}</small>
               </button>
             ))}
-            <button
-              className="project-select add-project"
-              onClick={() => {
-                setMobileOpen(false);
-                setNewProject(true);
-              }}
-            >
-              <FolderPlus size={15} />
-              <span>Add project</span>
-            </button>
           </div>
           <nav>
             <span className="rail-label">Setup</span>
@@ -1043,6 +1052,7 @@ function NewTask({
     </Modal>
   );
 }
+type DirectoryListing = { path: string; name: string; parent: string; folders: { name: string; path: string }[] };
 function NewProject({
   open,
   onClose,
@@ -1055,7 +1065,17 @@ function NewProject({
   notify: (s: string) => void;
 }) {
   const [name, setName] = useState(''),
-    [repoPath, setRepoPath] = useState('');
+    [repoPath, setRepoPath] = useState(''),
+    [browsing, setBrowsing] = useState(false),
+    [listing, setListing] = useState<DirectoryListing | null>(null);
+  async function browse(path?: string) {
+    try {
+      const result = await api<DirectoryListing>('/api/directories', 'POST', path ? { path } : {});
+      setListing(result);
+    } catch (error) {
+      notify((error as Error).message);
+    }
+  }
   async function create() {
     try {
       const result = await api<{ id: number }>('/api/projects', 'POST', {
@@ -1064,6 +1084,7 @@ function NewProject({
       });
       setName('');
       setRepoPath('');
+      setBrowsing(false);
       onCreated(result.id);
     } catch (error) {
       notify((error as Error).message);
@@ -1072,17 +1093,70 @@ function NewProject({
   return (
     <Modal
       open={open}
-      onClose={onClose}
+      onClose={() => {
+        setBrowsing(false);
+        onClose();
+      }}
       title="Add project"
       description="Point Aludra at a local project folder to start tracking tasks in it."
     >
       <Field label="Project folder" help="The absolute path to an existing folder on this machine.">
-        <Input
-          autoFocus
-          value={repoPath}
-          onChange={(event) => setRepoPath(event.target.value)}
-          placeholder="/Users/you/code/my-project"
-        />
+        <div className="folder-field">
+          <Input
+            autoFocus
+            value={repoPath}
+            onChange={(event) => setRepoPath(event.target.value)}
+            placeholder="/Users/you/code/my-project"
+          />
+          <Button
+            variant="secondary"
+            size="icon"
+            aria-label="Browse for folder"
+            title="Browse for folder"
+            onClick={() => {
+              setBrowsing(true);
+              browse(repoPath.trim() || undefined);
+            }}
+          >
+            <FolderPlus size={15} />
+          </Button>
+        </div>
+        {browsing && listing && (
+          <div className="folder-browser">
+            <div className="folder-browser-path">{listing.path}</div>
+            <div className="folder-browser-list">
+              {listing.parent !== listing.path && (
+                <button className="folder-browser-item" onClick={() => browse(listing.parent)}>
+                  <span>..</span>
+                </button>
+              )}
+              {listing.folders.map((folder) => (
+                <button
+                  key={folder.path}
+                  className="folder-browser-item"
+                  onClick={() => browse(folder.path)}
+                >
+                  <span>{folder.name}</span>
+                </button>
+              ))}
+              {!listing.folders.length && <p className="muted">No subfolders here.</p>}
+            </div>
+            <div className="folder-browser-actions">
+              <Button variant="secondary" size="sm" onClick={() => setBrowsing(false)}>
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => {
+                  setRepoPath(listing.path);
+                  setBrowsing(false);
+                }}
+              >
+                Use this folder
+              </Button>
+            </div>
+          </div>
+        )}
       </Field>
       <Field label="Name" help="Optional. Defaults to the folder name.">
         <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="My project" />
