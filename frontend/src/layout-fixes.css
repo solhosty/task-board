@@ -107,9 +107,6 @@
   gap: 6px;
   margin-bottom: 12px;
 }
-.board-search {
-  display: none;
-}
 .board {
   grid-template-columns: repeat(4, minmax(0, 1fr));
   max-width: 100%;

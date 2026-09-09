@@ -17,6 +17,9 @@
   .bar .actions .button.secondary {
     display: none;
   }
+  .bar .actions .search {
+    display: none;
+  }
   .bar .actions .button {
     min-height: 40px;
   }

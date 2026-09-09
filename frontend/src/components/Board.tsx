@@ -19,7 +19,6 @@ import { CSS } from '@dnd-kit/utilities';
 import {
   MoreHorizontal,
   GitPullRequest,
-  Search,
   Plus,
   Play,
   Clock3,
@@ -387,15 +386,16 @@ export default function Board({
   onNew,
   refresh,
   notify,
+  search = '',
 }: {
   project: Project;
   onOpen: (id: number) => void;
   onNew: () => void;
   refresh: () => void;
   notify: (message: string) => void;
+  search?: string;
 }) {
   const [tab, setTab] = useState('all'),
-    [search, setSearch] = useState(''),
     [config, setConfig] = useState(defaultView),
     [editing, setEditing] = useState(false),
     [name, setName] = useState('My view'),
@@ -554,15 +554,6 @@ export default function Board({
             Edit view
           </Button>
         </div>
-      </div>
-      <div className="board-search">
-        <Search size={15} />
-        <Input
-          aria-label="Search tasks"
-          placeholder="Search tasks…"
-          value={search}
-          onChange={(event) => setSearch(event.target.value)}
-        />
       </div>
       {tab === 'needs' ? (
         <FocusView tasks={filtered} onOpen={onOpen} onStart={startTask} />

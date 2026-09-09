@@ -21,6 +21,7 @@ import {
   FolderPlus,
   GripVertical,
   Paperclip,
+  Search,
   X,
 } from 'lucide-react';
 import {
@@ -87,7 +88,8 @@ export default function App() {
     [taskId, setTaskId] = useState<number>(),
     [newTask, setNewTask] = useState(false),
     [toast, setToast] = useState(''),
-    [mobileOpen, setMobileOpen] = useState(false);
+    [mobileOpen, setMobileOpen] = useState(false),
+    [taskSearch, setTaskSearch] = useState('');
   const project = data?.projects.find((item) => item.id === (projectId ?? data?.projects[0]?.id));
   useEffect(() => {
     if (!projectId && data?.projects[0]) setProjectId(data.projects[0].id);
@@ -294,6 +296,17 @@ export default function App() {
             <span>{subtitle[page]}</span>
           </div>
           <div className="actions">
+            {page === 'board' && (
+              <label className="search">
+                <Search size={15} />
+                <Input
+                  aria-label="Search tasks"
+                  placeholder="Search tasks…"
+                  value={taskSearch}
+                  onChange={(event) => setTaskSearch(event.target.value)}
+                />
+              </label>
+            )}
             <Button variant="secondary" onClick={() => setPage('settings')}>
               Project settings
             </Button>
@@ -311,6 +324,7 @@ export default function App() {
               onNew={() => setNewTask(true)}
               refresh={refresh}
               notify={notify}
+              search={taskSearch}
             />
           )}{' '}
           {page === 'activity' && <ActivityPage projects={data.projects} onOpen={setTaskId} />}{' '}
