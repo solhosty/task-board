@@ -46,7 +46,6 @@ responses, and displays expiry or failure. The private device code stays in memo
 only the one-time user code and verification URL reach the browser. Restarting
 Harness interrupts pending exchanges; begin a new connection after a restart.
 
-
 ```sh
 python3 app.py
 ```
@@ -78,7 +77,7 @@ scripts may continue to import `app` while modules are extracted incrementally.
 
 ### Runner payloads
 
-`infra/runner/` holds the programs that execute *inside* a persistent Coder
+`infra/runner/` holds the programs that execute _inside_ a persistent Coder
 runner rather than on the desktop. Each is sent over Coder SSH as stdin and run
 by `python3 -`, so they must stay standard-library only and must never import
 `app` or `harness_rotation`. The host reads them through

@@ -1,22 +1,144 @@
-.live-activity{max-width:720px;margin:0 0 24px;border:1px solid #dce2f8;border-radius:9px;background:#f8f9ff;padding:12px}
-.live-activity-heading,.live-activity-heading span,.live-files>div{display:flex;align-items:center;gap:7px}
-.live-activity-heading{justify-content:space-between;color:#2f42b7;font-size:12px;font-weight:700}.live-activity-heading small{color:#7280c7;font-size:10px}
-.live-events{display:grid;gap:8px;margin-top:10px;max-height:380px;overflow-y:auto}
-.live-event{color:#5c6574;font-size:11px;border-bottom:1px solid #e9ecfa;padding-bottom:7px}.live-event:last-child{border-bottom:none;padding-bottom:0}
-.live-event-head{display:flex;align-items:center;gap:7px}
-.live-event-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
-.live-event-head small{margin-left:auto;color:#7b8494;font-size:10px}
-.live-event-head small.busy{color:#c77b1f}
-.live-event.live-reasoning{color:#8b93a8;font-style:italic}
-.live-event.live-command .live-event-text,.live-event.live-tool .live-event-text{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-.live-event.live-error .live-event-text,.live-event.live-permission .live-event-text{color:#a4322a}
-.live-output{margin-top:5px}.live-output summary{cursor:pointer;color:#7280c7;font-size:10px}
-.live-output pre{margin:5px 0 0;max-height:220px;overflow:auto;background:#11142a;color:#d9dcf5;padding:8px;border-radius:6px;font-size:10.5px;white-space:pre-wrap;word-break:break-word}
-.live-permissions{margin:5px 0 0;padding-left:16px}.live-permissions code{margin-left:6px;color:#a4322a}
-.live-files{border-top:1px solid #e1e5f6;padding-top:9px;color:#677182;font-size:11px;display:grid;gap:6px;margin-top:10px}
-.live-files>div{color:#4d5cae;font-weight:650}
-.live-file{display:flex;align-items:center;gap:7px}
-.file-path{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
-.file-status{font-size:9px;text-transform:uppercase;color:#6675c8}
-.file-stat{display:flex;gap:6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px}
-.file-stat .added{color:#1a8f4c}.file-stat .removed{color:#c0392b}
+.live-activity {
+  max-width: 720px;
+  margin: 0 0 24px;
+  border: 1px solid #dce2f8;
+  border-radius: 9px;
+  background: #f8f9ff;
+  padding: 12px;
+}
+.live-activity-heading,
+.live-activity-heading span,
+.live-files > div {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.live-activity-heading {
+  justify-content: space-between;
+  color: #2f42b7;
+  font-size: 12px;
+  font-weight: 700;
+}
+.live-activity-heading small {
+  color: #7280c7;
+  font-size: 10px;
+}
+.live-events {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  max-height: 380px;
+  overflow-y: auto;
+}
+.live-event {
+  color: #5c6574;
+  font-size: 11px;
+  border-bottom: 1px solid #e9ecfa;
+  padding-bottom: 7px;
+}
+.live-event:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+.live-event-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.live-event-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.live-event-head small {
+  margin-left: auto;
+  color: #7b8494;
+  font-size: 10px;
+}
+.live-event-head small.busy {
+  color: #c77b1f;
+}
+.live-event.live-reasoning {
+  color: #8b93a8;
+  font-style: italic;
+}
+.live-event.live-command .live-event-text,
+.live-event.live-tool .live-event-text {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.live-event.live-error .live-event-text,
+.live-event.live-permission .live-event-text {
+  color: #a4322a;
+}
+.live-output {
+  margin-top: 5px;
+}
+.live-output summary {
+  cursor: pointer;
+  color: #7280c7;
+  font-size: 10px;
+}
+.live-output pre {
+  margin: 5px 0 0;
+  max-height: 220px;
+  overflow: auto;
+  background: #11142a;
+  color: #d9dcf5;
+  padding: 8px;
+  border-radius: 6px;
+  font-size: 10.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.live-permissions {
+  margin: 5px 0 0;
+  padding-left: 16px;
+}
+.live-permissions code {
+  margin-left: 6px;
+  color: #a4322a;
+}
+.live-files {
+  border-top: 1px solid #e1e5f6;
+  padding-top: 9px;
+  color: #677182;
+  font-size: 11px;
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+.live-files > div {
+  color: #4d5cae;
+  font-weight: 650;
+}
+.live-file {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.file-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.file-status {
+  font-size: 9px;
+  text-transform: uppercase;
+  color: #6675c8;
+}
+.file-stat {
+  display: flex;
+  gap: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+}
+.file-stat .added {
+  color: #1a8f4c;
+}
+.file-stat .removed {
+  color: #c0392b;
+}

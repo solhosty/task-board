@@ -48,12 +48,12 @@ directly later.
 
 ## Responsibilities
 
-| Component | Owns |
-| --- | --- |
-| Harness Rotation | Task contract, ordered fallback chain, run state, attempt record, prompt handoff, verification, review state, checkpoints, and recovery policy. |
-| Coder Community | Self-hosted workspace lifecycle, Terraform template, remote agent connection, network boundary, and remote command transport. |
-| Workspace template | Repository checkout convention, runtime dependencies, installed headless CLIs, allowed outbound network, and task working-directory layout. |
-| Git | Base revision, checkpoint commits or patch artifacts, diff, and eventual review/PR handoff. |
+| Component          | Owns                                                                                                                                            |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Harness Rotation   | Task contract, ordered fallback chain, run state, attempt record, prompt handoff, verification, review state, checkpoints, and recovery policy. |
+| Coder Community    | Self-hosted workspace lifecycle, Terraform template, remote agent connection, network boundary, and remote command transport.                   |
+| Workspace template | Repository checkout convention, runtime dependencies, installed headless CLIs, allowed outbound network, and task working-directory layout.     |
+| Git                | Base revision, checkpoint commits or patch artifacts, diff, and eventual review/PR handoff.                                                     |
 
 ## Phase 1 run contract
 

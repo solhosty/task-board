@@ -1,6 +1,36 @@
 /* Direct translation of the approved Aludra v3 board layout-safety rules. */
-.board,.lane,.lanehead,.lanehead .left,.cards,.taskcard,.cardtop,.agentstack,.cardmain,.cardbottom{min-width:0}
-.cards{grid-template-columns:minmax(0,1fr)}
-.lanehead h2,.lane .empty,.taskcard h3,.taskcard p,.taskcard .meta,.taskcard .state{overflow-wrap:anywhere}
-.taskcard .cardmain h3,.taskcard .cardmain .meta{display:-webkit-box;overflow:hidden;-webkit-box-orient:vertical;-webkit-line-clamp:1}
-@media(min-width:1101px) and (max-width:1230px){.board{grid-template-columns:repeat(3,minmax(0,1fr))}}
+.board,
+.lane,
+.lanehead,
+.lanehead .left,
+.cards,
+.taskcard,
+.cardtop,
+.agentstack,
+.cardmain,
+.cardbottom {
+  min-width: 0;
+}
+.cards {
+  grid-template-columns: minmax(0, 1fr);
+}
+.lanehead h2,
+.lane .empty,
+.taskcard h3,
+.taskcard p,
+.taskcard .meta,
+.taskcard .state {
+  overflow-wrap: anywhere;
+}
+.taskcard .cardmain h3,
+.taskcard .cardmain .meta {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
+}
+@media (min-width: 1101px) and (max-width: 1230px) {
+  .board {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}

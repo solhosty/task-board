@@ -1,1 +1,8 @@
-@media(min-width:1101px){.board .lane{min-height:657.3125px}.board .lanehead{padding-bottom:8px}}
+@media (min-width: 1101px) {
+  .board .lane {
+    min-height: 657.3125px;
+  }
+  .board .lanehead {
+    padding-bottom: 8px;
+  }
+}

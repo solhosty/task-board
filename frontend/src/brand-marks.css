@@ -1,13 +1,45 @@
 /* Brand tiles for the harness marks. Each vendor mark is a single currentColor
    path, so the tile sets its own ground and the glyph inherits white. Codex,
    Droid and OpenCode are black-and-white brands; only Claude carries a colour. */
-.harness-mark,.connectionlogo{display:inline-grid;place-items:center;flex:none;background:#0d0d0d;color:#fff}
-.harness-mark svg,.connectionlogo svg{width:62%;height:62%;display:block}
-.harness-mark.claude,.connectionlogo.claude{background:#d97757}
-.harness-mark.codex,.connectionlogo.codex{background:#0d0d0d}
-.harness-mark.droid,.connectionlogo.droid{background:#020202}
-.harness-mark.opencode,.connectionlogo.opencode{background:#0b0d12}
+.harness-mark,
+.connectionlogo {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  background: #0d0d0d;
+  color: #fff;
+}
+.harness-mark svg,
+.connectionlogo svg {
+  width: 62%;
+  height: 62%;
+  display: block;
+}
+.harness-mark.claude,
+.connectionlogo.claude {
+  background: #d97757;
+}
+.harness-mark.codex,
+.connectionlogo.codex {
+  background: #0d0d0d;
+}
+.harness-mark.droid,
+.connectionlogo.droid {
+  background: #020202;
+}
+.harness-mark.opencode,
+.connectionlogo.opencode {
+  background: #0b0d12;
+}
 /* Factory's mark is fine outline work, so it needs a larger box than the solid
    glyphs to carry the same optical weight down at 20px. */
-.harness-mark.droid svg,.connectionlogo.droid svg{width:84%;height:84%}
-.mark-initials{font-size:.62em;font-weight:800;letter-spacing:-.02em}
+.harness-mark.droid svg,
+.connectionlogo.droid svg {
+  width: 84%;
+  height: 84%;
+}
+.mark-initials {
+  font-size: 0.62em;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
