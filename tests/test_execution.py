@@ -81,6 +81,19 @@ print('Implemented the requested feature.', flush=True)
         state = self.wait(task_id, 'awaiting_review')
         self.assertEqual(state['attempts'][0]['tool_permissions'], 'auto')
 
+    def test_paused_conversation_accepts_followup_without_starting_an_agent(self):
+        project = self.api('/api/projects', {'name':'Paused chat', 'repo_path':str(self.repo), 'default_mode':'supervised'})
+        created = self.api(f"/api/projects/{project['id']}/tasks", {'text':'Work', 'start':True})
+        task_id = created['id']
+        state = self.api(f'/api/tasks/{task_id}')
+        app.update_run(state['run']['id'], 'paused_cooldown', 'Waiting for account reset.')
+        with patch.object(app, 'run_attempt') as worker:
+            self.api(f'/api/tasks/{task_id}/messages', {'content':'Keep this instruction for the next available account.', 'start':True})
+            worker.assert_not_called()
+        state = self.api(f'/api/tasks/{task_id}')
+        self.assertEqual(state['run']['status'], 'paused_cooldown')
+        self.assertTrue(any(m['content']=='Keep this instruction for the next available account.' for m in state['messages']))
+
     def test_coder_github_auth_status_never_exposes_the_token(self):
         server = {'id': 7, 'base_url': 'http://127.0.0.1:3000', 'token_configured': 1}
         with patch.object(app, 'read_coder_token', return_value='secret-token'), \
@@ -215,6 +228,22 @@ print('Implemented the requested feature.', flush=True)
         self.assertEqual((self.repo / 'feature.txt').read_text(), 'implemented and verified\n')
         self.assertEqual(state['task']['status'], 'completed')
         self.assertFalse(Path(state['attempts'][0]['worktree_path']).exists())
+
+    def test_message_while_a_run_is_active_is_queued_for_that_run(self):
+        project_id, task_id, run_id = self.create()
+        self.wait(task_id, 'awaiting_dispatch')
+        with patch.object(app, 'run_attempt') as worker:
+            response = self.api(f'/api/tasks/{task_id}/messages', {
+                'content': 'Resolve the newly reported merge conflicts too.', 'start': True})
+            worker.assert_not_called()
+        self.assertTrue(response['queued'])
+        state = self.api(f'/api/tasks/{task_id}')
+        self.assertEqual(state['run']['id'], run_id)
+        self.assertEqual(state['run']['status'], 'awaiting_dispatch')
+        self.assertTrue(any(message['content'] == 'Resolve the newly reported merge conflicts too.'
+                            for message in state['messages']))
+        prompt = app.task_prompt(state['task'], app.one('SELECT * FROM projects WHERE id=?', (project_id,)))
+        self.assertIn('Resolve the newly reported merge conflicts too.', prompt)
 
     def test_task_and_run_snapshot_do_not_mix_across_completion(self):
         _, task_id, run_id = self.create()

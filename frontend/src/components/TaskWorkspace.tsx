@@ -37,6 +37,7 @@ type Detail = {
   blockers: string[];
   lease: any;
   attachments: Attachment[];
+  delivery_recovery?: { title: string; detail: string; run_id: string } | null;
   connection_action?: { server_id: number; provider: string } | null;
 };
 function Attachments({
@@ -79,13 +80,60 @@ function eventTitle(s: any) {
     ? `Session ${s.session_number} ended · ${s.close_reason}`
     : `Session ${s.session_number} started${s.harness_key ? ` on ${label(s.harness_key)}` : ''}`;
 }
-function LiveActivity({ attempt, active }: { attempt: any; active: boolean }) {
+const KIND_ICON: Record<string, any> = {
+  message: MessageSquareText,
+  reasoning: Activity,
+  command: Terminal,
+  tool: Wrench,
+  edit: FilePenLine,
+  permission: AlertTriangle,
+  error: AlertTriangle,
+  result: Wrench,
+};
+function LiveEvent({ item }: { item: any }) {
+  const Icon = KIND_ICON[item.kind] || Activity;
+  const busy = ['working', 'in_progress'].includes(item.status);
+  return (
+    <div className={`live-event live-${item.kind}${item.status === 'failed' ? ' failed' : ''}`}>
+      <div className="live-event-head">
+        <Icon size={13} />
+        <span className="live-event-text">{item.text || label(item.kind)}</span>
+        {item.status && <small className={busy ? 'busy' : ''}>{label(item.status)}</small>}
+      </div>
+      {item.kind === 'permission' && item.requests?.length > 0 && (
+        <ul className="live-permissions">
+          {item.requests.map((r: any, i: number) => (
+            <li key={i}>
+              <b>{r.tool}</b>
+              {r.command && <code>{r.command}</code>}
+            </li>
+          ))}
+        </ul>
+      )}
+      {item.output?.trim() && (
+        <details className="live-output">
+          <summary>Output</summary>
+          <pre>{item.output}</pre>
+        </details>
+      )}
+    </div>
+  );
+}
+function LiveActivity({
+  attempt,
+  active,
+  replies,
+}: {
+  attempt: any;
+  active: boolean;
+  replies: string[];
+}) {
   const enabled = !!attempt;
   const { data: log } = useQuery({
     queryKey: ['attempt-log', attempt?.id],
-    queryFn: () => api<{ activity: any[] }>(`/api/attempts/${attempt.id}/log`),
+    queryFn: () => api<{ events: any[] }>(`/api/attempts/${attempt.id}/log`),
     enabled,
-    refetchInterval: active ? 2500 : false,
+    refetchInterval: active ? 1500 : false,
   });
   const { data: changes } = useQuery({
     queryKey: ['attempt-files-live', attempt?.id],
@@ -94,10 +142,14 @@ function LiveActivity({ attempt, active }: { attempt: any; active: boolean }) {
         `/api/attempts/${attempt.id}/files`,
       ),
     enabled,
-    refetchInterval: active ? 4000 : false,
+    refetchInterval: active ? 2000 : false,
   });
   if (!enabled) return null;
-  const activity = log?.activity || [],
+  // Once a reply lands in the persisted timeline above, dropping it here keeps
+  // the live feed from echoing the same final message a second time.
+  const events = (log?.events || []).filter(
+      (item) => item.kind !== 'message' || !replies.includes(item.text.trim()),
+    ),
     files = changes?.files || [];
   return (
     <section className="live-activity" aria-live="polite">
@@ -106,24 +158,20 @@ function LiveActivity({ attempt, active }: { attempt: any; active: boolean }) {
           <Activity size={15} />
           {active ? 'Live harness activity' : 'Harness activity'}
         </span>
-        <small>{active ? 'Refreshing' : 'Latest attempt'}</small>
+        <small>{active ? 'Streaming' : 'Latest attempt'}</small>
       </div>
-      {activity.length > 0 && (
+      {events.length > 0 ? (
         <div className="live-events">
-          {activity.map((item, index) => (
-            <div className="live-event" key={`${item.kind}-${item.text}-${index}`}>
-              {item.kind === 'edit' ? (
-                <FilePenLine size={14} />
-              ) : item.kind === 'command' || item.kind === 'tool' ? (
-                <Wrench size={14} />
-              ) : (
-                <Activity size={14} />
-              )}
-              <span>{item.text}</span>
-              {item.status && <small>{label(item.status)}</small>}
-            </div>
+          {events.map((item, index) => (
+            <LiveEvent item={item} key={item.event_id || `${item.kind}-${index}`} />
           ))}
         </div>
+      ) : (
+        <p className="muted">
+          {active
+            ? 'Waiting for the harness to report activity…'
+            : 'No activity was recorded for this attempt.'}
+        </p>
       )}
       {changes && !changes.available ? (
         <p className="muted">{changes.reason}</p>
@@ -134,10 +182,16 @@ function LiveActivity({ attempt, active }: { attempt: any; active: boolean }) {
             Working tree changes{changes?.remote ? ' in Coder' : ''}
           </div>
           {files.map((file) => (
-            <span key={file.path}>
-              <b>{label(file.status)}</b>
-              {file.path}
-            </span>
+            <div className="live-file" key={file.path}>
+              <b className={'file-status ' + file.status}>{label(file.status)}</b>
+              <span className="file-path">{file.path}</span>
+              {(file.added != null || file.removed != null) && (
+                <span className="file-stat">
+                  {file.added != null && <em className="added">+{file.added}</em>}
+                  {file.removed != null && <em className="removed">-{file.removed}</em>}
+                </span>
+              )}
+            </div>
           ))}
         </div>
       ) : (
@@ -174,7 +228,16 @@ export default function TaskWorkspace({
     queryKey: ['task', taskId],
     queryFn: () => api<Detail>(`/api/tasks/${taskId}`),
     refetchInterval: (q) =>
-      ['running', 'verifying', 'rotating', 'committing'].includes(q.state.data?.run?.status || '')
+      [
+        'awaiting_dispatch',
+        'awaiting_capacity',
+        'queued',
+        'running',
+        'verifying',
+        'rotating',
+        'committing',
+        'paused_cooldown',
+      ].includes(q.state.data?.run?.status || '')
         ? 2500
         : false,
   });
@@ -201,10 +264,25 @@ export default function TaskWorkspace({
       </main>
     );
   const active =
-    detail.run && !['complete', 'stopped', 'discarded', 'blocked'].includes(detail.run.status);
+    !!detail.run &&
+    ['queued', 'running', 'verifying', 'rotating', 'committing'].includes(detail.run.status);
+  const canQueue =
+    !!detail.run &&
+    [
+      'awaiting_dispatch',
+      'awaiting_capacity',
+      'queued',
+      'running',
+      'verifying',
+      'rotating',
+      'committing',
+      'awaiting_review',
+      'awaiting_resume',
+      'paused_cooldown',
+    ].includes(detail.run.status);
   const recoveryError =
     detail!.run?.status === 'stopped' &&
-    /attachment|coder runner|transfer/i.test(detail!.run?.message || '');
+    /attachment|coder runner|transfer|runner handoff/i.test(detail!.run?.message || '');
   const action = !detail!.run
     ? ['Execute', `/api/projects/${project.id}/run`]
     : detail!.run.status === 'blocked' || recoveryError
@@ -219,11 +297,18 @@ export default function TaskWorkspace({
   async function send() {
     if (!message.trim()) return;
     try {
-      await api(`/api/tasks/${taskId}/messages`, 'POST', { content: message, start: true });
+      const result = await api<{ queued?: boolean }>(`/api/tasks/${taskId}/messages`, 'POST', {
+        content: message,
+        start: !canQueue,
+      });
       setMessage('');
       refetch();
       refresh();
-      notify('Instruction sent; starting the task');
+      notify(
+        result.queued
+          ? 'Instruction queued for the next harness checkpoint'
+          : 'Instruction sent; starting the task',
+      );
     } catch (e) {
       notify((e as Error).message);
     }
@@ -324,6 +409,15 @@ export default function TaskWorkspace({
           </Button>
         </div>
       </header>
+      {detail.run?.status === 'paused_cooldown' && (
+        <section className="task-notice blue">
+          <Activity size={17} />
+          <div>
+            <b>Automatic failover is waiting for an eligible runner</b>
+            <p>{detail.run.message}</p>
+          </div>
+        </section>
+      )}
       {(recoveryError ||
         (!detail.run && detail.task.status === 'pending' && detail.blockers?.length > 0)) && (
         <section className="task-notice">
@@ -358,6 +452,37 @@ export default function TaskWorkspace({
             </p>
           </div>
           <Button onClick={retryRepositoryCheckout}>Retry repository checkout</Button>
+        </section>
+      )}
+      {detail.delivery_recovery && (
+        <section className="task-notice">
+          <AlertTriangle size={17} />
+          <div>
+            <b>{detail.delivery_recovery.title}</b>
+            <p>{detail.delivery_recovery.detail}</p>
+            <p className="muted">
+              Continue sends this saved Git error to the same task in its preserved worktree. It
+              does not touch the main checkout.
+            </p>
+          </div>
+          <Button
+            onClick={async () => {
+              try {
+                await api(
+                  `/api/runs/${detail.delivery_recovery!.run_id}/continue-delivery-recovery`,
+                  'POST',
+                  {},
+                );
+                notify('Continuing task to resolve delivery');
+                refetch();
+                refresh();
+              } catch (error) {
+                notify((error as Error).message);
+              }
+            }}
+          >
+            Continue task to resolve
+          </Button>
         </section>
       )}
       {action && (
@@ -410,7 +535,15 @@ export default function TaskWorkspace({
                 )}
               </article>
             ))}
-            <LiveActivity attempt={detail.attempts.at(-1)} active={active} />
+            <LiveActivity
+              attempt={detail.attempts.at(-1)}
+              active={active}
+              replies={detail.messages
+                .filter(
+                  (m: any) => m.role === 'assistant' && m.attempt_id === detail.attempts.at(-1)?.id,
+                )
+                .map((m: any) => m.content.trim())}
+            />
             {detail.sessions
               .filter((s: any) => s.session_number > 1)
               .map((s: any) => (
@@ -457,7 +590,7 @@ export default function TaskWorkspace({
                 variant="ghost"
                 size="icon"
                 aria-label="Attach a file or image"
-                disabled={!!active || uploading}
+                disabled={!!canQueue || uploading}
                 onClick={() => fileInput.current?.click()}
               >
                 <Paperclip size={16} />
@@ -465,8 +598,8 @@ export default function TaskWorkspace({
               <span>
                 {detail.run?.status === 'awaiting_external_auth'
                   ? 'Confirm the repository connection above before sending another instruction.'
-                  : active
-                    ? 'A harness is active; wait for it before sending another instruction.'
+                  : canQueue
+                    ? 'A harness is active; your instruction will be queued for its next checkpoint.'
                     : uploading
                       ? 'Adding attachments…'
                       : 'Attach or paste files and images; they go to whichever harness runs this task.'}
@@ -480,7 +613,7 @@ export default function TaskWorkspace({
             <Textarea
               value={message}
               onChange={(e) => setMessage(e.target.value)}
-              disabled={!!active}
+              disabled={detail.run?.status === 'awaiting_external_auth'}
               placeholder="Add an instruction, decision, or follow-up…"
               onPaste={(e) => {
                 const pasted = Array.from(e.clipboardData.files);
@@ -492,9 +625,12 @@ export default function TaskWorkspace({
             />
             <div className="compose-footer">
               <span>⌘ ↵ to send</span>
-              <Button onClick={send} disabled={!!active || !message.trim()}>
+              <Button
+                onClick={send}
+                disabled={detail.run?.status === 'awaiting_external_auth' || !message.trim()}
+              >
                 <Send size={15} />
-                Send
+                {canQueue ? 'Queue' : 'Send'}
               </Button>
             </div>
           </div>

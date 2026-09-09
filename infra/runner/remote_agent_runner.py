@@ -32,7 +32,7 @@ def command_for(request, root):
         mode = "auto" if request.get("permission_mode") == "auto" else "acceptEdits"
         folders = sorted({str(Path(path).parent) for path in paths})
         flags = [part for folder in folders for part in ("--add-dir", folder)]
-        return ["/home/coder/.local/bin/claude", "-p", "--permission-mode", mode, "--verbose", "--output-format", "stream-json"] + flags + ([] if model == "default" else ["--model", model]) + [prompt]
+        return ["/home/coder/.local/node_modules/.bin/claude", "-p", "--permission-mode", mode, "--verbose", "--output-format", "stream-json"] + flags + ([] if model == "default" else ["--model", model]) + [prompt]
     raise ValueError("Unsupported remote harness.")
 
 

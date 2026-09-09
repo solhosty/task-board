@@ -125,6 +125,17 @@ def main(encoded):
         head_sha = run(["git", "rev-parse", "HEAD"], worktree).stdout.strip()
     else:
         raise RuntimeError("The remote worktree could not be inspected before delivery.")
+    # Another delivery attempt can have updated this task's remote branch while
+    # this preserved worktree was waiting for review.  Reconcile that branch
+    # here instead of reporting a generic non-fast-forward push failure.
+    # A semantic conflict remains in this isolated worktree for task recovery.
+    fetch = run(["git", "fetch", "origin", branch], worktree, check=False)
+    remote_branch = "origin/" + branch
+    if fetch.returncode == 0 and run(["git", "rev-parse", "--verify", remote_branch], worktree, check=False).returncode == 0:
+        ancestor = run(["git", "merge-base", "--is-ancestor", remote_branch, "HEAD"], worktree, check=False)
+        if ancestor.returncode != 0:
+            run(["git", "rebase", remote_branch], worktree)
+            head_sha = run(["git", "rev-parse", "HEAD"], worktree).stdout.strip()
     # Coder injects the workspace's fresh external-auth credential through
     # GIT_ASKPASS. Do not replace it with a cached or desktop credential.
     # A delivery retry may have amended the task's previous commit (for

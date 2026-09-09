@@ -153,6 +153,49 @@ def transfer_manifest(runner: Dict[str, Any], environment: Dict[str, str], workt
     return manifest
 
 
+def export_workspace(runner: Dict[str, Any], environment: Dict[str, str], worktree_path: str,
+                     app_root: Path) -> Dict[str, Any]:
+    """Export bounded Git state for a runner handoff. Credentials never cross runners."""
+    command = shlex.join(["python3", "-", worktree_path])
+    checked = subprocess.run(["coder", "ssh", "--wait", "yes", runner["workspace_name"], "--", command],
+                             input=payload(app_root, "remote_transfer_export.py"), env=environment,
+                             capture_output=True, text=True, timeout=300)
+    if checked.returncode:
+        raise RuntimeError("Could not export the preserved remote worktree for failover.")
+    try:
+        exported = json.loads(checked.stdout)
+    except ValueError as exc:
+        raise RuntimeError("The source runner returned an invalid workspace handoff.") from exc
+    if not isinstance(exported, dict) or not exported.get("available"):
+        raise RuntimeError(str(exported.get("reason") if isinstance(exported, dict) else "Workspace handoff is unavailable."))
+    return exported
+
+
+def import_workspace(runner: Dict[str, Any], environment: Dict[str, str], worktree_path: str,
+                     exported: Dict[str, Any], app_root: Path) -> Dict[str, Any]:
+    """Apply a validated handoff only when the destination has the same base."""
+    # `python -` consumes all stdin as source. Use `-c` so the bounded export
+    # remains stdin data for remote_transfer_apply.py rather than being parsed
+    # as Python source on the destination runner.
+    command = shlex.join(["python3", "-c", payload(app_root, "remote_transfer_apply.py"), worktree_path])
+    checked = subprocess.run(["coder", "ssh", "--wait", "yes", runner["workspace_name"], "--", command],
+                             input=json.dumps(exported, separators=(",", ":")),
+                             env=environment, capture_output=True, text=True, timeout=300)
+    if checked.returncode:
+        # The runner helpers emit only a bounded generic reason, never Git or
+        # credential stderr. Surface it so automatic routing can decide whether
+        # another configured runner should be tried.
+        detail = checked.stdout.strip()[-500:]
+        raise RuntimeError(detail or "Could not apply the preserved remote worktree on the next runner.")
+    try:
+        result = json.loads(checked.stdout)
+    except ValueError as exc:
+        raise RuntimeError("The destination runner returned an invalid workspace handoff.") from exc
+    if not isinstance(result, dict) or not result.get("available"):
+        raise RuntimeError(str(result.get("reason") if isinstance(result, dict) else "Workspace handoff could not be verified."))
+    return result
+
+
 def run_agent(runner: Dict[str, Any], environment: Dict[str, str], command: str,
               output_file: Path, app_root: Path, result_marker: str) -> Tuple[Dict[str, Any], str]:
     """Run the bounded remote helper and retain its transcript locally for review."""

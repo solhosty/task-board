@@ -359,6 +359,11 @@ def _multiple_coder_runners(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA foreign_keys=ON")
 
 
+def _binding_cooldown_reason(connection: sqlite3.Connection) -> None:
+    """Only a confirmed provider quota may keep an account out of rotation."""
+    _add_column(connection, "runner_account_bindings", "cooldown_reason", "TEXT")
+
+
 MIGRATIONS = (
     Migration("001_execution_lease_runner", _runner_link),
     Migration("002_runner_capacity", _runner_capacity),
@@ -378,6 +383,7 @@ MIGRATIONS = (
     Migration("016_scheduled_tasks", _scheduled_tasks),
     Migration("017_account_pool_transfers", _account_pool),
     Migration("018_multiple_coder_runners", _multiple_coder_runners),
+    Migration("019_binding_cooldown_reason", _binding_cooldown_reason),
 )
 
 

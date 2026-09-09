@@ -40,17 +40,25 @@ class RunStateStore:
         return self.rows(
             "SELECT * FROM runs WHERE project_id=? "
             "AND status NOT IN ('complete','stopped','discarded','blocked') "
+            "AND rowid=(SELECT MAX(newer.rowid) FROM runs newer WHERE newer.task_id=runs.task_id) "
             "ORDER BY rowid DESC",
             (project_id,),
         )
 
     def remote_capacity(self, profile: Optional[Dict[str, Any]]) -> int:
-        """Use the last capacity measured inside the persistent Coder runner."""
+        """Sum slots across the configured isolated runner pool."""
         if not profile or not profile.get("coder_server_id"):
             return 1
+        bindings = self.rows(
+            """SELECT r.detected_max_tasks FROM runner_account_bindings b
+               JOIN coder_runners r ON r.id=b.runner_id
+               WHERE b.enabled=1 AND r.coder_server_id=?""",
+            (profile["coder_server_id"],),
+        )
+        if bindings:
+            return sum(max(1, int(item["detected_max_tasks"] or 1)) for item in bindings)
         runner = self.one(
-            "SELECT detected_max_tasks FROM coder_runners WHERE coder_server_id=? "
-            "ORDER BY rowid DESC LIMIT 1",
+            "SELECT detected_max_tasks FROM coder_runners WHERE coder_server_id=? ORDER BY rowid DESC LIMIT 1",
             (profile["coder_server_id"],),
         )
         return max(1, int(runner["detected_max_tasks"] or 1)) if runner else 1
@@ -117,4 +125,3 @@ class RunStateStore:
             base_sha=?, updated_at=? WHERE run_id=?""",
             (str(worktree), base_sha, self.clock(), run_id),
         )
-

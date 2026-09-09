@@ -48,6 +48,7 @@ from harness_rotation.harness_output import (
 from harness_rotation import attachments as attachment_store
 from harness_rotation import memories as memory_store
 from harness_rotation import remote_transport
+from harness_rotation import account_pool
 from harness_rotation import worktrees
 from harness_rotation.sessions import SessionService
 from harness_rotation.coder_config import (
@@ -108,6 +109,7 @@ WORKTREE_ROOT = Path("/private/tmp/harness-rotation-worktrees")
 HOST, PORT = "127.0.0.1", 4173
 DB_LOCK = threading.RLock()
 RUN_LOCK = threading.RLock()
+QUOTA_PROBE_SECONDS = 120
 CODER_RUNNER_LOCK = threading.RLock()
 CHILDREN = set()
 REMOTE_RESULT_MARKER = '__HARNESS_REMOTE_RESULT__'
@@ -521,6 +523,14 @@ def remote_parallel_capacity(profile: Optional[Dict[str, Any]]) -> int:
 
 def runner_slot_runs(coder_server_id: int) -> List[Dict[str, Any]]:
     return run_state_store().runner_slots(coder_server_id)
+
+
+def runner_slot_count(runner_id: int) -> int:
+    """Count admitted remote work for one concrete account runner."""
+    placeholders = ','.join('?' for _ in REMOTE_SLOT_STATUSES)
+    return one(f'''SELECT COUNT(*) AS count FROM execution_leases l JOIN runs r ON r.id=l.run_id
+                   WHERE l.runner_id=? AND r.status IN ({placeholders})''',
+               (runner_id, *REMOTE_SLOT_STATUSES))['count']
 
 
 def run_backend(run_id: str) -> Optional[str]:
@@ -1087,7 +1097,9 @@ def reserve_runner_worktree(run_id, task, runner, repo_url):
     return one('SELECT * FROM coder_task_worktrees WHERE task_id=?', (task['id'],))
 
 
-def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[str, Any]) -> Dict[str, Any]:
+def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[str, Any],
+                              runner: Optional[Dict[str, Any]] = None,
+                              environment: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     profile = project_coder_profile(project['id'])
     if not profile or not profile.get('coder_server_id'):
         raise ValueError('This project has no Coder environment configured.')
@@ -1098,8 +1110,33 @@ def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[s
         AND workspace_name IS NOT NULL AND runner_id IS NULL LIMIT 1""", (task['id'],))
     if legacy:
         raise ValueError('This task has a legacy task workspace. It was preserved; create a new task or explicitly migrate its work to a persistent runner.')
-    runner, environment = ensure_coder_runner(server, profile)
-    saved = reserve_runner_worktree(run_id, task, runner, repo_url)
+    runner, environment = (runner, environment) if runner and environment else ensure_coder_runner(server, profile)
+    previous = one('SELECT * FROM coder_task_worktrees WHERE task_id=?', (task['id'],))
+    transfer_id = None
+    exported = None
+    if previous and previous['runner_id'] != runner['id']:
+        source = one('SELECT * FROM coder_runners WHERE id=?', (previous['runner_id'],))
+        if not source or not previous.get('worktree_path'):
+            raise RuntimeError('The preserved remote worktree cannot be handed to another runner automatically.')
+        source_environment = dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=environment['CODER_SESSION_TOKEN'],
+                                  CODER_ORGANIZATION=server['organization'])
+        manifest = remote_transfer_manifest(source, source_environment, previous['worktree_path'])
+        if not manifest.get('available'):
+            raise RuntimeError('The preserved remote worktree cannot be handed off safely: ' + manifest.get('reason', 'unknown reason'))
+        exported = remote_transport.export_workspace(source, source_environment, previous['worktree_path'], APP_ROOT)
+        transfer_id = execute('''INSERT INTO remote_workspace_transfers(task_id,source_runner_id,destination_runner_id,source_path,status,manifest_json,created_at)
+                               VALUES(?,?,?,?,?,?,?)''', (task['id'], source['id'], runner['id'], previous['worktree_path'], 'exporting', json.dumps(manifest), now()))
+        # The old runner remains untouched. Revert this pointer if destination provisioning fails.
+        execute('UPDATE coder_task_worktrees SET runner_id=?,worktree_path=NULL,base_sha=NULL,branch_name=NULL,updated_at=? WHERE task_id=?',
+                (runner['id'], now(), task['id']))
+    try:
+        saved = reserve_runner_worktree(run_id, task, runner, repo_url)
+    except Exception:
+        if previous and transfer_id:
+            execute('UPDATE coder_task_worktrees SET runner_id=?,worktree_path=?,base_sha=?,branch_name=?,updated_at=? WHERE task_id=?',
+                    (previous['runner_id'], previous['worktree_path'], previous['base_sha'], previous['branch_name'], now(), task['id']))
+            execute("UPDATE remote_workspace_transfers SET status='failed',error=?,completed_at=? WHERE id=?", ('Destination reservation failed.', now(), transfer_id))
+        raise
     request = {'repo_url': repo_url, 'base_ref': profile.get('base_ref') or 'main', 'task_key': saved['task_key']}
     command = shlex.join(['python3', '-', json.dumps(request)])
     checked = subprocess.run(['coder', 'ssh', '--wait', 'yes', runner['workspace_name'], '--', command],
@@ -1107,6 +1144,10 @@ def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[s
                              capture_output=True, text=True, timeout=300)
     if checked.returncode:
         execute("UPDATE execution_leases SET state='failed',updated_at=? WHERE run_id=?", (now(), run_id))
+        if previous and transfer_id:
+            execute('UPDATE coder_task_worktrees SET runner_id=?,worktree_path=?,base_sha=?,branch_name=?,updated_at=? WHERE task_id=?',
+                    (previous['runner_id'], previous['worktree_path'], previous['base_sha'], previous['branch_name'], now(), task['id']))
+            execute("UPDATE remote_workspace_transfers SET status='failed',error=?,completed_at=? WHERE id=?", ('Destination checkout failed.', now(), transfer_id))
         raise RuntimeError('Runner task checkout failed. Check repository access and branch; existing work was preserved.')
     result = json.loads(checked.stdout)
     expected_path = '/home/coder/.harness-runner/tasks/' + saved['task_key']
@@ -1114,6 +1155,16 @@ def provision_coder_execution(run_id: str, project: Dict[str, Any], task: Dict[s
         raise RuntimeError('Runner returned an unexpected worktree or Git revision.')
     execute('''UPDATE coder_task_worktrees SET worktree_path=?,base_sha=?,branch_name=?,updated_at=? WHERE task_id=?''',
             (result['worktree_path'], result['base_sha'], result['branch_name'], now(), task['id']))
+    if transfer_id:
+        try:
+            remote_transport.import_workspace(runner, environment, result['worktree_path'], exported, APP_ROOT)
+        except Exception as exc:
+            execute('UPDATE coder_task_worktrees SET runner_id=?,worktree_path=?,base_sha=?,branch_name=?,updated_at=? WHERE task_id=?',
+                    (previous['runner_id'], previous['worktree_path'], previous['base_sha'], previous['branch_name'], now(), task['id']))
+            execute("UPDATE remote_workspace_transfers SET status='failed',error=?,completed_at=? WHERE id=?", (str(exc), now(), transfer_id))
+            raise RuntimeError('Automatic runner handoff was not applied safely; the original worktree remains preserved.') from exc
+        execute("UPDATE remote_workspace_transfers SET destination_path=?,status='complete',completed_at=? WHERE id=?",
+                (result['worktree_path'], now(), transfer_id))
     execute("UPDATE execution_leases SET state='ready',worktree_path=?,base_sha=?,updated_at=? WHERE run_id=?",
             (result['worktree_path'], result['base_sha'], now(), run_id))
     return {'runner': runner, 'environment': environment,
@@ -1133,7 +1184,95 @@ def runner_account_bindings(coder_server_id: int) -> List[Dict[str, Any]]:
     """Public account metadata for routing; credentials remain only in runner homes."""
     return rows('''SELECT b.*, r.workspace_name, r.detected_max_tasks FROM runner_account_bindings b
                    JOIN coder_runners r ON r.id=b.runner_id WHERE r.coder_server_id=?
-                   ORDER BY b.provider,b.priority,b.id''', (coder_server_id,))
+                   ORDER BY b.priority,b.id''', (coder_server_id,))
+
+
+def refresh_runner_account_bindings(server: Dict[str, Any], force: bool = False) -> List[Dict[str, Any]]:
+    """Reconcile configured identities before trusting a historical cooldown."""
+    token = read_coder_token(server)
+    if not token:
+        raise ValueError('The Coder token is unavailable from Keychain.')
+    environment = dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=token,
+                       CODER_ORGANIZATION=server['organization'])
+    moment = datetime.now(timezone.utc)
+    for binding in runner_account_bindings(server['id']):
+        checked = binding.get('last_checked_at')
+        if not force and checked:
+            try:
+                if (moment - datetime.fromisoformat(checked.replace('Z', '+00:00'))).total_seconds() < 60:
+                    continue
+            except ValueError:
+                pass
+        runner = one('SELECT * FROM coder_runners WHERE id=?', (binding['runner_id'],))
+        if not runner:
+            continue
+        try:
+            status = remote_codex_account(runner, environment, refresh=True) if binding['provider'] == 'codex' else remote_claude_account(runner, environment)
+        except Exception:
+            continue
+        if not (status.get('installed') and status.get('authenticated')):
+            execute('UPDATE runner_account_bindings SET last_checked_at=?,updated_at=? WHERE id=?', (now(), now(), binding['id']))
+            continue
+        # Historic cooldowns without a confirmed quota cause came from older
+        # handoff failures. A live authenticated account is eligible again.
+        cooldown = None if not binding.get('cooldown_reason') else binding.get('cooldown_until')
+        execute('''UPDATE runner_account_bindings SET account_email=COALESCE(?,account_email),
+                   plan_type=COALESCE(?,plan_type),cooldown_until=?,last_checked_at=?,updated_at=? WHERE id=?''',
+                (status.get('email'), status.get('plan_type'), cooldown, now(), now(), binding['id']))
+        if not runner.get('detected_max_tasks'):
+            refresh_runner_capacity(runner, environment, force=True)
+    return runner_account_bindings(server['id'])
+
+
+def pool_runner_for_task(server: Dict[str, Any], task: Dict[str, Any], excluded: Tuple[str, ...] = (),
+                         allow_quota_probe: bool = False, refresh: bool = True) -> Tuple[Optional[Dict[str, Any]], Dict[str, str], Optional[Dict[str, Any]]]:
+    """Choose an eligible configured account, rather than a legacy default runner.
+
+    refresh=False skips the live SSH re-verification of each account and uses
+    the last cached binding state instead; callers on the interactive request
+    path use this so sending a chat message never blocks on a runner probe.
+    The real dispatch in run_attempt always refreshes before it actually uses
+    a runner, so a stale read here cannot admit a bad account into execution.
+    """
+    token = read_coder_token(server)
+    if not token:
+        raise ValueError('The Coder token is unavailable from Keychain.')
+    environment = dict(os.environ, CODER_URL=server['base_url'], CODER_SESSION_TOKEN=token,
+                       CODER_ORGANIZATION=server['organization'])
+    # Exhaust accounts within the preferred provider before changing provider.
+    # A failed attempt excludes its account through the binding cooldown, never
+    # every account belonging to that provider.
+    order = ([task['preferred_harness']] if task.get('preferred_harness') else [])
+    configured_order, _ = resolve_harness_order(task)
+    order += [key for key in configured_order if key in ('codex', 'claude') and key not in order]
+    bindings = refresh_runner_account_bindings(server) if refresh else runner_account_bindings(server['id'])
+    # Capacity never changes an account assignment. A task keeps its runner
+    # until that account has a confirmed usage-limit cooldown.
+    saved = one('SELECT runner_id FROM coder_task_worktrees WHERE task_id=?', (task.get('id'),)) if task.get('id') else None
+    if saved:
+        assigned = next((item for item in bindings if item['runner_id'] == saved['runner_id'] and item['enabled']), None)
+        if assigned and not (assigned.get('cooldown_reason') == 'quota' and assigned.get('cooldown_until') and datetime.fromisoformat(assigned['cooldown_until'].replace('Z', '+00:00')) > datetime.now(timezone.utc)):
+            return one('SELECT * FROM coder_runners WHERE id=?', (assigned['runner_id'],)), environment, assigned
+        # A task workspace remains owned by its recorded runner even when an
+        # administrator removes that runner from the pool.  Pool membership
+        # controls new assignments and quota failover; it must not silently
+        # migrate an existing dirty worktree to another runner.
+        preserved_runner = one('SELECT * FROM coder_runners WHERE id=?', (saved['runner_id'],))
+        if preserved_runner:
+            return preserved_runner, environment, None
+    binding = account_pool.next_binding(bindings, order)
+    if not binding and allow_quota_probe:
+        # Account/read confirms identity but does not report remaining quota.
+        # Retry the preferred account periodically so a manual usage reset does
+        # not remain hidden behind an old provider reset estimate.
+        for provider in order:
+            candidates = [item for item in bindings if item['enabled'] and item['provider'] == provider]
+            if candidates:
+                binding = min(candidates, key=lambda item: (item['priority'], item['id']))
+                break
+    if not binding:
+        return None, environment, None
+    return one('SELECT * FROM coder_runners WHERE id=?', (binding['runner_id'],)), environment, binding
 
 
 def unassigned_runner_connections() -> List[Dict[str, Any]]:
@@ -1169,7 +1308,9 @@ def saved_remote_workspace_snapshot(project: Dict[str, Any], task: Dict[str, Any
         return {'available': False, 'reason': 'The remote task worktree is unavailable.'}
     try:
         server = coder_server_or_404(profile['coder_server_id'])
-        token, _, runner = coder_runner_context(server)
+        token = read_coder_token(server)
+        runner = one('SELECT * FROM coder_runners WHERE id=? AND coder_server_id=?',
+                     (saved['runner_id'], server['id']))
     except (ValueError, HTTPError, URLError, TimeoutError, OSError):
         return {'available': False, 'reason': 'Could not access the saved Coder runner.'}
     if not runner or runner['id'] != saved['runner_id']:
@@ -1180,12 +1321,15 @@ def saved_remote_workspace_snapshot(project: Dict[str, Any], task: Dict[str, Any
 
 
 def choose_remote_harness(task: Dict[str, Any], runner: Dict[str, Any], environment: Dict[str, str],
-                          excluded_keys: Tuple[str, ...] = (), locked_key: Optional[str] = None) -> Tuple[Optional[Dict[str, Any]], str]:
+                          excluded_keys: Tuple[str, ...] = (), locked_key: Optional[str] = None,
+                          allowed_keys: Optional[Tuple[str, ...]] = None) -> Tuple[Optional[Dict[str, Any]], str]:
     """Choose only CLIs installed and signed in inside this runner, never locally."""
     configured = {item['key']: item for item in rows("SELECT * FROM harnesses WHERE enabled=1 AND key IN ('codex','claude')")}
     order = ([locked_key] if locked_key else [])
     order += ([task['preferred_harness']] if task.get('preferred_harness') else [])
     order += [key for key in ('codex', 'claude') if key not in order]
+    if allowed_keys:
+        order = [key for key in order if key in allowed_keys]
     statuses = {}
     cooling_down = []
     moment = datetime.now(timezone.utc)
@@ -1195,7 +1339,10 @@ def choose_remote_harness(task: Dict[str, Any], runner: Dict[str, Any], environm
         harness = configured.get(key)
         if not harness:
             continue
-        cooldown_until = harness.get('cooldown_until')
+        binding = one('SELECT * FROM runner_account_bindings WHERE runner_id=? AND provider=?', (runner['id'], key))
+        if binding and not binding['enabled']:
+            continue
+        cooldown_until = binding.get('cooldown_until') if binding else harness.get('cooldown_until')
         if cooldown_until and datetime.fromisoformat(cooldown_until) > moment:
             cooling_down.append(cooldown_until)
             continue
@@ -1283,6 +1430,16 @@ def harness_availability(harness: Dict[str, Any]) -> Dict[str, str]:
 
 def execution_blockers(project: Dict[str, Any], task: Optional[Dict[str, Any]] = None) -> List[str]:
     blockers = []
+    if task:
+        backend, profile = effective_execution_backend(project, task)
+        if backend == 'coder':
+            if not profile or not profile.get('coder_server_id'):
+                return ['Choose a Coder server for this project before using remote execution.']
+            if profile.get('server_status') != 'authorized':
+                return ['Verify the project’s Coder server and API token before using remote execution.']
+            # Remote account readiness is checked in the selected runner. A
+            # local CLI cooldown or dirty local checkout is unrelated.
+            return []
     repo = Path(project['repo_path'])
     if not repo.is_dir():
         return ['The project folder no longer exists.']
@@ -1325,16 +1482,25 @@ def parse_scheduled_for(value: Any) -> Optional[str]:
 
 
 def request_run(project_id: int, task_id: Optional[int] = None) -> Dict[str, Any]:
-    # Do this outside the scheduler lock: Coder SSH may take a moment, and an
-    # existing runner is enough to measure without provisioning anything.
+    # This runs on the interactive request path (e.g. every chat "Send"), so it
+    # must never block on Coder SSH. Use the last cached runner/account state
+    # for this admission decision; the actual dispatch in run_attempt always
+    # re-checks live before using a runner, so a stale read here cannot admit
+    # a bad account into execution, and it never leaves the cache stale for
+    # long since scheduled_task_loop and every dispatch refresh it too.
     preflight_project = project_or_404(project_id)
     preflight_task = one("SELECT * FROM tasks WHERE project_id=? AND status='pending'" + (' AND id=?' if task_id else ' ORDER BY task_order LIMIT 1'),
                          (project_id, int(task_id)) if task_id else (project_id,))
+    selected_runner = None
     if preflight_task:
         preflight_backend, preflight_profile = effective_execution_backend(preflight_project, preflight_task)
         if preflight_backend == 'coder' and preflight_profile and preflight_profile.get('coder_server_id'):
             try:
-                refresh_saved_runner_capacity(coder_server_or_404(preflight_profile['coder_server_id']))
+                server = coder_server_or_404(preflight_profile['coder_server_id'])
+                # Explicit account pools reserve capacity on the account chosen
+                # for this task. Capacity never makes a task jump accounts.
+                if runner_account_bindings(server['id']):
+                    selected_runner, _, _ = pool_runner_for_task(server, preflight_task, refresh=False)
             except (ValueError, RuntimeError, HTTPError, URLError, OSError, subprocess.TimeoutExpired):
                 # Execution blockers and provisioning report Coder failures; a
                 # failed telemetry read must not discard a known safe capacity.
@@ -1361,7 +1527,7 @@ def request_run(project_id: int, task_id: Optional[int] = None) -> Dict[str, Any
         if active:
             if backend != 'coder' or any(run_backend(run['id']) != 'coder' for run in active):
                 blockers.append('Another task in this project has an active or paused run. Finish that run first.')
-            elif len(runner_slot_runs(profile['coder_server_id'])) >= remote_parallel_capacity(profile):
+            elif selected_runner and runner_slot_count(selected_runner['id']) >= runner_capacity(selected_runner):
                 capacity_full = True
         harness, _ = choose_harness(task)
         permissions = permission_snapshot(task)
@@ -1371,7 +1537,7 @@ def request_run(project_id: int, task_id: Optional[int] = None) -> Dict[str, Any
                 blockers.append(problem)
         status = 'blocked' if blockers else ('awaiting_capacity' if capacity_full else ('awaiting_dispatch' if mode == 'supervised' or task['force_gate'] else 'queued'))
         message = ' '.join(blockers) if blockers else (
-            f'The persistent Coder runner is full ({remote_parallel_capacity(profile)} task(s)). Waiting for the next slot.' if status == 'awaiting_capacity'
+            f'The selected Coder runner is full ({runner_capacity(selected_runner)} task(s)). Waiting for its next slot.' if status == 'awaiting_capacity'
             else f"Ready to start {harness['label']} ({harness['model']}). Approve dispatch to begin." if status == 'awaiting_dispatch'
             else 'Queued for execution.')
         run_id = str(uuid.uuid4())
@@ -1379,6 +1545,11 @@ def request_run(project_id: int, task_id: Optional[int] = None) -> Dict[str, Any
                 (run_id, project_id, task['id'], mode, status, message, now(), now()))
         execute('UPDATE runs SET permissions_json=? WHERE id=?', (json.dumps(permissions), run_id))
         create_execution_lease(run_id, task['id'], backend)
+        if backend == 'coder' and selected_runner:
+            # Reserve the selected account's slot before the background thread
+            # reaches SSH, so concurrent Execute clicks cannot over-admit it.
+            execute("UPDATE execution_leases SET runner_id=?,updated_at=? WHERE run_id=?",
+                    (selected_runner['id'], now(), run_id))
     if status == 'queued':
         threading.Thread(target=run_attempt, args=(run_id, project_id, task['id']), daemon=True).start()
     return {'run_id': run_id, 'status': status, 'message': message}
@@ -1401,6 +1572,51 @@ def dispatch_scheduled_tasks() -> int:
 def scheduled_task_loop(stop: threading.Event) -> None:
     while not stop.wait(15):
         dispatch_scheduled_tasks()
+        dispatch_cooldown_resumes()
+        for profile in rows("SELECT DISTINCT coder_server_id FROM project_coder_profiles WHERE coder_server_id IS NOT NULL"):
+            dispatch_capacity_waiters(profile['coder_server_id'])
+
+
+def dispatch_cooldown_resumes() -> int:
+    """Recover paused account-pool tasks after restart or an elapsed cooldown."""
+    started = 0
+    for run in rows("SELECT * FROM runs WHERE status='paused_cooldown' ORDER BY updated_at"):
+        latest = one('SELECT id FROM runs WHERE task_id=? ORDER BY rowid DESC LIMIT 1', (run['task_id'],))
+        if latest['id'] != run['id']:
+            continue
+        profile = project_coder_profile(run['project_id'])
+        if not profile or not profile.get('coder_server_id'):
+            continue
+        server = coder_server_or_404(profile['coder_server_id'])
+        bindings = refresh_runner_account_bindings(server)
+        quota_probe = bool(bindings and not account_pool.next_binding(bindings, ('codex', 'claude')))
+        if quota_probe:
+            try:
+                age = (datetime.now(timezone.utc) - datetime.fromisoformat(run['updated_at'].replace('Z', '+00:00'))).total_seconds()
+            except ValueError:
+                age = QUOTA_PROBE_SECONDS
+            if age < QUOTA_PROBE_SECONDS:
+                continue
+        try:
+            claim_run(run['id'], 'paused_cooldown', 'queued',
+                      'Rechecking the configured account after a possible usage reset.' if quota_probe else 'A configured runner is eligible; resuming automatically.')
+        except ValueError:
+            continue
+        threading.Thread(target=run_attempt, args=(run['id'], run['project_id'], run['task_id'], run.get('attempt_id'), False, quota_probe), daemon=True).start()
+        started += 1
+    return started
+
+
+def schedule_cooldown_resume(run_id: str, until: str) -> None:
+    """Wake promptly while the server is alive; the scheduler also covers restarts."""
+    try:
+        delay = max(0, (datetime.fromisoformat(until.replace('Z', '+00:00')) - datetime.now(timezone.utc)).total_seconds())
+    except ValueError:
+        delay = 15
+    def wake():
+        time.sleep(min(delay + 1, 24 * 60 * 60))
+        dispatch_cooldown_resumes()
+    threading.Thread(target=wake, daemon=True).start()
 
 
 def update_run(run_id: str, status: str, message: str, attempt_id: Optional[int] = None) -> None:
@@ -1419,23 +1635,32 @@ def dispatch_capacity_waiters(coder_server_id: int) -> None:
     to_start = []
     with DB_LOCK:
         with db() as conn:
-            runner = conn.execute('''SELECT detected_max_tasks FROM coder_runners
-                WHERE coder_server_id=? ORDER BY rowid DESC LIMIT 1''', (coder_server_id,)).fetchone()
-            capacity = max(1, int(runner['detected_max_tasks'] or 1)) if runner else 1
             placeholders = ','.join('?' for _ in REMOTE_SLOT_STATUSES)
-            occupied = conn.execute(f'''SELECT COUNT(*) FROM runs r JOIN execution_leases l ON l.run_id=r.id
-                JOIN project_coder_profiles p ON p.project_id=r.project_id
-                WHERE l.backend='coder' AND r.status IN ({placeholders}) AND p.coder_server_id=?''',
-                (*REMOTE_SLOT_STATUSES, coder_server_id)).fetchone()[0]
-            slots = capacity - occupied
-            if slots < 1:
-                return
-            waiting = conn.execute('''SELECT r.*,t.force_gate FROM runs r JOIN execution_leases l ON l.run_id=r.id
+            waiting = conn.execute('''SELECT r.*,t.force_gate,l.runner_id AS leased_runner_id,w.runner_id AS saved_runner_id
+                FROM runs r JOIN execution_leases l ON l.run_id=r.id
                 JOIN project_coder_profiles p ON p.project_id=r.project_id JOIN tasks t ON t.id=r.task_id
+                LEFT JOIN coder_task_worktrees w ON w.task_id=r.task_id
                 WHERE l.backend='coder' AND p.coder_server_id=? AND r.status='awaiting_capacity'
                 ORDER BY r.created_at,r.rowid''', (coder_server_id,)).fetchall()
-            for row in waiting[:slots]:
+            occupied = {item['runner_id']: item['count'] for item in conn.execute(f'''SELECT l.runner_id,COUNT(*) AS count
+                FROM execution_leases l JOIN runs r ON r.id=l.run_id
+                WHERE l.runner_id IS NOT NULL AND r.status IN ({placeholders}) GROUP BY l.runner_id''',
+                REMOTE_SLOT_STATUSES).fetchall()}
+            for row in waiting:
                 run = dict(row)
+                runner_id = run.get('leased_runner_id') or run.get('saved_runner_id')
+                if not runner_id:
+                    binding = conn.execute('''SELECT b.runner_id FROM runner_account_bindings b JOIN coder_runners cr ON cr.id=b.runner_id
+                        WHERE b.enabled=1 AND cr.coder_server_id=? AND (b.cooldown_until IS NULL OR b.cooldown_until<=?)
+                        ORDER BY b.priority,b.id LIMIT 1''', (coder_server_id, now())).fetchone()
+                    legacy = None if binding else conn.execute('''SELECT id FROM coder_runners
+                        WHERE coder_server_id=? ORDER BY rowid DESC LIMIT 1''', (coder_server_id,)).fetchone()
+                    runner_id = binding['runner_id'] if binding else (legacy['id'] if legacy else None)
+                    if runner_id:
+                        conn.execute('UPDATE execution_leases SET runner_id=?,updated_at=? WHERE run_id=?', (runner_id, now(), run['id']))
+                runner = conn.execute('SELECT detected_max_tasks FROM coder_runners WHERE id=?', (runner_id,)).fetchone() if runner_id else None
+                if not runner or occupied.get(runner_id, 0) >= max(1, int(runner['detected_max_tasks'] or 1)):
+                    continue
                 next_status = 'awaiting_dispatch' if run['mode'] == 'supervised' or run['force_gate'] else 'queued'
                 message = ('A runner slot is available. Approve dispatch to begin.' if next_status == 'awaiting_dispatch'
                            else 'A runner slot is available. Starting execution.')
@@ -1443,6 +1668,8 @@ def dispatch_capacity_waiters(coder_server_id: int) -> None:
                                        (next_status, message, now(), run['id']))
                 if changed.rowcount and next_status == 'queued':
                     to_start.append((run['id'], run['project_id'], run['task_id']))
+                if changed.rowcount:
+                    occupied[runner_id] = occupied.get(runner_id, 0) + 1
     for args in to_start:
         threading.Thread(target=run_attempt, args=args, daemon=True).start()
 
@@ -1452,7 +1679,9 @@ def recover_capacity_waiters() -> None:
     with DB_LOCK, db() as conn:
         conn.execute("""UPDATE runs SET status='awaiting_capacity',
             message='Waiting for the next available Coder runner slot.',updated_at=?
-            WHERE status='blocked' AND message LIKE 'The persistent Coder runner has reached its environment capacity (%'""", (now(),))
+            WHERE rowid=(SELECT MAX(newer.rowid) FROM runs newer WHERE newer.task_id=runs.task_id)
+            AND ((status='blocked' AND message LIKE 'The persistent Coder runner has reached its environment capacity (%')
+              OR (status='stopped' AND message LIKE 'Execution stopped: Runner capacity is occupied.%'))""", (now(),))
         servers = conn.execute('''SELECT DISTINCT p.coder_server_id FROM runs r
             JOIN execution_leases l ON l.run_id=r.id JOIN project_coder_profiles p ON p.project_id=r.project_id
             WHERE l.backend='coder' AND r.status='awaiting_capacity' AND p.coder_server_id IS NOT NULL''').fetchall()
@@ -1773,21 +2002,83 @@ def commit_and_merge(project: Dict[str, Any], task: Dict[str, Any], attempt: Dic
     return worktrees.commit_and_merge(project, task, attempt, git)
 
 
+def delivery_recovery(task_run: Optional[Dict[str, Any]], attempt: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    """The single user decision for a failed delivery, backed by saved state.
+
+    A merge failure can originate locally or in Coder.  Do not claim a PR/task
+    dependency or pre-judge its cause: Git's recorded error is the evidence.
+    """
+    if not task_run or task_run.get('status') != 'stopped' or not attempt or attempt.get('status') != 'merge_failed':
+        return None
+    error = str(attempt.get('error') or task_run.get('message') or 'Git could not finish delivery.').strip()
+    return {'title': 'Delivery needs attention', 'detail': error[:1200]}
+
+
+def recoverable_delivery_for_task(task_id: int) -> Optional[Dict[str, Any]]:
+    """Find delivery work that remains actionable even if a later run stopped.
+
+    A task's general run history can include a later execution failure; hiding
+    an earlier preserved delivery worktree behind that record strands it.
+    """
+    record = one('''SELECT r.*, a.id AS recovery_attempt_id, a.status AS recovery_attempt_status,
+                           a.error AS recovery_error
+                    FROM runs r JOIN attempts a ON a.id=r.attempt_id
+                    WHERE r.task_id=? AND r.status='stopped' AND a.status='merge_failed'
+                    ORDER BY r.updated_at DESC, r.rowid DESC LIMIT 1''', (task_id,))
+    if not record:
+        return None
+    attempt = dict(record, id=record['recovery_attempt_id'], status=record['recovery_attempt_status'], error=record['recovery_error'])
+    recovery = delivery_recovery(record, attempt)
+    return dict(recovery or {}, run_id=record['id']) if recovery else None
+
+
+def continue_delivery_recovery(run_id: str) -> None:
+    """Resume the same task/worktree with explicit Git-resolution context."""
+    run = one('SELECT * FROM runs WHERE id=?', (run_id,))
+    attempt = one('SELECT * FROM attempts WHERE id=? AND run_id=?', ((run or {}).get('attempt_id'), run_id))
+    if not run or not attempt or not delivery_recovery(run, attempt):
+        raise ValueError('This run is not waiting for delivery recovery.')
+    task = one('SELECT * FROM tasks WHERE id=?', (run['task_id'],))
+    if not task:
+        raise ValueError('Task not found')
+    session = active_session(task['id'])
+    instruction = (
+        'Delivery could not finish because Git reported the saved error below. '
+        'Work only in this task’s preserved worktree. Inspect the current Git state, '
+        'update/rebase onto the intended base when needed, resolve any conflicts without '
+        'discarding either side, then run the project verification command. Do not commit, '
+        'push, reset, or change the main project checkout.\n\nSaved delivery error:\n' +
+        str(attempt.get('error') or run.get('message') or 'Git delivery failed.')[:4000]
+    )
+    execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,'user',?,?)",
+            (task['id'], session['id'], instruction, now()))
+    claim_run(run_id, 'stopped', 'queued', 'Continuing this task in its preserved worktree to resolve the delivery issue.')
+    threading.Thread(target=run_attempt, args=(run_id, run['project_id'], run['task_id'], attempt['id']), daemon=True).start()
+
+
 def mark_task_complete(repo: Path, task: Dict[str, Any]) -> None:
     worktrees.mark_task_complete(repo, task, git)
 
 
-def run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: Optional[int] = None, permission_retry: bool = False) -> None:
+def run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: Optional[int] = None,
+                permission_retry: bool = False, quota_probe: bool = False) -> None:
     try:
-        _run_attempt(run_id, project_id, task_id, resume_attempt_id, permission_retry)
+        _run_attempt(run_id, project_id, task_id, resume_attempt_id, permission_retry, quota_probe)
     except CoderExternalAuthRequired as exc:
         update_run(run_id, 'awaiting_external_auth', f'Connect {exc.display_name} to this Coder account, then continue. {exc.login_url}')
     except Exception as exc:
+        if str(exc).startswith('Runner capacity is occupied.'):
+            update_run(run_id, 'awaiting_capacity', 'Waiting automatically for a runner slot. Task work is preserved.')
+            return
+        if 'Automatic runner handoff' in str(exc):
+            update_run(run_id, 'stopped', 'Runner handoff needs review. The original worktree remains preserved.')
+            return
         execute("UPDATE attempts SET status='failed',ended_at=?,error=? WHERE run_id=? AND status IN ('running','verified')", (now(), str(exc), run_id))
         update_run(run_id, 'stopped', 'Execution stopped: ' + str(exc))
 
 
-def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: Optional[int] = None, permission_retry: bool = False) -> None:
+def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: Optional[int] = None,
+                 permission_retry: bool = False, quota_probe: bool = False) -> None:
     """Run a single attempt. Failures are persisted rather than raised into the HTTP thread."""
     preflight_project, preflight_task = project_or_404(project_id), one("SELECT * FROM tasks WHERE id=?", (task_id,))
     assert preflight_task
@@ -1799,7 +2090,38 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
         backend, _ = effective_execution_backend(project, task)
         if backend == 'coder':
             session = active_session(task_id)
-            prepared = provision_coder_execution(run_id, project, task)
+            prior = one('SELECT * FROM attempts WHERE id=? AND task_id=?', (resume_attempt_id, task_id)) if resume_attempt_id else None
+            excluded = (prior['harness_key'],) if prior and prior.get('harness_key') in ('codex', 'claude') else ()
+            profile = project_coder_profile(project['id'])
+            binding = None
+            if profile and profile.get('coder_server_id'):
+                server = coder_server_or_404(profile['coder_server_id'])
+                runner, environment, binding = pool_runner_for_task(server, task, excluded, quota_probe)
+            else:
+                server, runner, environment = None, None, None
+            if not runner:
+                # Existing installations without explicit account bindings retain the legacy runner path.
+                if not server or not runner_account_bindings(server['id']):
+                    prepared = provision_coder_execution(run_id, project, task)
+                else:
+                    waiting = rows("SELECT cooldown_until FROM runner_account_bindings WHERE enabled=1 AND cooldown_until IS NOT NULL ORDER BY cooldown_until LIMIT 1")
+                    message = 'Every configured runner account is cooling down. The task will resume automatically when the next account is eligible.'
+                    if waiting:
+                        message += ' Next cooldown expires ' + waiting[0]['cooldown_until'] + '.'
+                        schedule_cooldown_resume(run_id, waiting[0]['cooldown_until'])
+                    update_run(run_id, 'paused_cooldown', message)
+                    return
+            else:
+                try:
+                    prepared = provision_coder_execution(run_id, project, task, runner, environment)
+                except RuntimeError as exc:
+                    # Provisioning/capacity failures do not rotate accounts.
+                    # The task remains tied to its current runner until quota.
+                    if binding:
+                        update_run(run_id, 'awaiting_capacity' if str(exc).startswith('Runner capacity is occupied.') else 'stopped',
+                                   'Waiting for the selected runner capacity.' if str(exc).startswith('Runner capacity is occupied.') else str(exc))
+                        return
+                    raise
             runner, environment, remote_worktree = prepared['runner'], prepared['environment'], prepared['worktree']
             snapshot = remote_workspace_snapshot(runner, environment, remote_worktree['worktree_path'])
             if not resume_attempt_id and not permission_retry and task.get('session_budget_chars', 0) and session_message_chars(session['id']) >= int(task['session_budget_chars']):
@@ -1809,15 +2131,21 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
                 if not reconciled:
                     update_run(run_id, 'stopped', 'State needs review. ' + detail)
                     return
-            prior = one('SELECT * FROM attempts WHERE id=? AND task_id=?', (resume_attempt_id, task_id)) if resume_attempt_id else None
-            excluded = (prior['harness_key'],) if prior and prior.get('harness_key') in ('codex', 'claude') else ()
-            harness, selection = choose_remote_harness(task, runner, environment, excluded,
-                session.get('harness_key') if not resume_attempt_id else None)
+            try:
+                harness, selection = choose_remote_harness(task, runner, environment, () if binding else excluded,
+                    binding['provider'] if binding else (session.get('harness_key') if not resume_attempt_id else None),
+                    (binding['provider'],) if binding else None)
+            except ValueError as exc:
+                if binding:
+                    update_run(run_id, 'stopped', 'The selected runner account is unavailable. ' + str(exc))
+                    return
+                raise
             if not harness:
-                waiting = rows("SELECT cooldown_until FROM harnesses WHERE enabled=1 AND cooldown_until IS NOT NULL ORDER BY cooldown_until LIMIT 1")
-                message = 'All authenticated harnesses in this persistent Coder runner have reached their usage limits. The remote worktree is preserved.'
+                waiting = rows("SELECT cooldown_until FROM runner_account_bindings WHERE enabled=1 AND cooldown_until IS NOT NULL ORDER BY cooldown_until LIMIT 1") if binding else rows("SELECT cooldown_until FROM harnesses WHERE enabled=1 AND cooldown_until IS NOT NULL ORDER BY cooldown_until LIMIT 1")
+                message = 'No eligible bound runner account is available. The remote worktree is preserved and this task will resume automatically.'
                 if waiting:
                     message += ' Next cooldown expires ' + waiting[0]['cooldown_until'] + '.'
+                    schedule_cooldown_resume(run_id, waiting[0]['cooldown_until'])
                 update_run(run_id, 'paused_cooldown', message)
                 return
             permissions = json.loads(one('SELECT * FROM runs WHERE id=?', (run_id,))['permissions_json'] or '{}')
@@ -1857,7 +2185,10 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
                 reset = re.search(r'resets? in (\d+)\s*(day|hour|minute)', output, re.I)
                 seconds = int(reset[1]) * {'day': 86400, 'hour': 3600, 'minute': 60}[reset[2].lower()] if reset else 4 * 3600
                 until = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(timespec='seconds')
-                execute("UPDATE harnesses SET cooldown_until=?,updated_at=? WHERE id=?", (until, now(), harness['id']))
+                if binding:
+                    execute("UPDATE runner_account_bindings SET cooldown_until=?,cooldown_reason='quota',updated_at=? WHERE id=?", (until, now(), binding['id']))
+                else:
+                    execute("UPDATE harnesses SET cooldown_until=?,updated_at=? WHERE id=?", (until, now(), harness['id']))
                 if effective_mode(project, task) == 'supervised' or task['force_gate'] or not project.get('auto_failover', 1):
                     update_run(run_id, 'awaiting_resume', f'{harness["label"]} reached its limit (retry after {until}). The remote worktree is preserved; resume on the next authenticated CLI.', attempt_id)
                 else:
@@ -2157,7 +2488,7 @@ class API(SimpleHTTPRequestHandler):
                 self.send_json({"api_version": 10, "projects": [serialize_project(item) for item in rows("SELECT * FROM projects ORDER BY id DESC")], "harnesses": harnesses,
                                 "coder_servers": [public_coder_server(item) for item in rows('SELECT * FROM coder_servers ORDER BY name')],
                                 "runners": runners,
-                                "account_bindings": rows('SELECT b.*,r.workspace_name FROM runner_account_bindings b JOIN coder_runners r ON r.id=b.runner_id ORDER BY b.provider,b.priority,b.id'), "adapters": adapter_metadata()})
+                                "account_bindings": rows('SELECT b.*,r.workspace_name FROM runner_account_bindings b JOIN coder_runners r ON r.id=b.runner_id ORDER BY b.priority,b.id'), "adapters": adapter_metadata()})
                 return
             if route == "/api/harness-order":
                 scope, scope_id = harness_order_scope(
@@ -2285,6 +2616,7 @@ class API(SimpleHTTPRequestHandler):
                     "run": task_run,
                     "connection_action": run_connection_action(task_run),
                     "lease": execution_lease(task_run['id']) if task_run else None,
+                    "delivery_recovery": recoverable_delivery_for_task(task_id),
                     "pull_requests": task_pull_requests(task_id),
                     "blockers": blockers,
                     "messages": conversation_messages(task_id),
@@ -2802,18 +3134,22 @@ class API(SimpleHTTPRequestHandler):
                 content = str(payload.get("content", "")).strip()
                 if not content:
                     raise ValueError("Write a message first")
-                active = current_run(task['project_id'])
-                if active and active['task_id'] == task_id:
-                    raise ValueError("This task has an active run; wait for it to finish before adding new instructions")
+                active = one('SELECT * FROM runs WHERE task_id=? ORDER BY rowid DESC LIMIT 1', (task_id,))
+                if active and active['status'] == 'awaiting_external_auth':
+                    raise ValueError('Confirm the repository connection before sending another instruction')
                 session = active_session(task_id)
                 message_id = execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,'user',?,?)", (task_id, session['id'], content, now()))
                 # Attachments are uploaded before the message they belong to;
                 # sending the message is what ties them to a point in the thread.
                 execute("UPDATE task_attachments SET message_id=?,session_id=? WHERE task_id=? AND message_id IS NULL",
                         (message_id, session['id'], task_id))
-                execute("UPDATE tasks SET status='pending' WHERE id=?", (task_id,))
-                submission = request_run(task['project_id'], task_id) if payload.get('start') else None
-                self.send_json({"ok": True, 'submission': submission}, 201)
+                queued_statuses = ('awaiting_dispatch', 'awaiting_capacity', 'queued', 'running', 'verifying',
+                                   'rotating', 'committing', 'awaiting_review', 'awaiting_resume', 'paused_cooldown')
+                queued = bool(active and active['status'] in queued_statuses)
+                if not queued:
+                    execute("UPDATE tasks SET status='pending' WHERE id=?", (task_id,))
+                submission = request_run(task['project_id'], task_id) if payload.get('start') and not queued else None
+                self.send_json({"ok": True, 'queued': queued, 'submission': submission}, 201)
                 return
             match = re.match(r"^/api/tasks/(\d+)/sessions/rotate$", route)
             if match:
@@ -2878,6 +3214,10 @@ class API(SimpleHTTPRequestHandler):
                 claim_run(run['id'], run['status'], 'committing', 'Finishing reviewed run.')
                 threading.Thread(target=finish_commit, args=(run["id"], run["project_id"], run["task_id"], run["attempt_id"]), daemon=True).start()
                 self.send_json({"ok": True}); return
+            match = re.match(r"^/api/runs/([\w-]+)/continue-delivery-recovery$", route)
+            if match:
+                continue_delivery_recovery(match.group(1))
+                self.send_json({'ok': True}); return
             match = re.match(r"^/api/runs/([\w-]+)/retry-delivery$", route)
             if match:
                 retry_remote_delivery(match.group(1))
