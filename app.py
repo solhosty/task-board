@@ -2472,22 +2472,17 @@ class API(SimpleHTTPRequestHandler):
         route = urlparse(self.path).path
         try:
             if route == "/api/bootstrap":
+                # This is polled every 2.5s and awaited inline by the chat
+                # "Send" handler before it can re-render, so it must never do
+                # live Coder network calls. `runners[].available` used to be
+                # computed here with a per-runner live SSH-backed workspace
+                # lookup, but the frontend never reads that field — it was
+                # pure dead weight stalling every send and poll.
                 harnesses = rows('SELECT * FROM harnesses ORDER BY chain_position')
                 for harness in harnesses:
                     harness['availability'] = harness_availability(harness)
-                runners = rows('SELECT id,workspace_name,coder_server_id FROM coder_runners ORDER BY id')
-                for runner in runners:
-                    runner['available'] = False
-                    try:
-                        server = coder_server_or_404(runner['coder_server_id'])
-                        token = read_coder_token(server)
-                        coder_json(server['base_url'], '/api/v2/users/me/workspace/' + quote(runner['workspace_name'], safe=''), token)
-                        runner['available'] = True
-                    except Exception:
-                        pass
                 self.send_json({"api_version": 10, "projects": [serialize_project(item) for item in rows("SELECT * FROM projects ORDER BY id DESC")], "harnesses": harnesses,
                                 "coder_servers": [public_coder_server(item) for item in rows('SELECT * FROM coder_servers ORDER BY name')],
-                                "runners": runners,
                                 "account_bindings": rows('SELECT b.*,r.workspace_name FROM runner_account_bindings b JOIN coder_runners r ON r.id=b.runner_id ORDER BY b.priority,b.id'), "adapters": adapter_metadata()})
                 return
             if route == "/api/harness-order":
