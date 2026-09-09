@@ -616,6 +616,51 @@ textarea:focus-visible {
 .field .muted {
   margin: -3px 0 0;
 }
+.folder-field {
+  display: flex;
+  gap: 6px;
+}
+.folder-field .input {
+  flex: 1;
+}
+.folder-browser {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+  border: 1px solid #d8dee7;
+  border-radius: 7px;
+  padding: 10px;
+  background: #f9fafc;
+}
+.folder-browser-path {
+  font-size: 12px;
+  font-weight: 700;
+  color: #1b202b;
+  word-break: break-all;
+}
+.folder-browser-list {
+  display: grid;
+  gap: 2px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.folder-browser-item {
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  padding: 6px 8px;
+  text-align: left;
+  font-size: 13px;
+  color: #363d49;
+}
+.folder-browser-item:hover {
+  background: #eef1f8;
+}
+.folder-browser-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
 .select-trigger {
   display: flex;
   align-items: center;

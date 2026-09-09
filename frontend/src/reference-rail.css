@@ -43,6 +43,29 @@
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
+.rail-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.rail-label-row .rail-label {
+  margin: 18px 0 6px 8px;
+}
+.rail-label-add {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  margin: 12px 4px 0 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #7c8799;
+}
+.rail-label-add:hover {
+  background: #e5e9ff;
+  color: #283fc9;
+}
 .rail nav {
   display: grid;
   gap: 3px;

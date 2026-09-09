@@ -89,6 +89,7 @@ export default function App() {
     [newTask, setNewTask] = useState(false),
     [toast, setToast] = useState(''),
     [mobileOpen, setMobileOpen] = useState(false),
+    [newProject, setNewProject] = useState(false),
     [taskSearch, setTaskSearch] = useState('');
   const project = data?.projects.find((item) => item.id === (projectId ?? data?.projects[0]?.id));
   useEffect(() => {
@@ -165,7 +166,17 @@ export default function App() {
           />
         </nav>
         <div className="rail-projects">
-          <span className="rail-label">Projects</span>
+          <div className="rail-label-row">
+            <span className="rail-label">Projects</span>
+            <button
+              className="rail-label-add"
+              aria-label="Add project"
+              title="Add project"
+              onClick={() => setNewProject(true)}
+            >
+              <Plus size={13} />
+            </button>
+          </div>
           {data.projects.map((item) => (
             <button
               key={item.id}
@@ -250,7 +261,20 @@ export default function App() {
             />
           </nav>
           <div className="rail-projects">
-            <span className="rail-label">Projects</span>
+            <div className="rail-label-row">
+              <span className="rail-label">Projects</span>
+              <button
+                className="rail-label-add"
+                aria-label="Add project"
+                title="Add project"
+                onClick={() => {
+                  setMobileOpen(false);
+                  setNewProject(true);
+                }}
+              >
+                <Plus size={13} />
+              </button>
+            </div>
             {data.projects.map((item) => (
               <button
                 key={item.id}
@@ -352,6 +376,17 @@ export default function App() {
           setNewTask(false);
           refresh();
           setTaskId(id);
+        }}
+        notify={notify}
+      />
+      <NewProject
+        open={newProject}
+        onClose={() => setNewProject(false)}
+        onCreated={(id) => {
+          setNewProject(false);
+          refresh();
+          setProjectId(id);
+          setPage('board');
         }}
         notify={notify}
       />
@@ -1013,6 +1048,126 @@ function NewTask({
             {waitForExecution ? 'Add to planned' : 'Create and execute'}
           </Button>
         </div>
+      </div>
+    </Modal>
+  );
+}
+type DirectoryListing = { path: string; name: string; parent: string; folders: { name: string; path: string }[] };
+function NewProject({
+  open,
+  onClose,
+  onCreated,
+  notify,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onCreated: (id: number) => void;
+  notify: (s: string) => void;
+}) {
+  const [name, setName] = useState(''),
+    [repoPath, setRepoPath] = useState(''),
+    [browsing, setBrowsing] = useState(false),
+    [listing, setListing] = useState<DirectoryListing | null>(null);
+  async function browse(path?: string) {
+    try {
+      const result = await api<DirectoryListing>('/api/directories', 'POST', path ? { path } : {});
+      setListing(result);
+    } catch (error) {
+      notify((error as Error).message);
+    }
+  }
+  async function create() {
+    try {
+      const result = await api<{ id: number }>('/api/projects', 'POST', {
+        name: name.trim() || undefined,
+        repo_path: repoPath.trim(),
+      });
+      setName('');
+      setRepoPath('');
+      setBrowsing(false);
+      onCreated(result.id);
+    } catch (error) {
+      notify((error as Error).message);
+    }
+  }
+  return (
+    <Modal
+      open={open}
+      onClose={() => {
+        setBrowsing(false);
+        onClose();
+      }}
+      title="Add project"
+      description="Point Aludra at a local project folder to start tracking tasks in it."
+    >
+      <Field label="Project folder" help="The absolute path to an existing folder on this machine.">
+        <div className="folder-field">
+          <Input
+            autoFocus
+            value={repoPath}
+            onChange={(event) => setRepoPath(event.target.value)}
+            placeholder="/Users/you/code/my-project"
+          />
+          <Button
+            variant="secondary"
+            size="icon"
+            aria-label="Browse for folder"
+            title="Browse for folder"
+            onClick={() => {
+              setBrowsing(true);
+              browse(repoPath.trim() || undefined);
+            }}
+          >
+            <FolderPlus size={15} />
+          </Button>
+        </div>
+        {browsing && listing && (
+          <div className="folder-browser">
+            <div className="folder-browser-path">{listing.path}</div>
+            <div className="folder-browser-list">
+              {listing.parent !== listing.path && (
+                <button className="folder-browser-item" onClick={() => browse(listing.parent)}>
+                  <span>..</span>
+                </button>
+              )}
+              {listing.folders.map((folder) => (
+                <button
+                  key={folder.path}
+                  className="folder-browser-item"
+                  onClick={() => browse(folder.path)}
+                >
+                  <span>{folder.name}</span>
+                </button>
+              ))}
+              {!listing.folders.length && <p className="muted">No subfolders here.</p>}
+            </div>
+            <div className="folder-browser-actions">
+              <Button variant="secondary" size="sm" onClick={() => setBrowsing(false)}>
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => {
+                  setRepoPath(listing.path);
+                  setBrowsing(false);
+                }}
+              >
+                Use this folder
+              </Button>
+            </div>
+          </div>
+        )}
+      </Field>
+      <Field label="Name" help="Optional. Defaults to the folder name.">
+        <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="My project" />
+      </Field>
+      <div className="modal-actions">
+        <Button variant="secondary" onClick={onClose}>
+          Cancel
+        </Button>
+        <Button disabled={!repoPath.trim()} onClick={create}>
+          Add project
+        </Button>
       </div>
     </Modal>
   );
