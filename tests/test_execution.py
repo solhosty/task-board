@@ -229,6 +229,22 @@ print('Implemented the requested feature.', flush=True)
         self.assertEqual(state['task']['status'], 'completed')
         self.assertFalse(Path(state['attempts'][0]['worktree_path']).exists())
 
+    def test_message_while_a_run_is_active_is_queued_for_that_run(self):
+        project_id, task_id, run_id = self.create()
+        self.wait(task_id, 'awaiting_dispatch')
+        with patch.object(app, 'run_attempt') as worker:
+            response = self.api(f'/api/tasks/{task_id}/messages', {
+                'content': 'Resolve the newly reported merge conflicts too.', 'start': True})
+            worker.assert_not_called()
+        self.assertTrue(response['queued'])
+        state = self.api(f'/api/tasks/{task_id}')
+        self.assertEqual(state['run']['id'], run_id)
+        self.assertEqual(state['run']['status'], 'awaiting_dispatch')
+        self.assertTrue(any(message['content'] == 'Resolve the newly reported merge conflicts too.'
+                            for message in state['messages']))
+        prompt = app.task_prompt(state['task'], app.one('SELECT * FROM projects WHERE id=?', (project_id,)))
+        self.assertIn('Resolve the newly reported merge conflicts too.', prompt)
+
     def test_task_and_run_snapshot_do_not_mix_across_completion(self):
         _, task_id, run_id = self.create()
         def complete_during_checks(*args):

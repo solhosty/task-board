@@ -303,6 +303,20 @@ class CoderRunnerTests(unittest.TestCase):
             runner, _, binding = app.pool_runner_for_task(self.server, task)
         self.assertEqual((runner['id'], binding['label']), (other['id'], 'second'))
 
+    def test_existing_task_keeps_its_runner_when_its_pool_binding_was_removed(self):
+        other = app.save_coder_runner(self.server, self.owner, dict(self.workspace, id='other-runner', name='other-runner'))
+        task, _ = self.task_run()
+        app.execute('''INSERT INTO runner_account_bindings(runner_id,provider,label,priority,created_at,updated_at)
+                       VALUES(?,'claude','new-pool-runner',0,?,?)''', (other['id'], app.now(), app.now()))
+        app.execute('''INSERT INTO coder_task_worktrees(task_id,runner_id,task_key,repo_url,created_at,updated_at)
+                       VALUES(?,?,?,'https://example.com/repo',?,?)''', (task['id'], self.runner['id'], 'task-' + 'b' * 32, app.now(), app.now()))
+        with patch.object(app, 'read_coder_token', return_value='secret'), \
+             patch.object(app, 'remote_claude_account', return_value={'installed': True, 'authenticated': True}), \
+             patch.object(app, 'refresh_runner_capacity', side_effect=lambda runner, *_args, **_kwargs: runner):
+            runner, _, binding = app.pool_runner_for_task(self.server, task)
+        self.assertEqual(runner['id'], self.runner['id'])
+        self.assertIsNone(binding)
+
     def test_live_authenticated_check_clears_only_legacy_cooldown(self):
         stale = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
         binding_id = app.execute('''INSERT INTO runner_account_bindings(runner_id,provider,label,cooldown_until,created_at,updated_at)

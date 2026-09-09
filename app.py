@@ -1246,6 +1246,13 @@ def pool_runner_for_task(server: Dict[str, Any], task: Dict[str, Any], excluded:
         assigned = next((item for item in bindings if item['runner_id'] == saved['runner_id'] and item['enabled']), None)
         if assigned and not (assigned.get('cooldown_reason') == 'quota' and assigned.get('cooldown_until') and datetime.fromisoformat(assigned['cooldown_until'].replace('Z', '+00:00')) > datetime.now(timezone.utc)):
             return one('SELECT * FROM coder_runners WHERE id=?', (assigned['runner_id'],)), environment, assigned
+        # A task workspace remains owned by its recorded runner even when an
+        # administrator removes that runner from the pool.  Pool membership
+        # controls new assignments and quota failover; it must not silently
+        # migrate an existing dirty worktree to another runner.
+        preserved_runner = one('SELECT * FROM coder_runners WHERE id=?', (saved['runner_id'],))
+        if preserved_runner:
+            return preserved_runner, environment, None
     binding = account_pool.next_binding(bindings, order)
     if not binding and allow_quota_probe:
         # Account/read confirms identity but does not report remaining quota.
@@ -3119,17 +3126,21 @@ class API(SimpleHTTPRequestHandler):
                 if not content:
                     raise ValueError("Write a message first")
                 active = one('SELECT * FROM runs WHERE task_id=? ORDER BY rowid DESC LIMIT 1', (task_id,))
-                if active and active['status'] in ('queued','running','verifying','rotating','committing'):
-                    raise ValueError("This task has an active run; wait for it to finish before adding new instructions")
+                if active and active['status'] == 'awaiting_external_auth':
+                    raise ValueError('Confirm the repository connection before sending another instruction')
                 session = active_session(task_id)
                 message_id = execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at) VALUES(?,?,'user',?,?)", (task_id, session['id'], content, now()))
                 # Attachments are uploaded before the message they belong to;
                 # sending the message is what ties them to a point in the thread.
                 execute("UPDATE task_attachments SET message_id=?,session_id=? WHERE task_id=? AND message_id IS NULL",
                         (message_id, session['id'], task_id))
-                execute("UPDATE tasks SET status='pending' WHERE id=?", (task_id,))
-                submission = request_run(task['project_id'], task_id) if payload.get('start') else None
-                self.send_json({"ok": True, 'submission': submission}, 201)
+                queued_statuses = ('awaiting_dispatch', 'awaiting_capacity', 'queued', 'running', 'verifying',
+                                   'rotating', 'committing', 'awaiting_review', 'awaiting_resume', 'paused_cooldown')
+                queued = bool(active and active['status'] in queued_statuses)
+                if not queued:
+                    execute("UPDATE tasks SET status='pending' WHERE id=?", (task_id,))
+                submission = request_run(task['project_id'], task_id) if payload.get('start') and not queued else None
+                self.send_json({"ok": True, 'queued': queued, 'submission': submission}, 201)
                 return
             match = re.match(r"^/api/tasks/(\d+)/sessions/rotate$", route)
             if match:
