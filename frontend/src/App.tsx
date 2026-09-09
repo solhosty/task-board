@@ -89,6 +89,7 @@ export default function App() {
     [newTask, setNewTask] = useState(false),
     [toast, setToast] = useState(''),
     [mobileOpen, setMobileOpen] = useState(false),
+    [newProject, setNewProject] = useState(false),
     [taskSearch, setTaskSearch] = useState('');
   const project = data?.projects.find((item) => item.id === (projectId ?? data?.projects[0]?.id));
   useEffect(() => {
@@ -179,6 +180,10 @@ export default function App() {
               <small>{item.tasks.length}</small>
             </button>
           ))}
+          <button className="project-select add-project" onClick={() => setNewProject(true)}>
+            <FolderPlus size={15} />
+            <span>Add project</span>
+          </button>
         </div>
         <nav className="setup-nav">
           <span className="rail-label">Setup</span>
@@ -265,6 +270,16 @@ export default function App() {
                 <small>{item.tasks.length}</small>
               </button>
             ))}
+            <button
+              className="project-select add-project"
+              onClick={() => {
+                setMobileOpen(false);
+                setNewProject(true);
+              }}
+            >
+              <FolderPlus size={15} />
+              <span>Add project</span>
+            </button>
           </div>
           <nav>
             <span className="rail-label">Setup</span>
@@ -352,6 +367,17 @@ export default function App() {
           setNewTask(false);
           refresh();
           setTaskId(id);
+        }}
+        notify={notify}
+      />
+      <NewProject
+        open={newProject}
+        onClose={() => setNewProject(false)}
+        onCreated={(id) => {
+          setNewProject(false);
+          refresh();
+          setProjectId(id);
+          setPage('board');
         }}
         notify={notify}
       />
@@ -1013,6 +1039,61 @@ function NewTask({
             {waitForExecution ? 'Add to planned' : 'Create and execute'}
           </Button>
         </div>
+      </div>
+    </Modal>
+  );
+}
+function NewProject({
+  open,
+  onClose,
+  onCreated,
+  notify,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onCreated: (id: number) => void;
+  notify: (s: string) => void;
+}) {
+  const [name, setName] = useState(''),
+    [repoPath, setRepoPath] = useState('');
+  async function create() {
+    try {
+      const result = await api<{ id: number }>('/api/projects', 'POST', {
+        name: name.trim() || undefined,
+        repo_path: repoPath.trim(),
+      });
+      setName('');
+      setRepoPath('');
+      onCreated(result.id);
+    } catch (error) {
+      notify((error as Error).message);
+    }
+  }
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Add project"
+      description="Point Aludra at a local project folder to start tracking tasks in it."
+    >
+      <Field label="Project folder" help="The absolute path to an existing folder on this machine.">
+        <Input
+          autoFocus
+          value={repoPath}
+          onChange={(event) => setRepoPath(event.target.value)}
+          placeholder="/Users/you/code/my-project"
+        />
+      </Field>
+      <Field label="Name" help="Optional. Defaults to the folder name.">
+        <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="My project" />
+      </Field>
+      <div className="modal-actions">
+        <Button variant="secondary" onClick={onClose}>
+          Cancel
+        </Button>
+        <Button disabled={!repoPath.trim()} onClick={create}>
+          Add project
+        </Button>
       </div>
     </Modal>
   );
