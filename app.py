@@ -1385,8 +1385,9 @@ def run_remote_agent(runner: Dict[str, Any], environment: Dict[str, str], comman
 
 
 
-def remote_delivery_request(worktree: Dict[str, Any], task: Dict[str, Any], profile: Dict[str, Any]) -> str:
-    return remote_transport.delivery_request(worktree, task, profile)
+def remote_delivery_request(worktree: Dict[str, Any], task: Dict[str, Any], profile: Dict[str, Any],
+                            attempt: Dict[str, Any] = None) -> str:
+    return remote_transport.delivery_request(worktree, task, profile, attempt)
 
 
 
@@ -1849,7 +1850,13 @@ Previous sealed-session handoff (may be incomplete; verify against the code):
 Current-session harness progress (may be incomplete; verify against the code):
 {current_progress or 'No harness attempts in this session.'}
 
-Read the existing code and current diff before editing. Another harness may have worked on this same session. Preserve all existing uncommitted and untracked work. Work only inside this project folder. Do not commit, stash, reset, clean, or push. Keep changes focused and run relevant tests. Before meaningful tool batches, send a short user-visible progress update explaining what you are checking or changing; do not reveal private chain-of-thought. Finish with a concise summary of changes and tests run. If permissions prevent completing the task, clearly report that rather than claiming success."""
+Read the existing code and current diff before editing. Another harness may have worked on this same session. Preserve all existing uncommitted and untracked work. Work only inside this project folder. Do not commit, stash, reset, clean, or push. Keep changes focused and run relevant tests. Before meaningful tool batches, send a short user-visible progress update explaining what you are checking or changing; do not reveal private chain-of-thought. Finish with a concise summary of changes and tests run.
+
+If you made changes, end your reply with exactly these two lines (used verbatim as the commit message and pull-request description, so write them the way a senior engineer would title and describe their own PR — no ticket numbers, no restating this prompt):
+PR_TITLE: <imperative-mood summary of the change, under 70 characters>
+PR_SUMMARY: <1-3 sentences a reviewer would read as the PR description>
+
+If permissions prevent completing the task, clearly report that rather than claiming success."""
 
 
 def log_file(attempt_id: int) -> Path:
@@ -1992,6 +1999,29 @@ def cleanup_worktree(repo: Path, worktree: Path) -> None:
 
 def decode_result(key: str, output: str) -> Tuple[str, Optional[str]]:
     return decode_harness_result(key, output)
+
+
+PR_TITLE_RE = re.compile(r'^PR_TITLE:\s*(.+)$', re.MULTILINE)
+PR_SUMMARY_RE = re.compile(r'^PR_SUMMARY:\s*(.+)$', re.MULTILINE | re.DOTALL)
+
+
+def extract_pr_summary(reply: str) -> Tuple[str, str, str]:
+    """Split the harness's PR_TITLE/PR_SUMMARY footer out of its final reply.
+
+    Returns (title, summary, reply_without_footer). Either of the first two is
+    '' if the harness did not include that line, and callers fall back to the
+    raw task text in that case. Uses the last match of each so an earlier echo
+    of these instructions (e.g. in a quoted prompt) is not mistaken for the
+    real footer.
+    """
+    title_match = None
+    for title_match in PR_TITLE_RE.finditer(reply):
+        pass
+    summary_match = PR_SUMMARY_RE.search(reply, title_match.end()) if title_match else None
+    title = title_match.group(1).strip()[:200] if title_match else ''
+    summary = summary_match.group(1).strip()[:2000] if summary_match else ''
+    cleaned = reply[:title_match.start()].rstrip() if title_match else reply
+    return title, summary, cleaned
 
 
 def log_details(attempt: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2203,7 +2233,10 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
                 return
             execute("UPDATE attempts SET status='verified',verify_output=?,diff_output=? WHERE id=?", (verification, result.get('diff') or '', attempt_id))
             if reply.strip():
-                execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at,attempt_id) VALUES(?,?,'assistant',?,?,?)", (task_id, session['id'], reply.strip(), now(), attempt_id))
+                pr_title, pr_summary, reply = extract_pr_summary(reply.strip())
+                execute('UPDATE attempts SET pr_title=?, pr_summary=? WHERE id=?', (pr_title or None, pr_summary or None, attempt_id))
+                if reply.strip():
+                    execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at,attempt_id) VALUES(?,?,'assistant',?,?,?)", (task_id, session['id'], reply.strip(), now(), attempt_id))
             update_run(run_id, 'awaiting_review', f'Verification passed in persistent runner {runner["workspace_name"]}. Review the remote diff before committing or creating a pull request.', attempt_id)
             return
         session = active_session(task_id)
@@ -2291,7 +2324,10 @@ def _run_attempt(run_id: str, project_id: int, task_id: int, resume_attempt_id: 
         if code == 0:
             reply = reply_file.read_text(encoding='utf-8') if reply_file.exists() else reply
             if reply.strip():
-                execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at,attempt_id) VALUES(?,?,'assistant',?,?,?)", (task_id, session['id'], reply.strip(), now(), attempt_id))
+                pr_title, pr_summary, reply = extract_pr_summary(reply.strip())
+                execute('UPDATE attempts SET pr_title=?, pr_summary=? WHERE id=?', (pr_title or None, pr_summary or None, attempt_id))
+                if reply.strip():
+                    execute("INSERT INTO task_messages(task_id,session_id,role,content,created_at,attempt_id) VALUES(?,?,'assistant',?,?,?)", (task_id, session['id'], reply.strip(), now(), attempt_id))
         if code:
             is_quota = any(pattern.search(output) for pattern in QUOTA_PATTERNS)
             outcome = "quota" if is_quota else "failed"
@@ -2345,7 +2381,7 @@ def finish_commit(run_id: str, project_id: int, task_id: int, attempt_id: int) -
                     raise RuntimeError('This project no longer has a Coder profile. The remote worktree was preserved.')
                 prepared = provision_coder_execution(run_id, project, task)
                 result = run_remote_delivery(prepared['runner'], prepared['environment'],
-                                             remote_delivery_request(prepared['worktree'], task, profile))
+                                             remote_delivery_request(prepared['worktree'], task, profile, attempt))
                 execute("""INSERT INTO task_pull_requests(task_id,provider,url,number,branch_name,head_sha,state,review_state,created_at,updated_at)
                     VALUES(?,'github',?,?,?,?,'open','pending',?,?) ON CONFLICT(task_id,url) DO UPDATE SET
                     number=excluded.number,branch_name=excluded.branch_name,head_sha=excluded.head_sha,state='open',

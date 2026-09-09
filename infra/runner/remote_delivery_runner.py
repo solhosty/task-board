@@ -146,10 +146,10 @@ def main(encoded):
     head = repository.split("/", 1)[0] + ":" + branch
     query = urlencode({"state": "open", "head": head, "base": base, "per_page": "1"})
     existing = github_json("GET", "https://api.github.com/repos/" + repository + "/pulls?" + query, token)
+    body = str(request.get("body") or "Created by Harness Rotation after remote verification.")[:4000]
     pull = existing[0] if isinstance(existing, list) and existing else github_json(
         "POST", "https://api.github.com/repos/" + repository + "/pulls", token,
-        {"title": title, "head": branch, "base": base,
-         "body": "Created by Harness Rotation after remote verification."})
+        {"title": title, "head": branch, "base": base, "body": body})
     diff = run(["git", "diff", request["base_sha"], "HEAD", "--"], worktree).stdout
     stat = run(["git", "diff", "--stat", request["base_sha"], "HEAD"], worktree).stdout.strip()
     print(MARKER + json.dumps({"commit_sha": head_sha, "head_sha": head_sha, "branch_name": branch,
