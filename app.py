@@ -1225,8 +1225,15 @@ def refresh_runner_account_bindings(server: Dict[str, Any], force: bool = False)
 
 
 def pool_runner_for_task(server: Dict[str, Any], task: Dict[str, Any], excluded: Tuple[str, ...] = (),
-                         allow_quota_probe: bool = False) -> Tuple[Optional[Dict[str, Any]], Dict[str, str], Optional[Dict[str, Any]]]:
-    """Choose an eligible configured account, rather than a legacy default runner."""
+                         allow_quota_probe: bool = False, refresh: bool = True) -> Tuple[Optional[Dict[str, Any]], Dict[str, str], Optional[Dict[str, Any]]]:
+    """Choose an eligible configured account, rather than a legacy default runner.
+
+    refresh=False skips the live SSH re-verification of each account and uses
+    the last cached binding state instead; callers on the interactive request
+    path use this so sending a chat message never blocks on a runner probe.
+    The real dispatch in run_attempt always refreshes before it actually uses
+    a runner, so a stale read here cannot admit a bad account into execution.
+    """
     token = read_coder_token(server)
     if not token:
         raise ValueError('The Coder token is unavailable from Keychain.')
@@ -1238,7 +1245,7 @@ def pool_runner_for_task(server: Dict[str, Any], task: Dict[str, Any], excluded:
     order = ([task['preferred_harness']] if task.get('preferred_harness') else [])
     configured_order, _ = resolve_harness_order(task)
     order += [key for key in configured_order if key in ('codex', 'claude') and key not in order]
-    bindings = refresh_runner_account_bindings(server)
+    bindings = refresh_runner_account_bindings(server) if refresh else runner_account_bindings(server['id'])
     # Capacity never changes an account assignment. A task keeps its runner
     # until that account has a confirmed usage-limit cooldown.
     saved = one('SELECT runner_id FROM coder_task_worktrees WHERE task_id=?', (task.get('id'),)) if task.get('id') else None
@@ -1475,8 +1482,12 @@ def parse_scheduled_for(value: Any) -> Optional[str]:
 
 
 def request_run(project_id: int, task_id: Optional[int] = None) -> Dict[str, Any]:
-    # Do this outside the scheduler lock: Coder SSH may take a moment, and an
-    # existing runner is enough to measure without provisioning anything.
+    # This runs on the interactive request path (e.g. every chat "Send"), so it
+    # must never block on Coder SSH. Use the last cached runner/account state
+    # for this admission decision; the actual dispatch in run_attempt always
+    # re-checks live before using a runner, so a stale read here cannot admit
+    # a bad account into execution, and it never leaves the cache stale for
+    # long since scheduled_task_loop and every dispatch refresh it too.
     preflight_project = project_or_404(project_id)
     preflight_task = one("SELECT * FROM tasks WHERE project_id=? AND status='pending'" + (' AND id=?' if task_id else ' ORDER BY task_order LIMIT 1'),
                          (project_id, int(task_id)) if task_id else (project_id,))
@@ -1489,9 +1500,7 @@ def request_run(project_id: int, task_id: Optional[int] = None) -> Dict[str, Any
                 # Explicit account pools reserve capacity on the account chosen
                 # for this task. Capacity never makes a task jump accounts.
                 if runner_account_bindings(server['id']):
-                    selected_runner, _, _ = pool_runner_for_task(server, preflight_task)
-                else:
-                    refresh_saved_runner_capacity(server)
+                    selected_runner, _, _ = pool_runner_for_task(server, preflight_task, refresh=False)
             except (ValueError, RuntimeError, HTTPError, URLError, OSError, subprocess.TimeoutExpired):
                 # Execution blockers and provisioning report Coder failures; a
                 # failed telemetry read must not discard a known safe capacity.
