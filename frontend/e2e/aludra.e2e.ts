@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 
 const bootstrap = {
-  api_version: 9,
+  api_version: 10,
   harnesses: [
     {
       key: 'codex',
@@ -21,6 +21,8 @@ const bootstrap = {
     },
   ],
   coder_servers: [],
+  runners: [],
+  account_bindings: [],
   adapters: {
     codex: {
       models: ['default', 'gpt-5-codex'],
@@ -137,6 +139,12 @@ async function mockBootstrap(page: any) {
   await page.route('**/api/bootstrap', (route) =>
     route.fulfill({ contentType: 'application/json', body: JSON.stringify(bootstrap) }),
   );
+  await page.route('**/api/task-state', (route) =>
+    route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ projects: bootstrap.projects }),
+    }),
+  );
   await page.route('**/api/tasks/12', (route) =>
     route.fulfill({ contentType: 'application/json', body: JSON.stringify(taskDetail) }),
   );
@@ -145,7 +153,7 @@ async function mockBootstrap(page: any) {
 test('the real backend provides a JSON bootstrap response', async ({ request }) => {
   const response = await request.get('/api/bootstrap');
   expect(response.headers()['content-type']).toContain('application/json');
-  expect((await response.json()).api_version).toBe(9);
+  expect((await response.json()).api_version).toBe(10);
 });
 test('legacy ui paths resolve to the React product', async ({ page }) => {
   await mockBootstrap(page);
@@ -210,8 +218,9 @@ test('supporting pages preserve the approved layout rhythm', async ({ page }, te
   await page.goto('/');
   if ((page.viewportSize()?.width || 0) < 600) return;
   for (const label of ['Activity', 'Connections', 'Settings']) {
+    const heading = label === 'Connections' ? 'Account pool' : label;
     await page.getByRole('button', { name: label, exact: true }).first().click();
-    await expect(page.getByRole('heading', { name: label, exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: heading, exact: true })).toBeVisible();
     await page.screenshot({
       path: testInfo.outputPath(`${label.toLowerCase()}.png`),
       fullPage: true,
@@ -230,7 +239,7 @@ test('saved views and the responsive navigation follow the documented flows', as
       .locator('.mobile-drawer')
       .getByRole('button', { name: 'Connections', exact: true })
       .click();
-    await expect(page.getByRole('heading', { name: 'Connections', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Account pool', exact: true })).toBeVisible();
     return;
   }
   await page.getByRole('tab', { name: '+ View' }).click();
@@ -248,7 +257,7 @@ test('delivery tab uses the approved pull-request table', async ({ page }) => {
   await expect(page.getByRole('button', { name: 'Open task' })).toBeVisible();
 });
 
-test('a new task starts its harness without a separate opt-in', async ({ page }) => {
+test('a new task starts its harness when execution is enabled', async ({ page }) => {
   await mockBootstrap(page);
   let submitted: any;
   await page.route('**/api/projects/1/tasks', async (route) => {
@@ -271,7 +280,10 @@ test('a new task starts its harness without a separate opt-in', async ({ page })
   await page.goto('/');
   await page.getByRole('button', { name: 'New task' }).click();
   await expect(page.getByRole('checkbox', { name: /start the harness/i })).toHaveCount(0);
-  await page.getByLabel('What should be done?').fill('Start my task');
+  await page.getByRole('checkbox', { name: 'Wait until I execute this task' }).click();
+  await page
+    .getByPlaceholder('Describe the outcome and acceptance criteria…')
+    .fill('Start my task');
   await page.getByRole('button', { name: 'Create task' }).click();
   await expect.poll(() => submitted).toMatchObject({ text: 'Start my task', start: true });
 });

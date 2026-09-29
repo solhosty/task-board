@@ -1,14 +1,18 @@
 import { defineConfig, devices } from '@playwright/test';
+
+const port = Number(process.env.PLAYWRIGHT_PORT || 4173);
+const baseURL = 'http://127.0.0.1:' + port;
+
 export default defineConfig({
   testDir: './e2e',
   testMatch: '**/*.e2e.ts',
   timeout: 30_000,
-  use: { baseURL: 'http://127.0.0.1:4173', trace: 'retain-on-failure' },
+  use: { baseURL, trace: 'retain-on-failure' },
   webServer: {
-    command: 'PYTHONDONTWRITEBYTECODE=1 python3 ../app.py --port 4173',
-    url: 'http://127.0.0.1:4173/api/bootstrap',
+    command: 'PYTHONDONTWRITEBYTECODE=1 python3 ../app.py --port ' + port,
+    url: baseURL + '/api/bootstrap',
     timeout: 30_000,
-    reuseExistingServer: true,
+    reuseExistingServer: !process.env.CI,
   },
   projects: [
     { name: 'desktop', use: { ...devices['Desktop Chrome'], browserName: 'chromium' } },
