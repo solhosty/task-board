@@ -411,7 +411,8 @@ class CoderRunnerTests(unittest.TestCase):
                        VALUES(?,'codex','first',0,?,'quota',?,?)''',
                     (self.runner['id'], future, app.now(), app.now()))
         with patch.object(app, 'read_coder_token', return_value='secret'), \
-             patch.object(app, 'remote_codex_account', return_value={'installed':True, 'authenticated':True}):
+             patch.object(app, 'remote_codex_account', return_value={'installed':True, 'authenticated':True}), \
+             patch.object(app, 'refresh_runner_capacity', return_value=self.runner):
             runner, _, binding = app.pool_runner_for_task(self.server, {'preferred_harness':'codex'}, allow_quota_probe=True)
         self.assertEqual((runner['id'], binding['label']), (self.runner['id'], 'first'))
 
