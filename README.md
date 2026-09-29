@@ -1,149 +1,79 @@
 # Harness Rotation
 
-## Run the redesigned Aludra UI
+Harness Rotation is a local-first task board for coordinating coding harnesses against real project folders. A task keeps its goal, conversation, attempts, verification output, diff, and review state together while work moves between supported CLIs.
 
-For the production-style dashboard, build the frontend once and start the Python application:
+It is experimental desktop tooling for a single trusted user, not a hosted service or a security sandbox.
 
-```bash
-cd frontend && npm run build
-cd .. && python3 app.py
-```
+## What it does
 
-Open the printed `http://127.0.0.1:4173` URL. The React application is served at `/`.
+- Organizes local code folders into projects and persistent tasks.
+- Runs Codex, Claude Code, Droid, or OpenCode when those CLIs are installed and authenticated locally.
+- Preserves progress, logs, diffs, and verification results across attempts and controlled fallback.
+- Supports explicit dispatch and review gates before delivery actions.
+- Optionally connects to a self-hosted Coder deployment for persistent remote runners and task worktrees.
 
-For frontend hot reload, leave the Python server running and use a second terminal:
+Read [DOMAIN.md](DOMAIN.md) for the product model and [the persistent-runner decision](docs/adr/0001-persistent-coder-runners.md) for the remote-workspace boundary.
 
-```bash
-cd frontend && npm run dev
-```
+## Requirements
 
-Vite proxies API requests to the Python server on port `4173`.
+- Python 3.9+
+- Node.js 20+
+- npm
+- Git, for Git-backed projects and isolated worktrees
 
-A local workspace for goals that can continue across coding harnesses.
+The optional Coder flow is intended for a self-hosted Coder deployment. Coder credentials are stored in the operating-system keychain when available; do not commit them or the local .harness/ state directory.
 
-A project is a named folder containing local code. Each project has many tasks. A task is a persistent goal—a feature, fix, or entire app—with its conversation and harness attempts kept together. See [DOMAIN.md](DOMAIN.md).
+## Quick start
 
-The planned self-hosted remote execution path is specified in [CODER_PHASE_1.md](CODER_PHASE_1.md). It keeps Coder Community as the workspace layer while Harness Rotation retains headless fallback, verification, and review control.
+Install the root and frontend dependencies, then build the frontend bundle:
 
-Projects open on a task board. A card belongs to Planned, Running, Needs review, or Done and shows whether its effective execution target is local or the project's Coder environment. Local remains the default. The Coder settings can discover/register localhost Coder, store an API token in macOS Keychain, and create a server-specific project profile.
+    npm ci
+    npm --prefix frontend ci
+    npm run build
+    python3 app.py
 
-Coder-targeted work reuses a persistent private runner for the authenticated Coder user and creates a separate task worktree with a recorded base SHA. Retries preserve the same task's uncommitted files. Under **Manage servers → Runner**, select an existing private workspace and configure its admission limit; otherwise the first remote task creates a runner from the selected project template. Native CLI credentials stay in the runner's persistent home, never copied from the desktop or into task records. Private-repository authorization remains under per-user **Connected accounts**, where identity authorization and GitHub App installation are distinct. For HTTPS Git operations, Coder injects the workspace’s external-auth credential through `GIT_ASKPASS`; Harness does not replace it with a desktop or cached credential. Codex and Claude Code can now run remotely, return their transcript, verification output, and diff to the board, then always stop at **Needs review**. A user may explicitly commit, push, and create a PR from that review state; remote quota fallback is also supported. Parallel execution remains intentionally out of scope for this increment.
+Open the localhost URL printed by the server. State is written to .harness/ by default; pass --data-dir PATH to isolate it elsewhere.
 
-Remote delivery derives the authenticated GitHub account's ID-based `noreply`
-commit address at delivery time. It avoids placing a Coder profile email into Git
-metadata, so GitHub's private-email push protection remains enabled.
+For frontend development, use the combined development script after installing dependencies:
 
-## Run
+    npm run dev
 
-### Coder connection setup
+It starts the Python API on port 4173 and Vite with API proxying. Press Ctrl-C to stop both processes.
 
-Connected Accounts separates **Connect to Coder** (device authorization for the
-registered Coder account) from **Install for repository access** (GitHub App
-installation and repository selection). Both may be required. Installation alone
-does not authorize Coder, and authorization alone does not prove repository access.
-Harness polls the device exchange server-side, honoring pending and slow-down
-responses, and displays expiry or failure. The private device code stays in memory;
-only the one-time user code and verification URL reach the browser. Restarting
-Harness interrupts pending exchanges; begin a new connection after a restart.
+## Safety boundaries
 
-```sh
-python3 app.py
-```
-
-Open the URL printed in the terminal. The server prefers port 4173 and chooses a free port if that port is occupied. Use `python3 app.py --port 4180` to request another port. Ctrl-C stops the server. State is stored in `.harness/`; `--data-dir PATH` selects another state directory.
-
-## Backend structure
-
-`app.py` remains the dependency-light executable and compatibility API. Backend
-responsibilities that need independent evolution live in `harness_rotation/`:
-
-- `adapters.py` owns the supported CLI command contracts.
-- `coder_config.py` owns Coder URL validation, naming, and public presentation.
-- `credentials.py` owns Coder token lookup and Keychain operations.
-- `remote_transport.py` owns the validated SSH protocol used by Coder task helpers.
-- `worktrees.py` owns local Git worktree, harness-process, and merge mechanics.
-- `run_state.py` owns active-run queries, runner-slot queries, and execution leases.
-- `harness_output.py` owns reply decoding and saved-log presentation.
-- `coder_bridges.py` owns the private Codex JSON-RPC and Claude login transports
-  used inside persistent Coder runners.
-- `persistence.py` owns SQLite connections, the current schema, and numbered,
-  idempotent migrations.
-- `sessions.py` owns durable task-session rotation, handoff construction, and
-  workspace-integrity reconciliation.
-
-New backend behavior should enter through one of these boundaries rather than add
-another responsibility directly to the HTTP handler. Existing tests and maintenance
-scripts may continue to import `app` while modules are extracted incrementally.
-
-### Runner payloads
-
-`infra/runner/` holds the programs that execute _inside_ a persistent Coder
-runner rather than on the desktop. Each is sent over Coder SSH as stdin and run
-by `python3 -`, so they must stay standard-library only and must never import
-`app` or `harness_rotation`. The host reads them through
-`harness_rotation.remote_transport.payload`, which is the single place that
-knows the directory.
-
-- `remote_worktree.py` creates the isolated per-task checkout and pins its base ref.
-- `remote_agent_runner.py` runs one bounded Codex/Claude attempt plus verification.
-- `remote_delivery_runner.py` commits, pushes, and opens or reads the GitHub PR.
-- `remote_runner_capacity.py` probes cgroup CPU/memory to set the admission limit.
-- `remote_workspace_snapshot.py` fingerprints remote Git state read-only.
-- `remote_claude_login.py` proxies Claude Code's interactive login over a PTY.
-
-## Workspace
-
-- Browse local folders, name a project, and add it to the sidebar. Git and TASKS.md are not required to organize projects.
-- Start tasks under a project. Each task holds a goal and an ongoing conversation.
-- Create & run and Send & run request execution. Supervised tasks show an explicit dispatch approval before starting. Missing setup is shown in the conversation as a blocked run; creating text alone is no longer presented as running work.
-- Open a task to add messages, configure its preferred harness/model, and inspect its attempts.
-- Scan tools from the harness panel. Results are visible even before adding a project.
-- Add/remove harnesses from rotation and reorder them with the arrows. Membership is the only enablement control. A task's preferred harness takes priority; unavailable preferences fall back to the first eligible harness in the rotation.
-- Select discovered models or enter a custom model ID. Codex uses its local cache; Droid uses its CLI catalog; Claude offers aliases; OpenCode uses `opencode models` when installed. Discovery does not guarantee entitlement.
-- New projects always start with no tasks, even if the folder already contains TASKS.md. Task conversations are stored in SQLite and existing files are left unchanged. No example projects or goals are seeded.
-
-## Execution status
-
-Chat renders a safe Markdown subset (headings, lists, emphasis, inline code, fenced code). Code blocks and raw logs have bounded scroll areas; raw logs start collapsed. New output follows the bottom until you scroll up; Jump to latest resumes following. All four adapters share the conversation and activity layout, with harness attribution on new replies. Codex uses structured events rather than dumping terminal output into chat. Attempt details expose saved Codex CLI session IDs and resume commands; Rotation does not synchronize these into desktop chat entries. Do not resume a native session separately while Rotation is editing the same folder.
-
-Natural-language progress remains visible in sequence, with expandable tool batches between messages. Provider-emitted **reasoning summaries** are shown inline with each harness run and highlighted while a run is active; these are concise status summaries, not private model chain-of-thought. Saved logs reconstruct history after reload, including interrupted harness progress; up to the latest 500 normalized events per attempt are embedded, with bounded output previews and a full raw transcript download. Older Codex text logs recover explicit assistant sections. Failed Claude attempts retain their natural-language explanations, and recorded tool denials display **Needs permission**, not an undifferentiated failure.
-
-Tool permissions can be chosen before creating a task or in task settings. **Use each harness’s default** inherits the per-harness settings; **Auto** overrides them for this task; **Use adapter defaults** uses the original adapter policies. Every new run snapshots the effective policy for all four harnesses, so later settings changes do not affect that run or its handoffs. Each attempt records its permission mode in history. Project supervised/unattended review gates remain separate from tool permissions.
-
-Auto maps to Codex automatic approval review, Claude native `auto` review (subject to CLI/model/account support), and Droid medium autonomy. Adapter defaults are Codex review, Claude `acceptEdits`, Droid medium autonomy, and OpenCode's configured policy. OpenCode automatic review is unsupported and stops before launch if selected by a task override; no bypass is substituted. Live **Allow / Deny** in chat is not implemented and is marked unavailable in the controls. The API also refuses to execute an `ask` policy. No global CLI configuration is rewritten. The existing Claude permission-retry endpoint is scoped to a run and launches a new attempt, not approval of a still-paused tool call.
-
-Tasks run in the existing project folder by default, including uncommitted/untracked work. Git is not required. Rotation does not commit, stash, reset, merge, or remove files in local mode. Closing a local run preserves its edits. Only one active or paused run may own a project. Avoid running a separate editing harness against that folder simultaneously.
-
-New projects can opt into isolated Git worktrees under Execution settings. That mode requires a clean Git repository and initial commit, and retains the review/merge workflow. Existing projects migrate to local execution; old isolated attempts remain isolated.
-
-Supervised runs pause before dispatch and after verification for review. Local review has a **Finish run** action, not a commit action. Unattended runs finish automatically. A missing Git baseline skips the default `git diff --check`; supply a real project verification command for meaningful validation. The diff for a local Git run includes pre-existing edits and is not an attempt-only change attribution.
-
-Codex uses workspace-write with approval review, Claude uses `acceptEdits`, Droid uses `--auto medium`, and OpenCode uses its configured permissions. No adapter disables all permission checks. A working-directory argument is NOT an OS security boundary; Claude/Droid/OpenCode are not advertised as filesystem sandboxes. Permission failures are surfaced rather than silently called success.
-
-The task header shows the current/next harness, requested model (or CLI default), and working location. Output and attempt history remain on the task. Native transcripts are not imported; conversation plus current code is supplied on each attempt. Quota rotates in the same folder; supervised tasks ask before a handoff. If no harness remains available, the run pauses with Resume and Close controls. Retry now clears a harness cooldown. Cooldowns parse simple relative resets and otherwise conservatively assume four hours; there is no automatic wake-up scheduler yet.
-
-There is no billing checkbox. Rotation uses existing CLI credentials, blocks detected Codex/Claude API environment overrides, and does not guarantee subscription billing for every provider/configuration. It does not change your credentials or buy extra usage. Login failures are shown from the CLI. Runs currently have a ten-minute execution timeout, and server shutdown terminates tracked harness processes. Restart marks interrupted active runs stopped rather than leaving them falsely running.
-
-Verified locally: actual Codex and Claude file edits in non-Git folders; actual Droid usage-limit response followed by a successful Claude edit through the HTTP runner. OpenCode's command follows its [CLI documentation](https://opencode.ai/docs/cli/), but it is not installed here, so live OpenCode execution remains unverified. Droid file-writing remains unverified while its quota is exhausted.
+- Local runs edit the selected project folder and may include its existing uncommitted work.
+- A working directory and a Git worktree are not operating-system security boundaries. Do not use this tool with untrusted prompts or sensitive repositories unless you have independently constrained the execution environment.
+- Harness Rotation does not automatically commit, push, merge, or create a pull request from local work.
+- Remote Coder tasks stop for review before delivery. Credentials remain in the runner or keychain; they are not stored in Harness state.
+- Provider usage, account limits, and CLI permissions remain controlled by the installed harnesses. This project does not guarantee subscription billing or provider availability.
 
 ## Verification
 
-```sh
-python3 -B tests/smoke.py
-python3 -B tests/test_execution.py
-```
+Run the full local test suite:
 
-The integration test exercises folder browsing, project creation without Git, multiple goals, conversation persistence, project isolation, duplicate handling, and real harness/model discovery using disposable state. Its server binds an ephemeral port and closes in a finally block. Add `--serve` for a temporary browser test window (ten-minute maximum, Ctrl-C to stop earlier).
+    npm test
 
-Execution tests replace only the AI command with deterministic subprocess workers. They cover local dirty and non-Git folders, preservation of existing changes, local close, same-folder quota handoff, review gates, isolated merge, visible verification/permission failures, project ownership, and retry.
+For narrower checks:
 
-Opt-in live tests consume a small amount of account usage:
+    npm run test:python
+    npm --prefix frontend test
+    npm --prefix frontend run test:e2e
+    npm run format:check
 
-```sh
-python3 -B tests/real_adapter_smoke.py codex
-python3 -B tests/real_adapter_smoke.py claude
-python3 -B tests/real_adapter_smoke.py droid
-python3 -B tests/live_handoff.py
-```
+Some live tests intentionally consume provider usage and are opt-in:
 
-The last test expects Droid's account to be quota-exhausted and verifies a real Droid → Claude handoff. All use disposable state/folders; temporary servers are closed after testing. Browser verification also covered blank slate → add project → create task → approve dispatch → review local result → finish run.
+    python3 -B tests/real_adapter_smoke.py codex
+    python3 -B tests/real_adapter_smoke.py claude
+    python3 -B tests/real_adapter_smoke.py droid
+    python3 -B tests/live_handoff.py
+
+## Architecture
+
+app.py is the dependency-light HTTP application and compatibility API. The harness_rotation/ package holds the backend boundaries, frontend/ contains the React/Vite interface, and infra/runner/ contains standard-library-only programs sent to persistent Coder runners.
+
+The committed static/ bundle is intentionally absent: generate it with npm run build. It is ignored as build output.
+
+## Contributing
+
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Security reports belong in the process described in [SECURITY.md](SECURITY.md), not in public issues.

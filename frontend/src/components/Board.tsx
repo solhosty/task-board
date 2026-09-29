@@ -16,14 +16,7 @@ import {
   arrayMove,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import {
-  MoreHorizontal,
-  GitPullRequest,
-  Plus,
-  Play,
-  Clock3,
-  RefreshCw,
-} from 'lucide-react';
+import { MoreHorizontal, GitPullRequest, Plus, Play, Clock3, RefreshCw } from 'lucide-react';
 import { Button } from './ui/button';
 import { Menu, Modal, Input, Select, Checkbox, Field, Empty, Tabs } from './ui/controls';
 import {

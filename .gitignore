@@ -15,3 +15,10 @@ frontend/test-results/
 frontend/playwright-report/
 test-results/
 frontend/*.tsbuildinfo
+
+# Generated frontend bundle (created by npm run build)
+static/index.html
+static/assets/
+
+# Local acceptance artifacts
+browser-*-proof.txt

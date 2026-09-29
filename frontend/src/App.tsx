@@ -1052,7 +1052,12 @@ function NewTask({
     </Modal>
   );
 }
-type DirectoryListing = { path: string; name: string; parent: string; folders: { name: string; path: string }[] };
+type DirectoryListing = {
+  path: string;
+  name: string;
+  parent: string;
+  folders: { name: string; path: string }[];
+};
 function NewProject({
   open,
   onClose,
@@ -1159,7 +1164,11 @@ function NewProject({
         )}
       </Field>
       <Field label="Name" help="Optional. Defaults to the folder name.">
-        <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="My project" />
+        <Input
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+          placeholder="My project"
+        />
       </Field>
       <div className="modal-actions">
         <Button variant="secondary" onClick={onClose}>
