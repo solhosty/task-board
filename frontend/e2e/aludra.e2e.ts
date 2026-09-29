@@ -145,6 +145,9 @@ async function mockBootstrap(page: any) {
       body: JSON.stringify({ projects: bootstrap.projects }),
     }),
   );
+  await page.route('**/api/projects/1/board-views', (route) =>
+    route.fulfill({ contentType: 'application/json', body: '{}' }),
+  );
   await page.route('**/api/tasks/12', (route) =>
     route.fulfill({ contentType: 'application/json', body: JSON.stringify(taskDetail) }),
   );
@@ -284,7 +287,7 @@ test('a new task starts its harness when execution is enabled', async ({ page })
   await page
     .getByPlaceholder('Describe the outcome and acceptance criteria…')
     .fill('Start my task');
-  await page.getByRole('button', { name: 'Create task' }).click();
+  await page.getByRole('button', { name: 'Create and execute' }).click();
   await expect.poll(() => submitted).toMatchObject({ text: 'Start my task', start: true });
 });
 
